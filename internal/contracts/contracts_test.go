@@ -6,6 +6,7 @@ package contracts
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -79,8 +80,9 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s did not marshal: %v", tc.path, err)
 		}
-		if string(encoded) != string(fixture) {
-			t.Fatalf("%s round-trip drifted:\nwant %s\n got %s", tc.path, fixture, encoded)
+		want := strings.TrimSpace(string(fixture))
+		if string(encoded) != want {
+			t.Fatalf("%s round-trip drifted:\nwant %s\n got %s", tc.path, want, encoded)
 		}
 	}
 }
