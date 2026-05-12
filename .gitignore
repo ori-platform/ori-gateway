@@ -3,3 +3,4 @@ coverage.out
 *.test
 .env
 .DS_Store
+.venv/
