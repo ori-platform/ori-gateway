@@ -1,0 +1,1 @@
+{"request_id":"7d4bd5ee-7f7e-4f11-bdab-a4b3fb3ca7a3","device_id":"site-a","sensor_type":"current_clamp","trigger_name":"dangerous_overcurrent","prompt":"Is this dangerous?","context":{"value":14.2,"unit":"A","timestamp":123,"history":[{"value":8.1,"timestamp":111}]},"action_tier_hint":"D","timeout_ms":10000}

@@ -1,6 +1,5 @@
 gateway:
   broker_url: "tcp://localhost:1883"
-  device_topic_prefix: "ori/gateway"
   heartbeat_interval_s: 30
 
 provider:

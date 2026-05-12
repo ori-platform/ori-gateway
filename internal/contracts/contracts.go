@@ -46,28 +46,43 @@ type ReasoningResponse struct {
 	Confidence     float64 `json:"confidence"`
 	ActionTier     string  `json:"action_tier"`
 	ProposedAction *string `json:"proposed_action"`
+	Error          *string `json:"error,omitempty"`
 }
 
 type Heartbeat struct {
-	Status       string `json:"status"`
-	UptimeS      int64  `json:"uptime_s"`
-	Provider     string `json:"provider"`
-	SIMAvailable bool   `json:"sim_available"`
-	TimestampMS  int64  `json:"timestamp_ms"`
+	Status       string  `json:"status"`
+	UptimeS      float64 `json:"uptime_s"`
+	Provider     string  `json:"provider"`
+	SIMAvailable bool    `json:"sim_available"`
+	TimestampMS  int64   `json:"timestamp_ms"`
 }
 
 func RequestTopic(deviceID string) (string, error) {
 	if deviceID == "" {
 		return "", fmt.Errorf("device_id must not be empty")
 	}
-	return fmt.Sprintf("ori/gateway/%s/reason/request", deviceID), nil
+	return fmt.Sprintf("ori/%s/reasoning/request", deviceID), nil
 }
 
 func ResponseTopic(deviceID string) (string, error) {
 	if deviceID == "" {
 		return "", fmt.Errorf("device_id must not be empty")
 	}
-	return fmt.Sprintf("ori/gateway/%s/reason/response", deviceID), nil
+	return fmt.Sprintf("ori/%s/reasoning/response", deviceID), nil
+}
+
+func NewErrorResponse(requestID string, actionTier string, message string) ReasoningResponse {
+	return ReasoningResponse{
+		RequestID:      requestID,
+		Text:           "",
+		Model:          "gateway",
+		TokensUsed:     0,
+		LatencyMS:      0,
+		Confidence:     0,
+		ActionTier:     actionTier,
+		ProposedAction: nil,
+		Error:          &message,
+	}
 }
 
 func IsValidActionTier(tier string) bool {

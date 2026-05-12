@@ -1,0 +1,1 @@
+{"request_id":"7d4bd5ee-7f7e-4f11-bdab-a4b3fb3ca7a3","text":"Dangerous overcurrent detected.","model":"gateway-llm","tokens_used":120,"latency_ms":300,"confidence":0.93,"action_tier":"D","proposed_action":null}
