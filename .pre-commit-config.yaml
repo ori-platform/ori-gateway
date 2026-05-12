@@ -1,0 +1,75 @@
+# Pre-commit hooks for ori-gateway
+#
+# Install once: pre-commit install
+# Run manually: pre-commit run --all-files
+
+minimum_pre_commit_version: "3.7.0"
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
+
+repos:
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        language: system
+        entry: gofmt
+        args: [-w]
+        files: \.go$
+
+      - id: license-header
+        name: Apache-2.0 license header
+        language: python
+        entry: python
+        args:
+          - -c
+          - |-
+            import pathlib
+            import sys
+
+            roots = {"cmd", "internal"}
+            missing = [
+                str(f)
+                for f in pathlib.Path(".").rglob("*.go")
+                if f.parts and f.parts[0] in roots
+                and "SPDX-License-Identifier: Apache-2.0" not in f.read_text()
+            ]
+
+            if missing:
+                print("Missing license header:\n" + "\n".join(missing))
+                sys.exit(1)
+        pass_filenames: false
+
+      - id: conventional-commit
+        name: Conventional commit format
+        language: python
+        stages: [commit-msg]
+        entry: python
+        args:
+          - -c
+          - |-
+            import re
+            import sys
+
+            msg = open(sys.argv[1]).read().split("\n")[0]
+            pattern = (
+                r"^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert|security)"
+                r"(\([a-z0-9/-]+\))?: .{1,100}$"
+            )
+            if not re.match(pattern, msg):
+                print("Commit message does not follow Conventional Commits format.")
+                print(f"Got: {msg!r}")
+                print("Expected: type(scope): description")
+                sys.exit(1)
+        pass_filenames: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+        exclude: \.md$
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: [--branch, main]

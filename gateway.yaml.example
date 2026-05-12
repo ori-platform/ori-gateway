@@ -1,0 +1,21 @@
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_topic_prefix: "ori/gateway"
+  heartbeat_interval_s: 30
+
+provider:
+  name: "echo" # echo | llama_cpp | claude
+  timeout_ms: 10000
+  llama_cpp:
+    url: "http://localhost:8080/completion"
+  claude:
+    api_key_env: "ANTHROPIC_API_KEY"
+    model: "claude-sonnet-4-5"
+
+sim:
+  enabled: false
+  modem_path: "/dev/ttyUSB0"
+
+fleet:
+  enabled: false
+  cloud_url: ""

@@ -1,0 +1,13 @@
+# Default ownership
+
+- @adegneus
+
+# Architecture and safety-sensitive contracts
+
+/AGENTS.md @adegneus
+/PRINCIPLES.md @adegneus
+/SECURITY.md @adegneus
+/.github/ @adegneus
+/internal/contracts/ @adegneus
+/internal/session/ @adegneus
+/internal/site/ @adegneus
