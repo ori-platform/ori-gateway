@@ -16,28 +16,19 @@ repos:
         args: [-w]
         files: \.go$
 
+      - id: go-vet
+        name: go vet
+        language: system
+        entry: go vet ./...
+        pass_filenames: false
+        files: \.go$
+
       - id: license-header
         name: Apache-2.0 license header
-        language: python
-        entry: python
-        args:
-          - -c
-          - |-
-            import pathlib
-            import sys
-
-            roots = {"cmd", "internal"}
-            missing = [
-                str(f)
-                for f in pathlib.Path(".").rglob("*.go")
-                if f.parts and f.parts[0] in roots
-                and "SPDX-License-Identifier: Apache-2.0" not in f.read_text()
-            ]
-
-            if missing:
-                print("Missing license header:\n" + "\n".join(missing))
-                sys.exit(1)
+        language: system
+        entry: python3 scripts/check_license_headers.py
         pass_filenames: false
+        files: \.go$
 
       - id: conventional-commit
         name: Conventional commit format
