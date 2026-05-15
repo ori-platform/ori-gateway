@@ -3,10 +3,14 @@
 
 package contracts
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
-	GatewayHealthTopic = "ori/gateway/health"
+	GatewayHealthTopic                 = "ori/gateway/health"
+	GatewayReasoningRequestTopicFilter = "ori/+/reasoning/request"
 
 	ActionTierA = "A"
 	ActionTierB = "B"
@@ -58,17 +62,30 @@ type Heartbeat struct {
 }
 
 func RequestTopic(deviceID string) (string, error) {
-	if deviceID == "" {
-		return "", fmt.Errorf("device_id must not be empty")
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("ori/%s/reasoning/request", deviceID), nil
 }
 
 func ResponseTopic(deviceID string) (string, error) {
-	if deviceID == "" {
-		return "", fmt.Errorf("device_id must not be empty")
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("ori/%s/reasoning/response", deviceID), nil
+}
+
+func validateMQTTDeviceID(deviceID string) error {
+	if deviceID == "" {
+		return fmt.Errorf("device_id must not be empty")
+	}
+	if strings.TrimSpace(deviceID) != deviceID {
+		return fmt.Errorf("device_id must not contain leading or trailing whitespace")
+	}
+	if strings.ContainsAny(deviceID, "/+#") {
+		return fmt.Errorf("device_id must not contain MQTT topic separators or wildcards")
+	}
+	return nil
 }
 
 func NewErrorResponse(requestID string, actionTier string, message string) ReasoningResponse {
@@ -98,8 +115,8 @@ func ValidateRequest(req ReasoningRequest) error {
 	if req.RequestID == "" {
 		return fmt.Errorf("request_id must not be empty")
 	}
-	if req.DeviceID == "" {
-		return fmt.Errorf("device_id must not be empty")
+	if err := validateMQTTDeviceID(req.DeviceID); err != nil {
+		return err
 	}
 	if req.Prompt == "" {
 		return fmt.Errorf("prompt must not be empty")

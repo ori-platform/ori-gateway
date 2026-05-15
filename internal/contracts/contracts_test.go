@@ -30,6 +30,56 @@ func TestTopicsMatchGatewaySpec(t *testing.T) {
 	if GatewayHealthTopic != "ori/gateway/health" {
 		t.Fatalf("unexpected heartbeat topic: %s", GatewayHealthTopic)
 	}
+
+	if GatewayReasoningRequestTopicFilter != "ori/+/reasoning/request" {
+		t.Fatalf("unexpected request subscription topic: %s", GatewayReasoningRequestTopicFilter)
+	}
+}
+
+func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
+	invalid := []string{
+		"",
+		" site-a",
+		"site-a ",
+		"site/a",
+		"site+a",
+		"site#a",
+	}
+
+	for _, deviceID := range invalid {
+		if topic, err := RequestTopic(deviceID); err == nil {
+			t.Fatalf("RequestTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+		if topic, err := ResponseTopic(deviceID); err == nil {
+			t.Fatalf("ResponseTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+	}
+}
+
+func TestTopicHelpersDoNotUseLegacyGatewayNamespace(t *testing.T) {
+	reqTopic, err := RequestTopic("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	respTopic, err := ResponseTopic("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacyFragments := []string{
+		"ori/gateway/site-a/reason/request",
+		"ori/gateway/site-a/reason/response",
+		"/reason/request",
+		"/reason/response",
+	}
+	for _, fragment := range legacyFragments {
+		if strings.Contains(reqTopic, fragment) {
+			t.Fatalf("request topic %q contains legacy fragment %q", reqTopic, fragment)
+		}
+		if strings.Contains(respTopic, fragment) {
+			t.Fatalf("response topic %q contains legacy fragment %q", respTopic, fragment)
+		}
+	}
 }
 
 func TestValidateResponseForRequestRequiresCorrelation(t *testing.T) {
@@ -37,6 +87,13 @@ func TestValidateResponseForRequestRequiresCorrelation(t *testing.T) {
 	resp := ReasoningResponse{RequestID: "other", ActionTier: "A"}
 	if err := ValidateResponseForRequest(req, resp); err == nil {
 		t.Fatal("expected request_id mismatch error")
+	}
+}
+
+func TestValidateRequestRejectsInvalidDeviceID(t *testing.T) {
+	req := ReasoningRequest{RequestID: "req-1", DeviceID: "site/a", Prompt: "p", ActionTierHint: "A"}
+	if err := ValidateRequest(req); err == nil {
+		t.Fatal("expected invalid device_id error")
 	}
 }
 
