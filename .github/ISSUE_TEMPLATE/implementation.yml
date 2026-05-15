@@ -1,6 +1,6 @@
 name: "Implementation Issue"
-description: "Implementation task from the Ori Platform Bootstrap or Implementation Reference"
-title: "[REPLACE-PREFIX-NNN] "
+description: "Implementation task from the Ori Gateway Implementation Reference"
+title: "[GW-NNN] "
 labels: []
 body:
   - type: markdown
@@ -8,6 +8,8 @@ body:
       value: |
         > Every issue must have clear acceptance criteria, explicit dependencies, and enough context
         > that a contributor who has never seen the codebase can deliver against it.
+        > Keep this issue scoped to the repository contract below.
+
 
   - type: textarea
     id: context
@@ -25,9 +27,10 @@ body:
       label: Scope
       description: "What this issue delivers. Be specific about files, packages, and interfaces."
       placeholder: |
-        - [ ] File/package to create or modify
-        - [ ] Interface or struct to implement
-        - [ ] Config or contract changes
+        - [ ] Go package under `internal/` or command under `cmd/ori-gateway/`
+        - [ ] Struct/interface/function to implement
+        - [ ] Config, MQTT topic, or contract fixture changes
+        - [ ] Tests under the same Go package
     validations:
       required: true
 
@@ -37,8 +40,8 @@ body:
       label: Non-Goals
       description: "What this issue explicitly does NOT do. Prevents scope creep."
       placeholder: |
-        - This issue does not implement X.
-        - This issue does not modify Y.
+        - This issue does not implement unrelated repo work.
+        - This issue does not change cross-repo contracts unless explicitly labelled contract-change.
     validations:
       required: true
 
@@ -49,7 +52,7 @@ body:
       description: "Code signatures, data types, algorithms, error handling. Enough detail to implement without guessing."
       placeholder: |
         ```go
-        func NewFromConfig(cfg ProviderConfig) (Provider, error)
+        func NewFromConfig(cfg config.ProviderConfig) (Provider, error)
         ```
     validations:
       required: true
@@ -60,9 +63,10 @@ body:
       label: Acceptance Criteria
       description: "Checkboxes. Every one must be checked before the PR is merged."
       placeholder: |
-        - [ ] Criterion 1
-        - [ ] Criterion 2
-        - [ ] All existing tests pass
+        - [ ] Implementation preserves request/response correlation
+        - [ ] Required startup config fails fast; disabled optional modules are inert
+        - [ ] `go test ./...` passes
+        - [ ] `go vet ./...` passes
         - [ ] New tests cover happy path and at least one failure path
     validations:
       required: true
@@ -76,7 +80,7 @@ body:
         | Test | Verifies |
         |------|----------|
         | `TestX` | Happy path |
-        | `TestY` | Error path |
+        | `TestY` | Timeout, invalid input, or degraded provider path |
     validations:
       required: true
 
@@ -86,7 +90,10 @@ body:
       label: "Invariants — Do Not Violate"
       description: "Copy the specific AGENTS.md invariants that apply to this issue."
       placeholder: |
+        - **GW-1**: MQTT topic names must match `gateway-api/v1.md` exactly.
         - **GW-2**: Every response must echo `request_id`.
+        - **GW-6**: Heartbeat publication must not fail silently.
+        - **GW-9**: Timeout must produce an error response with original `request_id`.
     validations:
       required: true
 
@@ -108,10 +115,12 @@ body:
     id: references
     attributes:
       label: Contract References
-      description: "Links to specs, implementation references, or runtime code."
+      description: "Links to specs, implementation references, runtime code, or SDK contract files relevant to this repo."
       placeholder: |
-        - `ori-specs/gateway-api/v1.md`
-        - Implementation Reference §4.4
+        - `ori-specs/gateway-api/v1.md` — MQTT topics and payload contracts
+        - Gateway Implementation Reference section for this issue
+        - SDK gateway models if this changes cross-repo payloads
+        - Runtime Tier 3 integration notes if labelled runtime-impact
     validations:
       required: false
 
@@ -132,4 +141,4 @@ body:
       options:
         - label: "contract-change — modifies cross-repo contract"
         - label: "runtime-impact — requires follow-up PR in ori-runtime"
-        - label: "security-sensitive — touches signing, tokens, keypairs, or Tier D"
+        - label: "security-sensitive — touches signing, tokens, keypairs, Tier C/D, or device credentials"
