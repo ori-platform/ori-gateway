@@ -46,6 +46,21 @@ billing belong in `ori-cloud`.
 Stateful learning and causal memory belong in [runtime](https://github.com/ori-platform/ori-runtime) or cloud-defined stores, not
 in the gateway request proxy.
 
+10. `GW-10` Product reporting providers are separate from Tier 3 reasoning providers.
+The gateway may own connected customer-reporting and enrichment providers, but
+those providers must use reporting-specific config and must not be wired into
+the Tier 3 reasoning provider factory.
+
+11. `GW-11` Gateway reporting and enrichment never change action authority.
+Customer-facing weekly reports and Tier C explanation enrichment are advisory.
+They must not promote, downgrade, approve, reject, bypass, or execute runtime
+action tiers. Runtime remains the physical action authority.
+
+12. `GW-12` Reporting provider credentials stay out of runtime config.
+Gemini/API keys and equivalent product-provider credentials belong in gateway
+or product environment variables only. Secret values must never be committed,
+and runtime config examples must remain provider-neutral.
+
 ## Layout
 
 ```text
