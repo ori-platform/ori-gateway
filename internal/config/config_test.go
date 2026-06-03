@@ -108,6 +108,7 @@ provider:
   timeout_ms: 5000
   llama_cpp:
     url: "http://localhost:8080/completion"
+    model: "local-model.gguf"
 `)
 
 	cfg, err := Load(path)
@@ -119,6 +120,9 @@ provider:
 	}
 	if cfg.Provider.LlamaCpp.URL != "http://localhost:8080/completion" {
 		t.Fatalf("unexpected llama.cpp url: %q", cfg.Provider.LlamaCpp.URL)
+	}
+	if cfg.Provider.LlamaCpp.Model != "local-model.gguf" {
+		t.Fatalf("unexpected llama.cpp model fallback: %q", cfg.Provider.LlamaCpp.Model)
 	}
 }
 

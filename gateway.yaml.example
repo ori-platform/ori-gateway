@@ -7,6 +7,7 @@ provider:
   timeout_ms: 10000
   llama_cpp:
     url: "http://localhost:8080/completion"
+    model: "llama-3.2-3b-instruct.gguf" # fallback if /props is unavailable
   cloud_llm:
     vendor: "claude" # claude | openai | gemini | deepseek | openai_compatible
     api_key_env: "ANTHROPIC_API_KEY"
