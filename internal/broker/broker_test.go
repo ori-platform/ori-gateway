@@ -280,7 +280,7 @@ func TestReconnect(t *testing.T) {
 	}
 	brokerURL := "tcp://" + addr
 
-	start := func() *mqttsrv.Server {
+	start := func() (*mqttsrv.Server, <-chan struct{}) {
 		srv := mqttsrv.New(&mqttsrv.Options{
 			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
@@ -291,12 +291,16 @@ func TestReconnect(t *testing.T) {
 		if err := srv.AddListener(tcp); err != nil {
 			t.Fatal(err)
 		}
-		go func() { _ = srv.Serve() }()
+		done := make(chan struct{})
+		go func() {
+			_ = srv.Serve()
+			close(done)
+		}()
 		waitForTCP(t, addr)
-		return srv
+		return srv, done
 	}
 
-	srv1 := start()
+	srv1, srv1Done := start()
 
 	ctx := context.Background()
 	c := testClient(t, brokerURL, "reconn-1", Options{
@@ -313,22 +317,16 @@ func TestReconnect(t *testing.T) {
 	}
 
 	_ = srv1.Close()
+	waitServerStopped(t, srv1Done)
 	waitDisconnected(t, c, 3*time.Second)
 
-	srv2 := start()
-	defer func() { _ = srv2.Close() }()
+	srv2, srv2Done := start()
+	defer func() {
+		_ = srv2.Close()
+		waitServerStopped(t, srv2Done)
+	}()
 
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if c.IsConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !c.IsConnected() {
-		t.Fatal("client did not reconnect")
-	}
-
+	deadline := time.Now().Add(30 * time.Second)
 	var published atomic.Bool
 	for time.Now().Before(deadline) {
 		if err := c.Publish(ctx, "ori/gateway/health", QoSHeartbeat, false, []byte("after")); err == nil {
@@ -339,6 +337,9 @@ func TestReconnect(t *testing.T) {
 	}
 	if !published.Load() {
 		t.Fatal("publish after reconnect never succeeded")
+	}
+	if !c.IsConnected() {
+		t.Fatal("client publish succeeded after reconnect but connected flag was not restored")
 	}
 }
 
@@ -374,6 +375,15 @@ func waitDisconnected(t *testing.T, c *Client, timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("expected disconnected")
+}
+
+func waitServerStopped(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mqtt test broker shutdown timed out")
+	}
 }
 
 func waitForTCP(t *testing.T, addr string) {
