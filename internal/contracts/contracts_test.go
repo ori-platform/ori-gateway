@@ -34,6 +34,30 @@ func TestTopicsMatchGatewaySpec(t *testing.T) {
 	if GatewayReasoningRequestTopicFilter != "ori/+/reasoning/request" {
 		t.Fatalf("unexpected request subscription topic: %s", GatewayReasoningRequestTopicFilter)
 	}
+
+	exportReqTopic, err := ExportRequestTopic("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exportReqTopic != "ori/site-a/export/request" {
+		t.Fatalf("unexpected export request topic: %s", exportReqTopic)
+	}
+
+	exportRespTopic, err := ExportResponseTopic("site-a", "req-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exportRespTopic != "ori/site-a/export/response/req-1" {
+		t.Fatalf("unexpected export response topic: %s", exportRespTopic)
+	}
+
+	exportRespFilter, err := ExportResponseTopicFilter("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exportRespFilter != "ori/site-a/export/response/+" {
+		t.Fatalf("unexpected export response filter: %s", exportRespFilter)
+	}
 }
 
 func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
@@ -52,6 +76,19 @@ func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
 		}
 		if topic, err := ResponseTopic(deviceID); err == nil {
 			t.Fatalf("ResponseTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+		if topic, err := ExportRequestTopic(deviceID); err == nil {
+			t.Fatalf("ExportRequestTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+		if topic, err := ExportResponseTopicFilter(deviceID); err == nil {
+			t.Fatalf("ExportResponseTopicFilter(%q) returned %q, expected error", deviceID, topic)
+		}
+	}
+
+	invalidRequestIDs := []string{"req/1", "req 1", "req	1", "req.1"}
+	for _, requestID := range invalidRequestIDs {
+		if topic, err := ExportResponseTopic("site-a", requestID); err == nil {
+			t.Fatalf("ExportResponseTopic returned %q, expected invalid request_id error", topic)
 		}
 	}
 }

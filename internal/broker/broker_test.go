@@ -522,7 +522,7 @@ func TestWaitTokenDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	err := waitToken(ctx, slowToken{release: make(chan struct{})})
+	err := waitToken(ctx, newSlowToken())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want %v", err, context.DeadlineExceeded)
 	}
