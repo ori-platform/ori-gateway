@@ -75,6 +75,30 @@ func ResponseTopic(deviceID string) (string, error) {
 	return fmt.Sprintf("ori/%s/reasoning/response", deviceID), nil
 }
 
+func ExportRequestTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/export/request", deviceID), nil
+}
+
+func ExportResponseTopic(deviceID string, requestID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	if err := validateMQTTRequestID(requestID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/export/response/%s", deviceID, requestID), nil
+}
+
+func ExportResponseTopicFilter(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/export/response/+", deviceID), nil
+}
+
 func validateMQTTDeviceID(deviceID string) error {
 	if deviceID == "" {
 		return fmt.Errorf("device_id must not be empty")
@@ -84,6 +108,25 @@ func validateMQTTDeviceID(deviceID string) error {
 	}
 	if strings.ContainsAny(deviceID, "/+#") {
 		return fmt.Errorf("device_id must not contain MQTT topic separators or wildcards")
+	}
+	return nil
+}
+
+func validateMQTTRequestID(requestID string) error {
+	if requestID == "" {
+		return fmt.Errorf("request_id must not be empty")
+	}
+	if strings.TrimSpace(requestID) != requestID {
+		return fmt.Errorf("request_id must not contain leading or trailing whitespace")
+	}
+	if strings.ContainsAny(requestID, "/+#") {
+		return fmt.Errorf("request_id must not contain MQTT topic separators or wildcards")
+	}
+	for _, ch := range requestID {
+		if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_' {
+			continue
+		}
+		return fmt.Errorf("request_id must contain only ASCII letters, digits, hyphen, or underscore")
 	}
 	return nil
 }

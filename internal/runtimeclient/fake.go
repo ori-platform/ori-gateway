@@ -22,13 +22,15 @@ type FakeClient struct {
 	TierCDecisionLogRows []TierCDecisionEntry
 	TierCDecisionLogErr  error
 
+	lastHealthRequest           HealthRequest
 	lastSensorHistoryRequest    SensorHistoryRequest
 	lastActionLogRequest        ActionLogRequest
 	lastTierCDecisionLogRequest TierCDecisionLogRequest
 }
 
 func (f *FakeClient) Health(ctx context.Context, req HealthRequest) (HealthSnapshot, error) {
-	if _, err := NormalizeHealthRequest(req); err != nil {
+	normalized, err := NormalizeHealthRequest(req)
+	if err != nil {
 		return HealthSnapshot{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -36,6 +38,7 @@ func (f *FakeClient) Health(ctx context.Context, req HealthRequest) (HealthSnaps
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastHealthRequest = normalized
 	if f.HealthErr != nil {
 		return HealthSnapshot{}, f.HealthErr
 	}
@@ -91,6 +94,12 @@ func (f *FakeClient) TierCDecisionLog(ctx context.Context, req TierCDecisionLogR
 		return nil, f.TierCDecisionLogErr
 	}
 	return copyTierCDecisionEntries(f.TierCDecisionLogRows), nil
+}
+
+func (f *FakeClient) LastHealthRequest() HealthRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastHealthRequest
 }
 
 func (f *FakeClient) LastSensorHistoryRequest() SensorHistoryRequest {
