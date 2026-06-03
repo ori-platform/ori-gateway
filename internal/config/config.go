@@ -220,6 +220,12 @@ func normalizeProviderStrings(provider ProviderConfig) ProviderConfig {
 }
 
 func validateProvider(provider ProviderConfig) error {
+	if provider.Name == ProviderLlamaCpp {
+		if provider.LlamaCpp.URL == "" {
+			return fmt.Errorf("provider.llama_cpp.url must not be empty when provider.name is llama_cpp")
+		}
+		return nil
+	}
 	if provider.Name != ProviderCloudLLM {
 		return nil
 	}
