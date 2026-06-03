@@ -76,6 +76,8 @@ func New(opts Options) (*Client, error) {
 	if reconnectMax == 0 {
 		reconnectMax = defaultReconnectMax
 	}
+	opts.ReconnectInitial = reconnectInitial
+	opts.ReconnectMax = reconnectMax
 
 	pahoOpts := mqtt.NewClientOptions()
 	pahoOpts.AddBroker(opts.BrokerURL)

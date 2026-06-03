@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -269,7 +270,39 @@ func TestHandlerPanicDoesNotBreakClient(t *testing.T) {
 	}
 }
 
-func TestReconnect(t *testing.T) {
+func TestReconnectBackoffOptions(t *testing.T) {
+	c, err := New(Options{BrokerURL: "tcp://127.0.0.1:1883", ClientID: "default-backoff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.opts.ReconnectInitial != defaultReconnectInitial {
+		t.Fatalf("default reconnect initial = %s, want %s", c.opts.ReconnectInitial, defaultReconnectInitial)
+	}
+	if c.opts.ReconnectMax != defaultReconnectMax {
+		t.Fatalf("default reconnect max = %s, want %s", c.opts.ReconnectMax, defaultReconnectMax)
+	}
+
+	c, err = New(Options{
+		BrokerURL:        "tcp://127.0.0.1:1883",
+		ClientID:         "custom-backoff",
+		ReconnectInitial: 200 * time.Millisecond,
+		ReconnectMax:     500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.opts.ReconnectInitial != 200*time.Millisecond {
+		t.Fatalf("custom reconnect initial = %s", c.opts.ReconnectInitial)
+	}
+	if c.opts.ReconnectMax != 500*time.Millisecond {
+		t.Fatalf("custom reconnect max = %s", c.opts.ReconnectMax)
+	}
+}
+
+func TestReconnectIntegration(t *testing.T) {
+	if os.Getenv("ORI_GATEWAY_MQTT_RECONNECT_INTEGRATION") == "" {
+		t.Skip("set ORI_GATEWAY_MQTT_RECONNECT_INTEGRATION=1 to run broker restart reconnect integration test")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
