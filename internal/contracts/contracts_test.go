@@ -134,6 +134,13 @@ func TestValidateRequestRejectsInvalidDeviceID(t *testing.T) {
 	}
 }
 
+func TestValidateRequestRejectsInvalidRequestID(t *testing.T) {
+	req := ReasoningRequest{RequestID: "req/1", DeviceID: "site-a", Prompt: "p", ActionTierHint: "A"}
+	if err := ValidateRequest(req); err == nil {
+		t.Fatal("expected invalid request_id error")
+	}
+}
+
 func TestValidateRequestRejectsInvalidTier(t *testing.T) {
 	req := ReasoningRequest{RequestID: "req-1", DeviceID: "site-a", Prompt: "p", ActionTierHint: "cloud"}
 	if err := ValidateRequest(req); err == nil {
@@ -160,6 +167,9 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 		{"testdata/reasoning_response.json", &ReasoningResponse{}},
 		{"testdata/reasoning_error_response.json", &ReasoningResponse{}},
 		{"testdata/heartbeat.json", &Heartbeat{}},
+		{"testdata/tier_c_enrichment_request.json", &TierCEnrichmentRequest{}},
+		{"testdata/tier_c_enrichment_response.json", &TierCEnrichmentResponse{}},
+		{"testdata/tier_c_enrichment_error_response.json", &TierCEnrichmentResponse{}},
 	}
 
 	for _, tc := range cases {

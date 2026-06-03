@@ -155,8 +155,8 @@ func IsValidActionTier(tier string) bool {
 }
 
 func ValidateRequest(req ReasoningRequest) error {
-	if req.RequestID == "" {
-		return fmt.Errorf("request_id must not be empty")
+	if err := validateMQTTRequestID(req.RequestID); err != nil {
+		return fmt.Errorf("request_id: %w", err)
 	}
 	if err := validateMQTTDeviceID(req.DeviceID); err != nil {
 		return err

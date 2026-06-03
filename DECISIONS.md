@@ -42,3 +42,34 @@ Rationale:
   safety paths.
 - Keeping API keys outside runtime config preserves the framework boundary and
   reduces the blast radius of product-layer credentials.
+
+---
+
+## 2026-06-03 — Tier C Enrichment Is Advisory Only
+
+**Status:** Accepted
+
+Tier C enrichment improves the operator-facing explanation for an existing
+runtime proposal. It is not a decision path and it is not an action-authority
+path.
+
+Rules:
+
+- Enrichment requests may include proposal context, reading context, recent
+  history, proposed action, and safe default action so the provider can explain
+  the situation clearly.
+- Enrichment responses may return explanation text, estimated impact, and
+  operator context only.
+- Enrichment responses must not contain fields that change action tier, action
+  name, safe default action, approval requirement, relay mode, actuator state, or
+  any other runtime authority field.
+- Runtime must preserve the original proposal if enrichment fails or times out.
+- Gateway enrichment must not execute actions or mutate runtime state.
+
+Rationale:
+
+- Tier C approval is a safety boundary. Connected language enrichment can make an
+  operator message clearer, but it cannot become an alternate approval or action
+  selection channel.
+- Keeping the response schema advisory-only lets product intelligence improve
+  customer comprehension without weakening runtime safety invariants.
