@@ -52,6 +52,8 @@ type ProviderConfig struct {
 
 type LlamaCppConfig struct {
 	URL string `yaml:"url"`
+	// Model is the fallback model name used when llama.cpp /props is unreachable or returns no model name.
+	Model string `yaml:"model"`
 }
 
 type CloudLLMConfig struct {
@@ -212,6 +214,7 @@ func isKnownProvider(name string) bool {
 func normalizeProviderStrings(provider ProviderConfig) ProviderConfig {
 	provider.Name = strings.TrimSpace(provider.Name)
 	provider.LlamaCpp.URL = strings.TrimSpace(provider.LlamaCpp.URL)
+	provider.LlamaCpp.Model = strings.TrimSpace(provider.LlamaCpp.Model)
 	provider.CloudLLM.Vendor = strings.TrimSpace(provider.CloudLLM.Vendor)
 	provider.CloudLLM.APIKeyEnv = strings.TrimSpace(provider.CloudLLM.APIKeyEnv)
 	provider.CloudLLM.Model = strings.TrimSpace(provider.CloudLLM.Model)
