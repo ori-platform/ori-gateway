@@ -1,5 +1,16 @@
 module github.com/ori-platform/ori-gateway
 
-go 1.22
+go 1.24.0
 
-require gopkg.in/yaml.v3 v3.0.1 // indirect
+require (
+	github.com/eclipse/paho.mqtt.golang v1.4.3
+	github.com/mochi-mqtt/server/v2 v2.7.9
+	gopkg.in/yaml.v3 v3.0.1
+)
+
+require (
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/rs/xid v1.4.0 // indirect
+	golang.org/x/net v0.44.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+)
