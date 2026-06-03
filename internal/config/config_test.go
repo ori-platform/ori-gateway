@@ -283,3 +283,416 @@ func TestLoadExampleShape(t *testing.T) {
 		t.Fatalf("unexpected example provider: %q", cfg.Provider.Name)
 	}
 }
+
+func TestReportingConfigDefaultsDisabled(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  weekly_report:
+    enabled: false
+  tier_c_enrichment:
+    enabled: false
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Reporting.WeeklyReport.Enabled {
+		t.Fatal("expected weekly report disabled")
+	}
+	if cfg.Reporting.TierCEnrichment.Enabled {
+		t.Fatal("expected tier C enrichment disabled")
+	}
+	if cfg.Reporting.Provider != "" {
+		t.Fatalf("expected no reporting provider requirement when disabled, got %q", cfg.Reporting.Provider)
+	}
+}
+
+func TestWeeklyReportRequiresProviderConfigWhenEnabled(t *testing.T) {
+	base := `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "08:00"
+    timezone: Africa/Lagos
+`
+	path := writeConfig(t, base)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected enabled weekly report to require provider")
+	}
+	if !strings.Contains(err.Error(), "reporting.provider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	path = writeConfig(t, base+`  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+`)
+	_, err = Load(path)
+	if err == nil {
+		t.Fatal("expected enabled weekly report to require model")
+	}
+	if !strings.Contains(err.Error(), "model") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	path = writeConfig(t, base+`  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Reporting.Provider != ReportingProviderGemini {
+		t.Fatalf("unexpected reporting provider: %q", cfg.Reporting.Provider)
+	}
+}
+
+func TestTierCEnrichmentRequiresProviderConfigWhenEnabled(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    model: gemini-2.5-flash
+  tier_c_enrichment:
+    enabled: true
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected enabled tier C enrichment to require api_key_env")
+	}
+	if !strings.Contains(err.Error(), "api_key_env") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	path = writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  tier_c_enrichment:
+    enabled: true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Reporting.TierCEnrichment.Enabled {
+		t.Fatal("expected tier C enrichment enabled")
+	}
+}
+
+func TestReportingProviderDoesNotAffectReasoningProvider(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "08:00"
+    timezone: Africa/Lagos
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Name != ProviderEcho {
+		t.Fatalf("reasoning provider changed: %q", cfg.Provider.Name)
+	}
+	if cfg.Reporting.Provider != ReportingProviderGemini {
+		t.Fatalf("reporting provider not loaded: %q", cfg.Reporting.Provider)
+	}
+}
+
+func TestWeeklyReportRejectsInvalidSchedule(t *testing.T) {
+	cases := []struct {
+		name    string
+		field   string
+		content string
+	}{
+		{
+			name:  "missing day",
+			field: "day",
+			content: `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    time: "08:00"
+    timezone: Africa/Lagos
+`,
+		},
+		{
+			name:  "invalid time",
+			field: "time",
+			content: `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "8am"
+    timezone: Africa/Lagos
+`,
+		},
+		{
+			name:  "invalid timezone",
+			field: "timezone",
+			content: `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "08:00"
+    timezone: Not/AZone
+`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.content)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("expected schedule validation error")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestReportingRejectsUnknownProviderEvenWhenDisabled(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: bogus
+  weekly_report:
+    enabled: false
+  tier_c_enrichment:
+    enabled: false
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected unknown reporting provider to fail")
+	}
+	if !strings.Contains(err.Error(), "reporting.provider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCloudLLMProviderRequiresProviderConfigWhenSelected(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: cloud_llm
+  cloud_llm:
+    vendor: claude
+    model: claude-sonnet-4-5
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected cloud_llm provider to require api_key_env")
+	}
+	if !strings.Contains(err.Error(), "provider.cloud_llm.api_key_env") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	path = writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: cloud_llm
+  cloud_llm:
+    vendor: claude
+    api_key_env: ANTHROPIC_API_KEY
+    model: claude-sonnet-4-5
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Name != ProviderCloudLLM {
+		t.Fatalf("unexpected reasoning provider: %q", cfg.Provider.Name)
+	}
+	if cfg.Provider.CloudLLM.Vendor != CloudVendorClaude {
+		t.Fatalf("unexpected cloud vendor: %q", cfg.Provider.CloudLLM.Vendor)
+	}
+}
+
+func TestCloudLLMProviderSupportsSwappableVendors(t *testing.T) {
+	vendors := []string{
+		CloudVendorClaude,
+		CloudVendorOpenAI,
+		CloudVendorGemini,
+		CloudVendorDeepSeek,
+	}
+
+	for _, vendor := range vendors {
+		t.Run(vendor, func(t *testing.T) {
+			path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: cloud_llm
+  cloud_llm:
+    vendor: `+vendor+`
+    api_key_env: CLOUD_LLM_API_KEY
+    model: default-model
+`)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Provider.CloudLLM.Vendor != vendor {
+				t.Fatalf("unexpected vendor: %q", cfg.Provider.CloudLLM.Vendor)
+			}
+		})
+	}
+}
+
+func TestCloudLLMOpenAICompatibleRequiresBaseURL(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: cloud_llm
+  cloud_llm:
+    vendor: openai_compatible
+    api_key_env: CLOUD_LLM_API_KEY
+    model: default-model
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected openai_compatible vendor to require base_url")
+	}
+	if !strings.Contains(err.Error(), "base_url") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCloudLLMRejectsUnknownVendor(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: cloud_llm
+  cloud_llm:
+    vendor: bogus
+    api_key_env: CLOUD_LLM_API_KEY
+    model: default-model
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected unknown cloud_llm vendor to fail")
+	}
+	if !strings.Contains(err.Error(), "vendor") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCloudLLMAPIKeyEnvMustBeEnvVarName(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: cloud_llm
+  cloud_llm:
+    vendor: claude
+    api_key_env: "not a valid env var name"
+    model: claude-sonnet-4-5
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid cloud api_key_env to fail")
+	}
+	if !strings.Contains(err.Error(), "provider.cloud_llm.api_key_env") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReportingAPIKeyEnvMustBeEnvVarName(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: "not a valid env var name"
+    model: gemini-2.5-flash
+  tier_c_enrichment:
+    enabled: true
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid api_key_env to fail")
+	}
+	if !strings.Contains(err.Error(), "api_key_env") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

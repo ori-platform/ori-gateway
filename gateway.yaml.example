@@ -3,13 +3,28 @@ gateway:
   heartbeat_interval_s: 30
 
 provider:
-  name: "echo" # echo | llama_cpp | claude
+  name: "echo" # echo | llama_cpp | cloud_llm
   timeout_ms: 10000
   llama_cpp:
     url: "http://localhost:8080/completion"
-  claude:
+  cloud_llm:
+    vendor: "claude" # claude | openai | gemini | deepseek | openai_compatible
     api_key_env: "ANTHROPIC_API_KEY"
     model: "claude-sonnet-4-5"
+    base_url: "" # required only for openai_compatible
+
+reporting:
+  provider: "gemini"
+  gemini:
+    api_key_env: "GEMINI_API_KEY"
+    model: "gemini-2.5-flash"
+  weekly_report:
+    enabled: false
+    day: monday
+    time: "08:00"
+    timezone: Africa/Lagos
+  tier_c_enrichment:
+    enabled: false
 
 sim:
   enabled: false
