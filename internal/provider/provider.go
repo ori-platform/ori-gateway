@@ -11,6 +11,7 @@ import (
 
 type Provider interface {
 	Name() string
+	Healthy(ctx context.Context) bool
 	Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error)
 }
 
@@ -23,6 +24,10 @@ func (p EchoProvider) Name() string {
 		return "echo"
 	}
 	return p.ModelName
+}
+
+func (p EchoProvider) Healthy(context.Context) bool {
+	return true
 }
 
 func (p EchoProvider) Reason(_ context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
