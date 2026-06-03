@@ -80,6 +80,48 @@ provider:
 	}
 }
 
+func TestLlamaCppProviderRequiresURLWhenSelected(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: llama_cpp
+  llama_cpp:
+    url: ""
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected llama_cpp provider to require url")
+	}
+	if !strings.Contains(err.Error(), "provider.llama_cpp.url") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLlamaCppProviderLoadsWithURL(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: llama_cpp
+  timeout_ms: 5000
+  llama_cpp:
+    url: "http://localhost:8080/completion"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Name != ProviderLlamaCpp {
+		t.Fatalf("unexpected reasoning provider: %q", cfg.Provider.Name)
+	}
+	if cfg.Provider.LlamaCpp.URL != "http://localhost:8080/completion" {
+		t.Fatalf("unexpected llama.cpp url: %q", cfg.Provider.LlamaCpp.URL)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
