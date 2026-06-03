@@ -65,6 +65,7 @@ and runtime config examples must remain provider-neutral.
 
 ```text
 cmd/ori-gateway/
+internal/broker/
 internal/contracts/
 internal/provider/
 internal/session/
