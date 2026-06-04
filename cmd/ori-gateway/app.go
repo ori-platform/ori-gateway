@@ -1,0 +1,297 @@
+// Copyright 2026 Ori Nexus Systems LTD
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/ori-platform/ori-gateway/internal/broker"
+	"github.com/ori-platform/ori-gateway/internal/config"
+	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/dispatcher"
+	"github.com/ori-platform/ori-gateway/internal/fleet"
+	"github.com/ori-platform/ori-gateway/internal/heartbeat"
+	"github.com/ori-platform/ori-gateway/internal/provider"
+	"github.com/ori-platform/ori-gateway/internal/sim"
+)
+
+const (
+	defaultConfigPath          = "gateway.yaml"
+	defaultClientID            = "ori-gateway"
+	defaultRequestFailureLimit = 5
+)
+
+type brokerClient interface {
+	Connect(ctx context.Context) error
+	Disconnect(ctx context.Context) error
+	Subscribe(ctx context.Context, topic string, qos byte, handler broker.MessageHandler) error
+	Publish(ctx context.Context, topic string, qos byte, retain bool, payload []byte) error
+}
+
+type heartbeatRunner interface {
+	Run(ctx context.Context) error
+}
+
+type appDependencies struct {
+	loadConfig   func(path string) (config.Config, error)
+	newProvider  func(cfg config.ProviderConfig) (provider.Provider, error)
+	newBroker    func(opts broker.Options) (brokerClient, error)
+	newSIM       func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
+	newFleet     func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
+	newHeartbeat func(
+		publish heartbeat.PublishFunc,
+		prov heartbeat.ProviderStatus,
+		simStatus heartbeat.SIMStatus,
+		opts heartbeat.Options,
+	) (heartbeatRunner, error)
+	logger *slog.Logger
+	now    func() time.Time
+}
+
+func defaultDependencies() appDependencies {
+	return appDependencies{
+		loadConfig:  config.Load,
+		newProvider: provider.NewFromConfig,
+		newBroker: func(opts broker.Options) (brokerClient, error) {
+			return broker.New(opts)
+		},
+		newSIM:   sim.New,
+		newFleet: fleet.New,
+		newHeartbeat: func(
+			publish heartbeat.PublishFunc,
+			prov heartbeat.ProviderStatus,
+			simStatus heartbeat.SIMStatus,
+			opts heartbeat.Options,
+		) (heartbeatRunner, error) {
+			return heartbeat.NewPublisher(publish, prov, simStatus, opts)
+		},
+		logger: slog.Default(),
+		now:    time.Now,
+	}
+}
+
+func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+	flags := flag.NewFlagSet("ori-gateway", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", defaultConfigPath, "path to gateway.yaml")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	deps := defaultDependencies()
+	if err := runGateway(ctx, *configPath, deps); err != nil {
+		_, _ = fmt.Fprintf(stderr, "ori-gateway: %v\n", err)
+		return 1
+	}
+	_, _ = fmt.Fprintln(stdout, "ori-gateway stopped")
+	return 0
+}
+
+func runGateway(ctx context.Context, configPath string, deps appDependencies) error {
+	deps = normalizeDependencies(deps)
+
+	cfg, err := deps.loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	reasoningProvider, err := deps.newProvider(cfg.Provider)
+	if err != nil {
+		return fmt.Errorf("construct provider: %w", err)
+	}
+	providerStatus := providerStatusFromProvider(reasoningProvider)
+
+	client, err := deps.newBroker(broker.Options{
+		BrokerURL: cfg.Gateway.BrokerURL,
+		ClientID:  defaultClientID,
+		Logger:    deps.logger,
+	})
+	if err != nil {
+		return fmt.Errorf("construct broker: %w", err)
+	}
+	if err := client.Connect(ctx); err != nil {
+		return fmt.Errorf("connect broker: %w", err)
+	}
+	disconnect := true
+	defer func() {
+		if disconnect {
+			_ = client.Disconnect(context.Background())
+		}
+	}()
+
+	simClient, err := deps.newSIM(cfg.SIM, sim.Options{})
+	if err != nil {
+		return fmt.Errorf("construct sim: %w", err)
+	}
+	fleetClient, err := deps.newFleet(cfg.Fleet, fleet.Options{})
+	if err != nil {
+		return fmt.Errorf("construct fleet: %w", err)
+	}
+	// Fleet status is constructed here so startup validates the optional-module
+	// boundary. It is intentionally not published until the heartbeat contract
+	// includes fleet health fields.
+	_ = fleetClient
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	hb, err := deps.newHeartbeat(
+		func(ctx context.Context, payload []byte) error {
+			return client.Publish(ctx, contracts.GatewayHealthTopic, broker.QoSHeartbeat, false, payload)
+		},
+		providerStatus,
+		heartbeat.SIMStatus{
+			Enabled: cfg.SIM.Enabled,
+			Probe: func() bool {
+				return simClient.Available(runCtx)
+			},
+		},
+		heartbeat.Options{
+			Interval:  time.Duration(cfg.Gateway.HeartbeatIntervalS) * time.Second,
+			StartedAt: deps.now(),
+			Now:       deps.now,
+			Logger:    deps.logger,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("construct heartbeat: %w", err)
+	}
+
+	heartbeatErr := make(chan error, 1)
+	go func() {
+		if err := hb.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			heartbeatErr <- err
+			return
+		}
+		heartbeatErr <- nil
+	}()
+
+	reasoningDispatcher, err := dispatcher.New(client, reasoningProvider, dispatcher.Options{
+		ProviderTimeoutMS: cfg.Provider.TimeoutMS,
+	})
+	if err != nil {
+		cancel()
+		<-heartbeatErr
+		return fmt.Errorf("construct dispatcher: %w", err)
+	}
+
+	requestErr := make(chan error, 1)
+	var requestFailureMu sync.Mutex
+	requestFailures := 0
+	if err := client.Subscribe(runCtx, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
+		if err := reasoningDispatcher.HandleRequest(runCtx, topic, payload); err != nil {
+			deps.logger.Warn("reasoning request handling failed", "topic", topic, "error", err)
+			requestFailureMu.Lock()
+			requestFailures++
+			failures := requestFailures
+			requestFailureMu.Unlock()
+			if failures >= defaultRequestFailureLimit {
+				select {
+				case requestErr <- fmt.Errorf("reasoning request failure limit reached: %w", err):
+				default:
+				}
+			}
+			return
+		}
+		requestFailureMu.Lock()
+		requestFailures = 0
+		requestFailureMu.Unlock()
+	}); err != nil {
+		cancel()
+		<-heartbeatErr
+		return fmt.Errorf("subscribe reasoning requests: %w", err)
+	}
+
+	select {
+	case <-ctx.Done():
+		cancel()
+		<-heartbeatErr
+		err := client.Disconnect(context.Background())
+		disconnect = false
+		if err != nil {
+			return fmt.Errorf("disconnect broker: %w", err)
+		}
+		return nil
+	case err := <-heartbeatErr:
+		cancel()
+		if err != nil {
+			return fmt.Errorf("heartbeat stopped: %w", err)
+		}
+		return fmt.Errorf("heartbeat stopped unexpectedly")
+	case err := <-requestErr:
+		cancel()
+		<-heartbeatErr
+		return err
+	}
+}
+
+func normalizeDependencies(deps appDependencies) appDependencies {
+	defaults := defaultDependencies()
+	if deps.loadConfig == nil {
+		deps.loadConfig = defaults.loadConfig
+	}
+	if deps.newProvider == nil {
+		deps.newProvider = defaults.newProvider
+	}
+	if deps.newBroker == nil {
+		deps.newBroker = defaults.newBroker
+	}
+	if deps.newSIM == nil {
+		deps.newSIM = defaults.newSIM
+	}
+	if deps.newFleet == nil {
+		deps.newFleet = defaults.newFleet
+	}
+	if deps.newHeartbeat == nil {
+		deps.newHeartbeat = defaults.newHeartbeat
+	}
+	if deps.logger == nil {
+		deps.logger = defaults.logger
+	}
+	if deps.now == nil {
+		deps.now = defaults.now
+	}
+	return deps
+}
+
+type staticProviderStatus struct {
+	name    string
+	healthy func(ctx context.Context) bool
+}
+
+func (s staticProviderStatus) Name() string {
+	return s.name
+}
+
+func (s staticProviderStatus) Healthy(ctx context.Context) bool {
+	if s.healthy == nil {
+		return false
+	}
+	return s.healthy(ctx)
+}
+
+func providerStatusFromProvider(reasoningProvider provider.Provider) heartbeat.ProviderStatus {
+	if status, ok := reasoningProvider.(heartbeat.ProviderStatus); ok {
+		return status
+	}
+	return staticProviderStatus{
+		name: reasoningProvider.Name(),
+		healthy: func(context.Context) bool {
+			return false
+		},
+	}
+}
