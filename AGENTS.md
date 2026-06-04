@@ -18,9 +18,19 @@ It is not [`ori-runtime`](https://github.com/ori-platform/ori-runtime) and not [
 
 2. `GW-2` Every response must echo the request `request_id`.
 A missing or changed `request_id` causes [`ori-runtime`](https://github.com/ori-platform/ori-runtime) timeout and fallback behavior.
+Provider timeout, provider error, provider panic, invalid provider response, and
+publish-failure paths must still preserve the original `request_id` whenever the
+incoming request is valid enough to correlate. Verified by:
+`TestDispatcherTimeoutErrorResponse`, `TestDispatcherProviderErrorResponse`,
+`TestDispatcherProviderPanicResponse`,
+`TestDispatcherProviderInvalidResponsePublishesErrorResponse`, and
+`TestDispatcherPublishFailureIsSurfaced`.
 
 3. `GW-3` Providers must satisfy one shared interface.
 Provider-specific settings belong in config, not in the provider interface.
+Tier 3 reasoning providers are selected through the reasoning provider factory
+only. Customer-reporting providers must not be routed through that factory.
+Verified by `TestReportingProviderDoesNotAffectReasoningProvider`.
 
 4. `GW-4` Gateway never changes action authority.
 [`ori-runtime`](https://github.com/ori-platform/ori-runtime) owns action-tier authority. Gateway may echo tier hints but must not
@@ -29,14 +39,23 @@ promote or downgrade physical authority.
 5. `GW-5` Gateway is not in the Tier D path.
 Tier D safety fires locally in the [runtime](https://github.com/ori-platform/ori-runtime) rule engine before gateway, cloud, or
 network systems are consulted.
+No direct test currently enforces this; it is enforced by code review and by
+keeping Tier D evaluation and actuation APIs out of this repository.
 
 6. `GW-6` Heartbeat must be reliable.
 If heartbeat publication cannot continue, the gateway must report failure or
 exit rather than silently appearing available.
+The gateway process must also surface repeated reasoning-response delivery
+failures instead of logging forever while dropping all replies. Verified by
+`TestHeartbeatFailureLimit`, `TestGatewayHeartbeatFailureReturnsError`, and
+`TestMainEscalatesRepeatedRequestHandlerFailures`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
 attempt authentication.
+Disabled fleet must perform zero HTTP, DNS, auth, credential, or background
+cloud work. Verified by `TestDisabledFleetNoNetwork` and
+`TestMainDisabledOptionalModulesDoNotFailStartup`.
 
 8. `GW-8` Site coordination is LAN-scoped.
 Cross-device correlation and shared GSM are site functions. Fleet analytics and
@@ -45,31 +64,68 @@ billing belong in `ori-cloud`.
 9. `GW-9` Gateway must not persist reasoning results.
 Stateful learning and causal memory belong in [runtime](https://github.com/ori-platform/ori-runtime) or cloud-defined stores, not
 in the gateway request proxy.
+No direct test currently enforces this; it is enforced by code review and by
+keeping durable reasoning stores out of the gateway request path.
 
 10. `GW-10` Product reporting providers are separate from Tier 3 reasoning providers.
 The gateway may own connected customer-reporting and enrichment providers, but
 those providers must use reporting-specific config and must not be wired into
 the Tier 3 reasoning provider factory.
+Verified by `TestReportingProviderDoesNotAffectReasoningProvider`.
 
 11. `GW-11` Gateway reporting and enrichment never change action authority.
 Customer-facing weekly reports and Tier C explanation enrichment are advisory.
 They must not promote, downgrade, approve, reject, bypass, or execute runtime
 action tiers. Runtime remains the physical action authority.
+Verified by `TestTierCEnrichmentCannotChangeActionAuthority` and
+`TestTierCEnrichmentDropsInjectedAuthorityFields`.
 
 12. `GW-12` Reporting provider credentials stay out of runtime config.
 Gemini/API keys and equivalent product-provider credentials belong in gateway
 or product environment variables only. Secret values must never be committed,
 and runtime config examples must remain provider-neutral.
+Only environment variable names may appear in gateway config. Verified by
+`TestReportingAPIKeyEnvMustBeEnvVarName`.
+
+13. `GW-13` SIM access is opt-in.
+With SIM disabled, gateway must not initialise, open, probe, or otherwise touch
+modem or serial hardware. Verified by `TestDisabledSIMNoSerialProbe` and
+`TestMainDisabledOptionalModulesDoNotFailStartup`.
+
+14. `GW-14` Gateway data access goes through runtime-owned interfaces.
+Gateway must not read runtime SQLite files directly. Sensor history, action
+logs, Tier C decisions, and runtime health must be consumed through explicit
+runtime-owned export interfaces. Current enforcement is structural: the gateway
+has no SQLite driver dependency and runtime-client tests such as
+`TestTierCDecisionLogRequestValidation` validate the export request contract.
+Future transport tests must preserve this boundary and must not add direct
+SQLite access.
+
+15. `GW-15` Gateway process startup and shutdown must be ordered and explicit.
+Startup order is config, provider, broker connect, optional modules, heartbeat,
+dispatcher, then MQTT subscribe. Failure at any required stage must prevent
+later stages from starting. Shutdown must cancel background work and disconnect
+the broker. Verified by `TestMainStartupMissingConfig`,
+`TestGatewayStartupProviderFailureStopsBeforeBroker`,
+`TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
+`TestGatewayStartupSubscribeFailureCancelsHeartbeatAndDisconnects`,
+`TestMainStartsHeartbeatBeforeSubscribe`, and `TestGracefulShutdown`.
 
 ## Layout
 
 ```text
 cmd/ori-gateway/
 internal/broker/
+internal/config/
 internal/contracts/
+internal/dispatcher/
+internal/fleet/
 internal/heartbeat/
 internal/provider/
+internal/reporting/
+internal/runtimeclient/
 internal/session/
+internal/sim/
 internal/site/
 ```
 
