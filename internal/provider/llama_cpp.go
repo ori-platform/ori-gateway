@@ -71,6 +71,13 @@ func (p *LlamaCppProvider) Name() string {
 	return "llama_cpp"
 }
 
+func (p *LlamaCppProvider) Healthy(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, ok := p.fetchModel(ctx)
+	return ok
+}
+
 func (p *LlamaCppProvider) Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
 	if req.TimeoutMS > 0 {
 		var cancel context.CancelFunc

@@ -25,6 +25,10 @@ func (p EchoProvider) Name() string {
 	return p.ModelName
 }
 
+func (p EchoProvider) Healthy(context.Context) bool {
+	return true
+}
+
 func (p EchoProvider) Reason(_ context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
 	return contracts.ReasoningResponse{
 		RequestID:  req.RequestID,

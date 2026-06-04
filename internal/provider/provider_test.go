@@ -28,3 +28,10 @@ func TestEchoProviderPreservesRequestIDAndTier(t *testing.T) {
 		t.Fatalf("tier changed: %q", resp.ActionTier)
 	}
 }
+
+func TestEchoProviderHealthy(t *testing.T) {
+	p := EchoProvider{}
+	if !p.Healthy(context.Background()) {
+		t.Fatal("echo provider should be healthy")
+	}
+}
