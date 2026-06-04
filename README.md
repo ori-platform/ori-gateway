@@ -36,37 +36,49 @@ Runtime baseline:
 
 - [`ori-runtime`](https://github.com/ori-platform/ori-runtime) `v0.9.0-beta.2+`
 
-## Bootstrap Scope
+## Current Scope
 
-Implemented in this repository baseline:
+Implemented in this repository:
 
 - Gateway API v1 typed request/response contracts
 - Topic helpers for request/response/heartbeat topics
-- Provider interface for reasoning backends
-- Request/response correlation validation
+- MQTT broker client with reconnect and fail-fast publish behavior
+- Tier 3 reasoning provider interface and provider factory
+- Echo and llama.cpp reasoning providers
+- Runtime reasoning request dispatcher with timeout/error responses
+- Request/response correlation and topic/device validation
 - Session registry primitives for request lifecycle tracking
 - Site heartbeat aggregation primitives
+- LAN health heartbeat publisher with supervision
+- Gateway process wiring: config, provider, broker, heartbeat, dispatcher, and graceful shutdown
+- Runtime export client contracts and MQTT runtime export client
+- Weekly report generation against runtime export interfaces
+- Tier C enrichment contracts
+- SIM and fleet optional-module stubs with disabled-path safety guarantees
 - CI, repository invariants, and contribution guardrails
 
 Deferred implementation:
 
-- MQTT broker connection loop
-- llama.cpp provider
-- Claude provider
-- SIM module integration
-- Fleet forwarding to ori-cloud
+- Full SIM modem integration for shared outbound SMS
+- Fleet forwarding and control-plane integration through `ori-cloud`
+- Runtime-side Tier 3 gateway reasoning client and deterministic escalation policy
+- Runtime-side consumption of gateway heartbeat capability posture
 
 ## Invariant
 
 The gateway is never in the Tier D path. Tier D fires locally in the
 [`ori-runtime`](https://github.com/ori-platform/ori-runtime) rule engine before gateway, cloud, or network systems are consulted.
 
+The gateway also does not read runtime SQLite directly. Runtime data used for
+reports, enrichment, or site status must come through runtime-owned export
+interfaces.
+
 ## Development
 
 ```bash
 pre-commit install
 go test ./...
-go fmt ./...
+go vet ./...
 ```
 
 ## License
