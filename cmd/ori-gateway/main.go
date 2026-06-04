@@ -4,11 +4,9 @@
 package main
 
 import (
-	"fmt"
-
-	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"os"
 )
 
 func main() {
-	fmt.Printf("ori-gateway bootstrap: heartbeat topic %s\n", contracts.GatewayHealthTopic)
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
