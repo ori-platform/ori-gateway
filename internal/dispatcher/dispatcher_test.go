@@ -99,8 +99,6 @@ type fakeProvider struct {
 
 func (p *fakeProvider) Name() string { return "fake" }
 
-func (p *fakeProvider) Healthy(context.Context) bool { return true }
-
 func (p *fakeProvider) Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
 	p.mu.Lock()
 	p.calls++

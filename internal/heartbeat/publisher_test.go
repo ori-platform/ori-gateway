@@ -246,7 +246,7 @@ func TestHeartbeatRestartOnPanic(t *testing.T) {
 }
 
 func TestHeartbeatFailureLimit(t *testing.T) {
-	fatalCh := make(chan struct{}, 1)
+	var fatalCalls atomic.Int32
 	publish := func(context.Context, []byte) error {
 		return errors.New("publish failed")
 	}
@@ -257,19 +257,23 @@ func TestHeartbeatFailureLimit(t *testing.T) {
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval:     1 * time.Millisecond,
 		FailureLimit: 3,
-		Fatal:        func(int) { fatalCh <- struct{}{} },
+		Fatal:        func(int) { fatalCalls.Add(1) },
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	go func() { _ = publisher.Run(ctx) }()
+	done := make(chan error, 1)
+	go func() { done <- publisher.Run(ctx) }()
 
 	select {
-	case <-fatalCh:
+	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected fatal after repeated publish failures")
+	}
+	if got := fatalCalls.Load(); got != 1 {
+		t.Fatalf("fatal calls = %d, want exactly 1", got)
 	}
 }
 
@@ -455,9 +459,12 @@ func TestHeartbeatTimestampsMonotonic(t *testing.T) {
 }
 
 func TestHeartbeatUptimeIsFloat64(t *testing.T) {
-	var payload []byte
+	payloads := make(chan []byte, 1)
 	publish := func(_ context.Context, p []byte) error {
-		payload = append([]byte(nil), p...)
+		select {
+		case payloads <- append([]byte(nil), p...):
+		default:
+		}
 		return nil
 	}
 
@@ -478,14 +485,10 @@ func TestHeartbeatUptimeIsFloat64(t *testing.T) {
 
 	go func() { _ = publisher.Run(ctx) }()
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if payload != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if payload == nil {
+	var payload []byte
+	select {
+	case payload = <-payloads:
+	case <-time.After(time.Second):
 		t.Fatal("no heartbeat published")
 	}
 
@@ -499,6 +502,13 @@ func TestHeartbeatUptimeIsFloat64(t *testing.T) {
 	}
 	if uptime != 2.5 {
 		t.Fatalf("uptime_s = %v, want 2.5", uptime)
+	}
+}
+
+func TestPublishFromBrokerRejectsNilClient(t *testing.T) {
+	publish := PublishFromBroker(nil)
+	if err := publish(context.Background(), []byte(`{}`)); err == nil {
+		t.Fatal("expected nil broker client error")
 	}
 }
 

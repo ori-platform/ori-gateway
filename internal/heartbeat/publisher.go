@@ -15,16 +15,22 @@ import (
 
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
-	"github.com/ori-platform/ori-gateway/internal/provider"
 )
 
 // PublishFunc publishes a heartbeat payload to the LAN.
 type PublishFunc func(ctx context.Context, payload []byte) error
 
+// ProviderStatus is the narrow provider health surface needed by heartbeat.
+// It intentionally stays separate from provider.Provider, which is reasoning-only.
+type ProviderStatus interface {
+	Name() string
+	Healthy(ctx context.Context) bool
+}
+
 // Publisher publishes contracts.Heartbeat on an interval with crash supervision.
 type Publisher struct {
 	publish      PublishFunc
-	provider     provider.Provider
+	provider     ProviderStatus
 	sim          SIMStatus
 	interval     time.Duration
 	failureLimit int
@@ -49,7 +55,7 @@ type Options struct {
 }
 
 // NewPublisher constructs a supervised heartbeat publisher.
-func NewPublisher(publish PublishFunc, prov provider.Provider, sim SIMStatus, opts Options) (*Publisher, error) {
+func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts Options) (*Publisher, error) {
 	if publish == nil {
 		return nil, fmt.Errorf("heartbeat: publish func must not be nil")
 	}
@@ -101,6 +107,9 @@ func NewPublisher(publish PublishFunc, prov provider.Provider, sim SIMStatus, op
 // PublishFromBroker adapts broker.Client to PublishFunc.
 func PublishFromBroker(client *broker.Client) PublishFunc {
 	return func(ctx context.Context, payload []byte) error {
+		if client == nil {
+			return fmt.Errorf("heartbeat: broker client must not be nil")
+		}
 		return client.Publish(ctx, contracts.GatewayHealthTopic, broker.QoSHeartbeat, false, payload)
 	}
 }
@@ -134,46 +143,51 @@ func (p *Publisher) loop(ctx context.Context) bool {
 	defer ticker.Stop()
 
 	failures := 0
-	p.publishOnce(ctx, &failures)
+	if p.publishOnce(ctx, &failures) {
+		return true
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return true
 		case <-ticker.C:
-			p.publishOnce(ctx, &failures)
+			if p.publishOnce(ctx, &failures) {
+				return true
+			}
 		}
 	}
 }
 
-func (p *Publisher) publishOnce(ctx context.Context, failures *int) {
+func (p *Publisher) publishOnce(ctx context.Context, failures *int) bool {
 	if err := ctx.Err(); err != nil {
-		return
+		return false
 	}
 
 	payload, err := p.buildPayload(ctx)
 	if err != nil {
-		p.recordFailure(failures, err)
-		return
+		return p.recordFailure(failures, err)
 	}
 	if err := p.publish(ctx, payload); err != nil {
-		p.recordFailure(failures, err)
-		return
+		return p.recordFailure(failures, err)
 	}
 
 	p.mu.Lock()
 	p.everPublished = true
 	p.mu.Unlock()
 	*failures = 0
+	return false
 }
 
-func (p *Publisher) recordFailure(failures *int, err error) {
+func (p *Publisher) recordFailure(failures *int, err error) bool {
 	*failures++
 	p.log.Warn("heartbeat publish failed", "error", err, "failures", *failures, "limit", p.failureLimit)
 	if *failures >= p.failureLimit {
 		p.log.Error("heartbeat failure limit reached, exiting")
 		p.fatal(1)
+		return true
 	}
+	return false
 }
 
 func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {

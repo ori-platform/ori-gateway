@@ -11,7 +11,6 @@ import (
 
 type Provider interface {
 	Name() string
-	Healthy(ctx context.Context) bool
 	Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error)
 }
 
