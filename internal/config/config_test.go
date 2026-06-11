@@ -862,3 +862,40 @@ provider:
 		})
 	}
 }
+
+func TestCloudLLMProviderIgnoresReportingConfig(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: cloud_llm
+  timeout_ms: 5000
+  cloud_llm:
+    vendor: claude
+    api_key_env: ANTHROPIC_API_KEY
+    model: claude-sonnet-4-5
+    base_url: "https://api.anthropic.com/v1/messages"
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "08:00"
+    timezone: Africa/Lagos
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Name != ProviderCloudLLM || cfg.Provider.CloudLLM.Vendor != CloudVendorClaude || cfg.Provider.CloudLLM.APIKeyEnv != "ANTHROPIC_API_KEY" {
+		t.Fatalf("unexpected cloud provider config: %#v", cfg.Provider)
+	}
+	if cfg.Reporting.Provider != ReportingProviderGemini || cfg.Reporting.Gemini.APIKeyEnv != "GEMINI_API_KEY" {
+		t.Fatalf("unexpected reporting config: %#v", cfg.Reporting)
+	}
+}
