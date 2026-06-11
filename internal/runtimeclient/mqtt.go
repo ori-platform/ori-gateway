@@ -21,6 +21,7 @@ const (
 	exportTypeSensorHistory    = "sensor_history"
 	exportTypeActionLog        = "action_log"
 	exportTypeTierCDecisionLog = "tier_c_decision_log"
+	exportTypeReasoningLog     = "reasoning_log"
 	maxExportPages             = 100
 )
 
@@ -165,6 +166,49 @@ func (c *MQTTClient) TierCDecisionLog(ctx context.Context, req TierCDecisionLogR
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+func (c *MQTTClient) ReasoningLog(ctx context.Context, req ReasoningLogRequest) ([]ReasoningLogEntry, error) {
+	normalized, err := NormalizeReasoningLogRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	items, err := c.exportAll(ctx, exportRequest{
+		DeviceID:   normalized.DeviceID,
+		ExportType: exportTypeReasoningLog,
+		SinceMS:    normalized.SinceMS,
+		UntilMS:    normalized.UntilMS,
+		Limit:      normalized.Limit,
+		Params:     reasoningLogParams(normalized),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ReasoningLogEntry, 0, len(items))
+	for _, item := range items {
+		out = append(out, mapReasoningLogEntry(item, normalized.DeviceID))
+	}
+	return out, nil
+}
+
+func reasoningLogParams(req ReasoningLogRequest) map[string]any {
+	params := map[string]any{}
+	if req.TierUsed != "" {
+		params["tier_used"] = req.TierUsed
+	}
+	if req.ActionTier != "" {
+		params["action_tier"] = req.ActionTier
+	}
+	if req.ReasoningStatus != "" {
+		params["reasoning_status"] = req.ReasoningStatus
+	}
+	if req.CorrelationID != "" {
+		params["correlation_id"] = req.CorrelationID
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return params
 }
 
 func (c *MQTTClient) exportAll(ctx context.Context, base exportRequest) ([]map[string]any, error) {
@@ -442,6 +486,32 @@ func mapTierCDecisionEntry(item map[string]any, fallbackDeviceID string) (TierCD
 		Timezone:          stringValue(item, "timezone", ""),
 		LaterOutcome:      mapValue(item, "later_outcome"),
 	}, nil
+}
+
+func mapReasoningLogEntry(item map[string]any, fallbackDeviceID string) ReasoningLogEntry {
+	createdAtMS := int64Value(item, "created_at_ms")
+	if createdAtMS == 0 {
+		createdAtMS = int64Value(item, "created_at", int64Value(item, "timestamp"))
+	}
+	return ReasoningLogEntry{
+		DeviceID:        stringValue(item, "device_id", fallbackDeviceID),
+		SkillName:       stringValue(item, "skill_name", ""),
+		TriggerName:     stringValue(item, "trigger_name", ""),
+		SensorID:        stringValue(item, "sensor_id", ""),
+		SensorType:      stringValue(item, "sensor_type", ""),
+		TierUsed:        stringValue(item, "tier_used", ""),
+		Model:           stringValue(item, "model", ""),
+		PromptText:      stringValue(item, "prompt_text", ""),
+		ReasoningText:   stringValue(item, "reasoning_text", ""),
+		Confidence:      floatValue(item, "confidence"),
+		ProposedAction:  stringValue(item, "proposed_action", ""),
+		ActionTier:      stringValue(item, "action_tier", ""),
+		TokenCount:      intValue(item, "token_count"),
+		LatencyMS:       int64Value(item, "latency_ms"),
+		ReasoningStatus: stringValue(item, "reasoning_status", ""),
+		CorrelationID:   stringValue(item, "correlation_id", ""),
+		CreatedAtMS:     createdAtMS,
+	}
 }
 
 func mapLockoutRiskLevels(item map[string]any) map[string]LockoutRiskState {

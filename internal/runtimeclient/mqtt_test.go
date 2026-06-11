@@ -305,6 +305,124 @@ func TestMQTTRuntimeClientTierCDecisionLog(t *testing.T) {
 	}
 }
 
+func TestMQTTRuntimeClientReasoningLog(t *testing.T) {
+	b := newFakeBroker()
+	client := newTestMQTTClient(t, b, "reasoning-1")
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Fatal(err)
+		}
+		if req.ExportType != "reasoning_log" {
+			t.Fatalf("export_type = %q", req.ExportType)
+		}
+		b.respond(req.DeviceID, req.RequestID, map[string]any{
+			"export_type": "reasoning_log",
+			"complete":    true,
+			"items": []any{map[string]any{
+				"device_id":        "edge-1",
+				"created_at_ms":    float64(5000),
+				"skill_name":       "energy-anomaly-detector",
+				"trigger_name":     "overcurrent",
+				"sensor_id":        "current-main",
+				"sensor_type":      "current_clamp",
+				"tier_used":        "gateway",
+				"model":            "llama-3.2-3b",
+				"prompt_text":      "explain",
+				"reasoning_text":   "voltage sag caused current spike",
+				"confidence":       0.73,
+				"proposed_action":  "notify operator",
+				"action_tier":      "A",
+				"token_count":      float64(42),
+				"latency_ms":       float64(1250),
+				"reasoning_status": "complete",
+				"correlation_id":   "corr-1",
+			}},
+		})
+	}
+
+	rows, err := client.ReasoningLog(context.Background(), ReasoningLogRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, Limit: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d", len(rows))
+	}
+	row := rows[0]
+	if row.CorrelationID != "corr-1" || row.ReasoningStatus != "complete" || row.TokenCount != 42 || row.LatencyMS != 1250 {
+		t.Fatalf("reasoning row not mapped: %#v", row)
+	}
+	if row.ReasoningText != "voltage sag caused current spike" || row.Model != "llama-3.2-3b" {
+		t.Fatalf("reasoning text/model not mapped: %#v", row)
+	}
+}
+
+func TestMQTTRuntimeClientReasoningLogFiltersForwarded(t *testing.T) {
+	b := newFakeBroker()
+	client := newTestMQTTClient(t, b, "reasoning-filter-1")
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Fatal(err)
+		}
+		if req.ExportType != "reasoning_log" {
+			t.Fatalf("export_type = %q", req.ExportType)
+		}
+		wantParams := map[string]any{
+			"tier_used":        "gateway",
+			"action_tier":      "B",
+			"reasoning_status": "incomplete",
+			"correlation_id":   "corr-1",
+		}
+		for key, want := range wantParams {
+			if got := req.Params[key]; got != want {
+				t.Fatalf("param %s = %#v, want %#v in %#v", key, got, want, req.Params)
+			}
+		}
+		b.respond(req.DeviceID, req.RequestID, map[string]any{
+			"export_type": "reasoning_log",
+			"complete":    true,
+			"items":       []any{},
+		})
+	}
+
+	rows, err := client.ReasoningLog(context.Background(), ReasoningLogRequest{
+		BoundedWindow:   BoundedWindow{DeviceID: "edge-1", SinceMS: 1, UntilMS: 2, Limit: 10},
+		TierUsed:        "gateway",
+		ActionTier:      "B",
+		ReasoningStatus: "incomplete",
+		CorrelationID:   "corr-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected empty rows, got %#v", rows)
+	}
+}
+
+func TestMQTTRuntimeClientReasoningLogRuntimeError(t *testing.T) {
+	b := newFakeBroker()
+	client := newTestMQTTClient(t, b, "reasoning-error-1")
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Fatal(err)
+		}
+		b.respond(req.DeviceID, req.RequestID, map[string]any{
+			"export_type": "reasoning_log",
+			"complete":    true,
+			"error":       "reasoning log unavailable",
+			"items":       []any{},
+		})
+	}
+
+	_, err := client.ReasoningLog(context.Background(), ReasoningLogRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, Limit: 10}})
+	if err == nil || !strings.Contains(err.Error(), "reasoning log unavailable") {
+		t.Fatalf("expected runtime error, got %v", err)
+	}
+}
+
 func TestMQTTRuntimeClientIgnoresUnmatchedResponseID(t *testing.T) {
 	b := newFakeBroker()
 	client := newTestMQTTClient(t, b, "wanted-id")
