@@ -43,6 +43,9 @@ func TestTopicsMatchGatewaySpec(t *testing.T) {
 	if RuntimeNodeHeartbeatTopicFilter != "ori/+/runtime/heartbeat" {
 		t.Fatalf("unexpected runtime heartbeat filter: %s", RuntimeNodeHeartbeatTopicFilter)
 	}
+	if TierCEnrichmentRequestTopicFilter != "ori/+/tier_c/enrichment/request" {
+		t.Fatalf("unexpected tier c enrichment request filter: %s", TierCEnrichmentRequestTopicFilter)
+	}
 	if HeartbeatAuthScheme != "hmac-sha256" {
 		t.Fatalf("unexpected heartbeat auth scheme: %s", HeartbeatAuthScheme)
 	}
@@ -60,6 +63,28 @@ func TestTopicsMatchGatewaySpec(t *testing.T) {
 	}
 	if deviceID != "site-a" {
 		t.Fatalf("unexpected runtime heartbeat topic device_id: %s", deviceID)
+	}
+
+	enrichReqTopic, err := TierCEnrichmentRequestTopic("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enrichReqTopic != "ori/site-a/tier_c/enrichment/request" {
+		t.Fatalf("unexpected tier c enrichment request topic: %s", enrichReqTopic)
+	}
+	enrichRespTopic, err := TierCEnrichmentResponseTopic("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enrichRespTopic != "ori/site-a/tier_c/enrichment/response" {
+		t.Fatalf("unexpected tier c enrichment response topic: %s", enrichRespTopic)
+	}
+	deviceID, err = DeviceIDFromTierCEnrichmentRequestTopic(enrichReqTopic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deviceID != "site-a" {
+		t.Fatalf("unexpected tier c enrichment topic device_id: %s", deviceID)
 	}
 
 	exportReqTopic, err := ExportRequestTopic("site-a")
@@ -110,6 +135,12 @@ func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
 		}
 		if topic, err := RuntimeNodeHeartbeatTopic(deviceID); err == nil {
 			t.Fatalf("RuntimeNodeHeartbeatTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+		if topic, err := TierCEnrichmentRequestTopic(deviceID); err == nil {
+			t.Fatalf("TierCEnrichmentRequestTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+		if topic, err := TierCEnrichmentResponseTopic(deviceID); err == nil {
+			t.Fatalf("TierCEnrichmentResponseTopic(%q) returned %q, expected error", deviceID, topic)
 		}
 		if topic, err := ExportResponseTopicFilter(deviceID); err == nil {
 			t.Fatalf("ExportResponseTopicFilter(%q) returned %q, expected error", deviceID, topic)

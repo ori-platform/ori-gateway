@@ -21,6 +21,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/dispatcher"
+	"github.com/ori-platform/ori-gateway/internal/enrichment"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -47,13 +48,14 @@ type heartbeatRunner interface {
 }
 
 type appDependencies struct {
-	loadConfig      func(path string) (config.Config, error)
-	newProvider     func(cfg config.ProviderConfig) (provider.Provider, error)
-	newBroker       func(opts broker.Options) (brokerClient, error)
-	newSIM          func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
-	newFleet        func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
-	newSiteRegistry func() *site.Registry
-	newHeartbeat    func(
+	loadConfig                 func(path string) (config.Config, error)
+	newProvider                func(cfg config.ProviderConfig) (provider.Provider, error)
+	newTierCEnrichmentProvider func(cfg config.ReportingConfig) (enrichment.Provider, error)
+	newBroker                  func(opts broker.Options) (brokerClient, error)
+	newSIM                     func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
+	newFleet                   func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
+	newSiteRegistry            func() *site.Registry
+	newHeartbeat               func(
 		publish heartbeat.PublishFunc,
 		prov heartbeat.ProviderStatus,
 		simStatus heartbeat.SIMStatus,
@@ -67,6 +69,9 @@ func defaultDependencies() appDependencies {
 	return appDependencies{
 		loadConfig:  config.Load,
 		newProvider: provider.NewFromConfig,
+		newTierCEnrichmentProvider: func(config.ReportingConfig) (enrichment.Provider, error) {
+			return nil, fmt.Errorf("tier C enrichment reporting provider is not wired")
+		},
 		newBroker: func(opts broker.Options) (brokerClient, error) {
 			return broker.New(opts)
 		},
@@ -255,6 +260,38 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
+	if cfg.Reporting.TierCEnrichment.Enabled {
+		enrichmentProvider, err := deps.newTierCEnrichmentProvider(cfg.Reporting)
+		if err != nil {
+			cancel()
+			<-heartbeatErr
+			return fmt.Errorf("construct tier c enrichment provider: %w", err)
+		}
+		enrichmentHandler, err := enrichment.NewHandler(client, enrichmentProvider, enrichment.Options{Logger: deps.logger})
+		if err != nil {
+			cancel()
+			<-heartbeatErr
+			return fmt.Errorf("construct tier c enrichment handler: %w", err)
+		}
+		for _, deviceID := range cfg.Gateway.DeviceIDs {
+			topic, err := contracts.TierCEnrichmentRequestTopic(deviceID)
+			if err != nil {
+				cancel()
+				<-heartbeatErr
+				return fmt.Errorf("tier c enrichment request topic: %w", err)
+			}
+			if err := client.Subscribe(runCtx, topic, broker.QoSReasoning, func(topic string, payload []byte) {
+				if err := enrichmentHandler.HandleRequest(runCtx, topic, payload); err != nil {
+					deps.logger.Warn("tier c enrichment request handling failed", "topic", topic, "error", err)
+				}
+			}); err != nil {
+				cancel()
+				<-heartbeatErr
+				return fmt.Errorf("subscribe tier c enrichment requests: %w", err)
+			}
+		}
+	}
+
 	select {
 	case <-ctx.Done():
 		cancel()
@@ -369,6 +406,9 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	}
 	if deps.newProvider == nil {
 		deps.newProvider = defaults.newProvider
+	}
+	if deps.newTierCEnrichmentProvider == nil {
+		deps.newTierCEnrichmentProvider = defaults.newTierCEnrichmentProvider
 	}
 	if deps.newBroker == nil {
 		deps.newBroker = defaults.newBroker

@@ -17,6 +17,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/enrichment"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -194,6 +195,32 @@ func (p *fakeProvider) Reason(_ context.Context, req contracts.ReasoningRequest)
 	}, nil
 }
 
+type fakeTierCEnrichmentProvider struct {
+	mu       sync.Mutex
+	requests []contracts.TierCEnrichmentRequest
+	response contracts.TierCEnrichmentResponse
+	err      error
+}
+
+func (p *fakeTierCEnrichmentProvider) EnrichTierC(_ context.Context, req contracts.TierCEnrichmentRequest) (contracts.TierCEnrichmentResponse, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+	if p.err != nil {
+		return contracts.TierCEnrichmentResponse{}, p.err
+	}
+	if p.response.Explanation != "" || p.response.Error != nil {
+		return p.response, nil
+	}
+	return contracts.TierCEnrichmentResponse{
+		Explanation:                "This action needs operator approval.",
+		EstimatedImpact:            "Could reduce peak load.",
+		RecommendedOperatorContext: "Confirm whether occupants are still present.",
+		Provider:                   "fake-reporting",
+		Model:                      "fake-model",
+	}, nil
+}
+
 type fakeHeartbeat struct {
 	started chan struct{}
 	once    sync.Once
@@ -257,6 +284,9 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 		},
 		newProvider: func(config.ProviderConfig) (provider.Provider, error) {
 			return fp, nil
+		},
+		newTierCEnrichmentProvider: func(config.ReportingConfig) (enrichment.Provider, error) {
+			return &fakeTierCEnrichmentProvider{}, nil
 		},
 		newBroker: func(broker.Options) (brokerClient, error) {
 			return fb, nil
@@ -925,4 +955,197 @@ func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("stale runtime nodes were not evicted: %#v", registry.Snapshot())
+}
+
+func validTierCEnrichmentRequestPayload(t *testing.T) []byte {
+	t.Helper()
+	payload, err := json.Marshal(contracts.TierCEnrichmentRequest{
+		RequestID:         "enrich-1",
+		ProposalID:        "proposal-1",
+		DeviceID:          "dev-01",
+		SkillName:         "energy-anomaly-detector",
+		TriggerName:       "sustained_high_load",
+		SensorID:          "current-main",
+		SensorType:        "current_clamp",
+		ReadingValue:      18.4,
+		Unit:              "A",
+		ProposedAction:    "open_hvac_contactor",
+		SafeDefaultAction: "alert_operator",
+		OperatorMessage:   "Approve HVAC scale-back?",
+		TimeoutMS:         1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func TestMainDoesNotSubscribeTierCEnrichmentWhenDisabled(t *testing.T) {
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", baseDeps(t, validConfig(), fb, fp, hb))
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	if _, ok := fb.handlers["ori/dev-01/tier_c/enrichment/request"]; ok {
+		t.Fatalf("tier c enrichment subscription should be disabled, topics %v", fb.subscribeTopics)
+	}
+}
+
+func TestMainSubscribesAndHandlesTierCEnrichmentWhenEnabled(t *testing.T) {
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider:        config.ReportingProviderGemini,
+		Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		TierCEnrichment: config.TierCEnrichmentConfig{Enabled: true},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	enrichmentProvider := &fakeTierCEnrichmentProvider{}
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newTierCEnrichmentProvider = func(config.ReportingConfig) (enrichment.Provider, error) {
+		return enrichmentProvider, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", deps)
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		handler = fb.handlerFor("ori/dev-01/tier_c/enrichment/request")
+		if handler != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing tier c enrichment handler, got topics %v", fb.subscribeTopics)
+	}
+	if fb.subscribeQoSByTopic["ori/dev-01/tier_c/enrichment/request"] != broker.QoSReasoning {
+		t.Fatalf("tier c enrichment qos = %d", fb.subscribeQoSByTopic["ori/dev-01/tier_c/enrichment/request"])
+	}
+	handler("ori/dev-01/tier_c/enrichment/request", validTierCEnrichmentRequestPayload(t))
+
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fb.mu.Lock()
+		var payload []byte
+		var retain bool
+		var qos byte
+		for _, msg := range fb.published {
+			if msg.topic == "ori/dev-01/tier_c/enrichment/response" {
+				payload = append([]byte(nil), msg.payload...)
+				retain = msg.retain
+				qos = msg.qos
+				break
+			}
+		}
+		fb.mu.Unlock()
+		if payload != nil {
+			if retain {
+				t.Fatal("tier c enrichment response must not be retained")
+			}
+			if qos != broker.QoSReasoning {
+				t.Fatalf("tier c enrichment response qos = %d", qos)
+			}
+			var resp contracts.TierCEnrichmentResponse
+			if err := json.Unmarshal(payload, &resp); err != nil {
+				t.Fatal(err)
+			}
+			if resp.RequestID != "enrich-1" || resp.ProposalID != "proposal-1" || resp.Explanation == "" {
+				t.Fatalf("unexpected enrichment response: %#v", resp)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("runGateway returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("gateway did not stop")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for tier c enrichment response")
+}
+
+func TestMainTierCEnrichmentProviderFailureStopsStartupWhenEnabled(t *testing.T) {
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider:        config.ReportingProviderGemini,
+		Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		TierCEnrichment: config.TierCEnrichmentConfig{Enabled: true},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newTierCEnrichmentProvider = func(config.ReportingConfig) (enrichment.Provider, error) {
+		return nil, errors.New("reporting provider unavailable")
+	}
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "construct tier c enrichment provider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	select {
+	case <-fb.disconnectedCh:
+	case <-time.After(time.Second):
+		t.Fatal("broker should be disconnected after enrichment provider startup failure")
+	}
+}
+
+func TestMainTierCEnrichmentSubscribeFailureCancelsHeartbeatAndDisconnects(t *testing.T) {
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider:        config.ReportingProviderGemini,
+		Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		TierCEnrichment: config.TierCEnrichmentConfig{Enabled: true},
+	}
+	fb := newFakeBroker()
+	fb.subscribeErrByTopic = map[string]error{
+		"ori/dev-01/tier_c/enrichment/request": errors.New("tier c subscribe failed"),
+	}
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+
+	err := runGateway(context.Background(), "gateway.yaml", baseDeps(t, cfg, fb, fp, hb))
+	if err == nil || !strings.Contains(err.Error(), "subscribe tier c enrichment requests") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	select {
+	case <-fb.disconnectedCh:
+	case <-time.After(time.Second):
+		t.Fatal("broker should be disconnected after tier c enrichment subscribe failure")
+	}
 }
