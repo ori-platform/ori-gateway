@@ -27,6 +27,7 @@ type Client interface {
 	SensorHistory(ctx context.Context, req SensorHistoryRequest) ([]SensorAggregate, error)
 	ActionLog(ctx context.Context, req ActionLogRequest) ([]ActionLogEntry, error)
 	TierCDecisionLog(ctx context.Context, req TierCDecisionLogRequest) ([]TierCDecisionEntry, error)
+	ReasoningLog(ctx context.Context, req ReasoningLogRequest) ([]ReasoningLogEntry, error)
 }
 
 // HealthRequest asks runtime for a device-scoped health snapshot.
@@ -109,6 +110,36 @@ type TierCDecisionLogRequest struct {
 	BoundedWindow
 }
 
+// ReasoningLogRequest asks runtime for bounded reasoning audit history.
+type ReasoningLogRequest struct {
+	BoundedWindow
+	TierUsed        string
+	ActionTier      string
+	ReasoningStatus string
+	CorrelationID   string
+}
+
+// ReasoningLogEntry is a runtime reasoning log row shaped for gateway reporting and audit sync.
+type ReasoningLogEntry struct {
+	DeviceID        string
+	SkillName       string
+	TriggerName     string
+	SensorID        string
+	SensorType      string
+	TierUsed        string
+	Model           string
+	PromptText      string
+	ReasoningText   string
+	Confidence      float64
+	ProposedAction  string
+	ActionTier      string
+	TokenCount      int
+	LatencyMS       int64
+	ReasoningStatus string
+	CorrelationID   string
+	CreatedAtMS     int64
+}
+
 // HistorySample is the reporting-safe history context attached to a Tier C decision.
 type HistorySample struct {
 	SensorID    string
@@ -184,6 +215,52 @@ func NormalizeTierCDecisionLogRequest(req TierCDecisionLogRequest) (TierCDecisio
 	}
 	req.BoundedWindow = window
 	return req, nil
+}
+
+// NormalizeReasoningLogRequest validates req and returns a copy with capped limit.
+func NormalizeReasoningLogRequest(req ReasoningLogRequest) (ReasoningLogRequest, error) {
+	window, err := NormalizeBoundedWindow(req.BoundedWindow)
+	if err != nil {
+		return ReasoningLogRequest{}, err
+	}
+	if req.TierUsed != "" && !isValidReasoningTier(req.TierUsed) {
+		return ReasoningLogRequest{}, fmt.Errorf("tier_used must be rule, local_slm, or gateway")
+	}
+	if req.ActionTier != "" && !isValidActionTier(req.ActionTier) {
+		return ReasoningLogRequest{}, fmt.Errorf("action_tier must be A, B, C, or D")
+	}
+	if req.ReasoningStatus != "" && !isValidReasoningStatus(req.ReasoningStatus) {
+		return ReasoningLogRequest{}, fmt.Errorf("reasoning_status must be complete, incomplete, or skipped")
+	}
+	req.BoundedWindow = window
+	return req, nil
+}
+
+func isValidReasoningTier(tier string) bool {
+	switch tier {
+	case "rule", "local_slm", "gateway":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidActionTier(tier string) bool {
+	switch tier {
+	case "A", "B", "C", "D":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidReasoningStatus(status string) bool {
+	switch status {
+	case "complete", "incomplete", "skipped":
+		return true
+	default:
+		return false
+	}
 }
 
 // NormalizeBoundedWindow validates window and returns a copy with the limit capped.

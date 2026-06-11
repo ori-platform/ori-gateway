@@ -21,11 +21,14 @@ type FakeClient struct {
 	ActionLogErr         error
 	TierCDecisionLogRows []TierCDecisionEntry
 	TierCDecisionLogErr  error
+	ReasoningLogRows     []ReasoningLogEntry
+	ReasoningLogErr      error
 
 	lastHealthRequest           HealthRequest
 	lastSensorHistoryRequest    SensorHistoryRequest
 	lastActionLogRequest        ActionLogRequest
 	lastTierCDecisionLogRequest TierCDecisionLogRequest
+	lastReasoningLogRequest     ReasoningLogRequest
 }
 
 func (f *FakeClient) Health(ctx context.Context, req HealthRequest) (HealthSnapshot, error) {
@@ -96,6 +99,23 @@ func (f *FakeClient) TierCDecisionLog(ctx context.Context, req TierCDecisionLogR
 	return copyTierCDecisionEntries(f.TierCDecisionLogRows), nil
 }
 
+func (f *FakeClient) ReasoningLog(ctx context.Context, req ReasoningLogRequest) ([]ReasoningLogEntry, error) {
+	normalized, err := NormalizeReasoningLogRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastReasoningLogRequest = normalized
+	if f.ReasoningLogErr != nil {
+		return nil, f.ReasoningLogErr
+	}
+	return copyReasoningLogEntries(f.ReasoningLogRows), nil
+}
+
 func (f *FakeClient) LastHealthRequest() HealthRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -118,6 +138,12 @@ func (f *FakeClient) LastTierCDecisionLogRequest() TierCDecisionLogRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lastTierCDecisionLogRequest
+}
+
+func (f *FakeClient) LastReasoningLogRequest() ReasoningLogRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastReasoningLogRequest
 }
 
 func copySensorAggregates(rows []SensorAggregate) []SensorAggregate {
@@ -144,6 +170,10 @@ func copyTierCDecisionEntries(rows []TierCDecisionEntry) []TierCDecisionEntry {
 		out[i].LaterOutcome = copyMap(out[i].LaterOutcome)
 	}
 	return out
+}
+
+func copyReasoningLogEntries(rows []ReasoningLogEntry) []ReasoningLogEntry {
+	return append([]ReasoningLogEntry(nil), rows...)
 }
 
 func copyMap(in map[string]any) map[string]any {

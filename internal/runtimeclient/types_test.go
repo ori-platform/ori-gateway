@@ -125,6 +125,12 @@ func TestFakeRuntimeDataClient(t *testing.T) {
 			FinalActionResult: map[string]any{"relay": "open"},
 			LaterOutcome:      map[string]any{"stable": true},
 		}},
+		ReasoningLogRows: []ReasoningLogEntry{{
+			DeviceID:        "edge-1",
+			TierUsed:        "gateway",
+			ReasoningStatus: "complete",
+			CorrelationID:   "corr-1",
+		}},
 	}
 
 	ctx := context.Background()
@@ -165,6 +171,22 @@ func TestFakeRuntimeDataClient(t *testing.T) {
 	if len(decisions) != 1 || decisions[0].ProposalID != "abc123" {
 		t.Fatalf("unexpected decisions: %#v", decisions)
 	}
+
+	reasoning, err := client.ReasoningLog(ctx, ReasoningLogRequest{
+		BoundedWindow:   validWindow(),
+		TierUsed:        "gateway",
+		ReasoningStatus: "complete",
+		CorrelationID:   "corr-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reasoning) != 1 || reasoning[0].CorrelationID != "corr-1" {
+		t.Fatalf("unexpected reasoning rows: %#v", reasoning)
+	}
+	if client.LastReasoningLogRequest().TierUsed != "gateway" {
+		t.Fatalf("fake did not preserve reasoning filter: %#v", client.LastReasoningLogRequest())
+	}
 }
 
 func TestFakeRuntimeDataClientReturnsCopies(t *testing.T) {
@@ -176,6 +198,7 @@ func TestFakeRuntimeDataClientReturnsCopies(t *testing.T) {
 			FinalActionResult: map[string]any{"relay": "open"},
 			LaterOutcome:      map[string]any{"stable": true},
 		}},
+		ReasoningLogRows: []ReasoningLogEntry{{CorrelationID: "corr-1", ReasoningText: "original"}},
 	}
 
 	history, err := client.SensorHistory(context.Background(), SensorHistoryRequest{BoundedWindow: validWindow(), SensorID: "current-main", BucketMS: DefaultWeeklyReportBucketMS})
@@ -213,6 +236,15 @@ func TestFakeRuntimeDataClientReturnsCopies(t *testing.T) {
 	if stored.LaterOutcome["stable"] != true {
 		t.Fatalf("later outcome aliased into fake storage: %v", stored.LaterOutcome["stable"])
 	}
+
+	reasoning, err := client.ReasoningLog(context.Background(), ReasoningLogRequest{BoundedWindow: validWindow()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasoning[0].ReasoningText = "tampered"
+	if client.ReasoningLogRows[0].ReasoningText != "original" {
+		t.Fatalf("reasoning rows aliased into fake storage: %v", client.ReasoningLogRows[0].ReasoningText)
+	}
 }
 
 func TestFakeRuntimeDataClientValidatesBeforeContext(t *testing.T) {
@@ -243,6 +275,39 @@ func TestFakeRuntimeDataClientPropagatesErrorsAndContext(t *testing.T) {
 	}
 }
 
+func TestReasoningLogRequestValidation(t *testing.T) {
+	req, err := NormalizeReasoningLogRequest(ReasoningLogRequest{
+		BoundedWindow:   BoundedWindow{DeviceID: "edge-1", SinceMS: 1, Limit: MaxLimit + 50},
+		TierUsed:        "gateway",
+		ActionTier:      "B",
+		ReasoningStatus: "incomplete",
+		CorrelationID:   "corr-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Limit != MaxLimit {
+		t.Fatalf("limit = %d, want cap %d", req.Limit, MaxLimit)
+	}
+
+	cases := []struct {
+		name string
+		req  ReasoningLogRequest
+	}{
+		{name: "bad tier", req: ReasoningLogRequest{BoundedWindow: validWindow(), TierUsed: "cloud"}},
+		{name: "bad action tier", req: ReasoningLogRequest{BoundedWindow: validWindow(), ActionTier: "Z"}},
+		{name: "bad status", req: ReasoningLogRequest{BoundedWindow: validWindow(), ReasoningStatus: "unknown"}},
+		{name: "bad window", req: ReasoningLogRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NormalizeReasoningLogRequest(tc.req); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
 func TestRuntimeDataClientLimitCap(t *testing.T) {
 	client := &FakeClient{}
 	_, err := client.ActionLog(context.Background(), ActionLogRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, Limit: MaxLimit + 1}})
@@ -251,5 +316,13 @@ func TestRuntimeDataClientLimitCap(t *testing.T) {
 	}
 	if client.LastActionLogRequest().Limit != MaxLimit {
 		t.Fatalf("limit = %d, want %d", client.LastActionLogRequest().Limit, MaxLimit)
+	}
+
+	_, err = client.ReasoningLog(context.Background(), ReasoningLogRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, Limit: MaxLimit + 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.LastReasoningLogRequest().Limit != MaxLimit {
+		t.Fatalf("reasoning limit = %d, want %d", client.LastReasoningLogRequest().Limit, MaxLimit)
 	}
 }
