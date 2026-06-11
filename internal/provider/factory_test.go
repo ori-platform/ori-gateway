@@ -149,25 +149,107 @@ func TestNewFromConfigRejectsUndocumentedAlias(t *testing.T) {
 	}
 }
 
-func TestNewFromConfigUnsupportedConfiguredProvider(t *testing.T) {
-	cfg := config.ProviderConfig{
+func TestNewFromConfigCloudLLMClaude(t *testing.T) {
+	t.Setenv("CLAUDE_API_KEY", "secret-api-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-api-key"); got != "secret-api-key" {
+			t.Fatalf("x-api-key = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"model":"claude-sonnet-4-5","content":[{"type":"text","text":"factory cloud response"}],"usage":{"input_tokens":2,"output_tokens":3}}`))
+	}))
+	defer server.Close()
+
+	p, err := NewFromConfig(config.ProviderConfig{
+		Name:      config.ProviderCloudLLM,
+		TimeoutMS: 2500,
+		CloudLLM: config.CloudLLMConfig{
+			Vendor:    config.CloudVendorClaude,
+			APIKeyEnv: "CLAUDE_API_KEY",
+			Model:     "claude-sonnet-4-5",
+			BaseURL:   server.URL,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloud, ok := p.(*CloudLLMProvider)
+	if !ok {
+		t.Fatalf("provider type = %T, want *CloudLLMProvider", p)
+	}
+	if cloud.client == nil || cloud.client.Timeout != 2500*time.Millisecond {
+		t.Fatalf("client timeout = %v", cloud.client)
+	}
+	resp, err := p.Reason(context.Background(), contracts.ReasoningRequest{RequestID: "req-cloud", Prompt: "p", ActionTierHint: contracts.ActionTierC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Text != "factory cloud response" || resp.TokensUsed != 5 || resp.RequestID != "req-cloud" || resp.ActionTier != contracts.ActionTierC {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+}
+
+func TestNewFromConfigCloudLLMGemini(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "secret-gemini-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(geminiAPIKeyHeader); got != "secret-gemini-key" {
+			t.Fatalf("%s = %q", geminiAPIKeyHeader, got)
+		}
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"factory gemini response"}]}}],"usageMetadata":{"totalTokenCount":6}}`))
+	}))
+	defer server.Close()
+
+	p, err := NewFromConfig(config.ProviderConfig{
+		Name:      config.ProviderCloudLLM,
+		TimeoutMS: 2500,
+		CloudLLM: config.CloudLLMConfig{
+			Vendor:    config.CloudVendorGemini,
+			APIKeyEnv: "GEMINI_API_KEY",
+			Model:     "gemini-2.5-flash",
+			BaseURL:   server.URL,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := p.Reason(context.Background(), contracts.ReasoningRequest{RequestID: "req-gemini", Prompt: "p", ActionTierHint: contracts.ActionTierA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Text != "factory gemini response" || resp.TokensUsed != 6 || resp.RequestID != "req-gemini" || resp.ActionTier != contracts.ActionTierA {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+}
+
+func TestNewFromConfigCloudLLMMissingKey(t *testing.T) {
+	t.Setenv("MISSING_CLAUDE_KEY", "")
+	_, err := NewFromConfig(config.ProviderConfig{
 		Name: config.ProviderCloudLLM,
 		CloudLLM: config.CloudLLMConfig{
 			Vendor:    config.CloudVendorClaude,
-			APIKeyEnv: "SECRET_ENV_SHOULD_NOT_LEAK",
+			APIKeyEnv: "MISSING_CLAUDE_KEY",
 			Model:     "claude-sonnet-4-5",
-			BaseURL:   "SECRET_BASE_URL_SHOULD_NOT_LEAK",
 		},
-	}
-	_, err := NewFromConfig(cfg)
-	if err == nil {
-		t.Fatal("expected cloud_llm unsupported error")
-	}
-	if !strings.Contains(err.Error(), config.ProviderCloudLLM) || !strings.Contains(err.Error(), "not wired") {
+	})
+	if err == nil || !strings.Contains(err.Error(), "MISSING_CLAUDE_KEY") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(err.Error(), cfg.CloudLLM.APIKeyEnv) || strings.Contains(err.Error(), cfg.CloudLLM.Model) || strings.Contains(err.Error(), cfg.CloudLLM.Vendor) || strings.Contains(err.Error(), cfg.CloudLLM.BaseURL) {
-		t.Fatalf("factory error leaked cloud config details: %v", err)
+}
+
+func TestNewFromConfigCloudLLMUnsupportedVendor(t *testing.T) {
+	t.Setenv("OPENAI_KEY", "secret-openai-key")
+	_, err := NewFromConfig(config.ProviderConfig{
+		Name: config.ProviderCloudLLM,
+		CloudLLM: config.CloudLLMConfig{
+			Vendor:    config.CloudVendorOpenAI,
+			APIKeyEnv: "OPENAI_KEY",
+			Model:     "gpt-5",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not implemented") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), "secret-openai-key") {
+		t.Fatalf("factory error leaked API key: %v", err)
 	}
 }
 

@@ -6,6 +6,8 @@ package provider
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/config"
@@ -32,7 +34,20 @@ func NewFromConfig(cfg config.ProviderConfig) (Provider, error) {
 			},
 		})
 	case config.ProviderCloudLLM:
-		return nil, fmt.Errorf("provider %q is known but not wired for Tier 3 reasoning yet", cfg.Name)
+		apiKeyEnv := strings.TrimSpace(cfg.CloudLLM.APIKeyEnv)
+		apiKey := strings.TrimSpace(os.Getenv(apiKeyEnv))
+		if apiKey == "" {
+			return nil, fmt.Errorf("provider.cloud_llm.api_key_env %q is empty", apiKeyEnv)
+		}
+		return NewCloudLLMProvider(CloudLLMOptions{
+			Vendor:  cfg.CloudLLM.Vendor,
+			APIKey:  apiKey,
+			Model:   cfg.CloudLLM.Model,
+			BaseURL: cfg.CloudLLM.BaseURL,
+			HTTPClient: &http.Client{
+				Timeout: providerTimeout(cfg.TimeoutMS),
+			},
+		})
 	case "":
 		return nil, fmt.Errorf("provider name must not be empty")
 	default:
