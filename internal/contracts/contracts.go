@@ -12,6 +12,7 @@ const (
 	GatewayHealthTopic                 = "ori/gateway/health"
 	GatewayReasoningRequestTopicFilter = "ori/+/reasoning/request"
 	RuntimeNodeHeartbeatTopicFilter    = "ori/+/runtime/heartbeat"
+	TierCEnrichmentRequestTopicFilter  = "ori/+/tier_c/enrichment/request"
 	HeartbeatMessageType               = "gateway.heartbeat"
 	RuntimeHeartbeatMessageType        = "runtime.heartbeat"
 	HeartbeatAuthScheme                = "hmac-sha256"
@@ -103,10 +104,35 @@ func RuntimeNodeHeartbeatTopic(deviceID string) (string, error) {
 	return fmt.Sprintf("ori/%s/runtime/heartbeat", deviceID), nil
 }
 
+func TierCEnrichmentRequestTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/tier_c/enrichment/request", deviceID), nil
+}
+
+func TierCEnrichmentResponseTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/tier_c/enrichment/response", deviceID), nil
+}
+
 func DeviceIDFromRuntimeNodeHeartbeatTopic(topic string) (string, error) {
 	parts := strings.Split(topic, "/")
 	if len(parts) != 4 || parts[0] != "ori" || parts[2] != "runtime" || parts[3] != "heartbeat" {
 		return "", fmt.Errorf("invalid runtime heartbeat topic %q", topic)
+	}
+	if err := validateMQTTDeviceID(parts[1]); err != nil {
+		return "", err
+	}
+	return parts[1], nil
+}
+
+func DeviceIDFromTierCEnrichmentRequestTopic(topic string) (string, error) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 5 || parts[0] != "ori" || parts[2] != "tier_c" || parts[3] != "enrichment" || parts[4] != "request" {
+		return "", fmt.Errorf("invalid tier c enrichment request topic %q", topic)
 	}
 	if err := validateMQTTDeviceID(parts[1]); err != nil {
 		return "", err
