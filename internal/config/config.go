@@ -41,6 +41,7 @@ type Config struct {
 
 type GatewayConfig struct {
 	BrokerURL          string            `yaml:"broker_url"`
+	DeviceIDs          []string          `yaml:"device_ids"`
 	HeartbeatIntervalS int               `yaml:"heartbeat_interval_s"`
 	Auth               GatewayAuthConfig `yaml:"auth"`
 }
@@ -115,6 +116,7 @@ type fileConfig struct {
 
 type fileGatewayConfig struct {
 	BrokerURL          string            `yaml:"broker_url"`
+	DeviceIDs          []string          `yaml:"device_ids"`
 	HeartbeatIntervalS *int              `yaml:"heartbeat_interval_s"`
 	Auth               GatewayAuthConfig `yaml:"auth"`
 }
@@ -150,6 +152,7 @@ func (f *fileConfig) normalize() (Config, error) {
 	cfg := Config{
 		Gateway: GatewayConfig{
 			BrokerURL: strings.TrimSpace(f.Gateway.BrokerURL),
+			DeviceIDs: normalizeGatewayDeviceIDs(f.Gateway.DeviceIDs),
 			Auth: GatewayAuthConfig{
 				Enabled:         f.Gateway.Auth.Enabled,
 				SharedSecretEnv: strings.TrimSpace(f.Gateway.Auth.SharedSecretEnv),
@@ -167,6 +170,14 @@ func (f *fileConfig) normalize() (Config, error) {
 
 	if cfg.Gateway.BrokerURL == "" {
 		return Config{}, fmt.Errorf("gateway.broker_url must not be empty")
+	}
+	if len(cfg.Gateway.DeviceIDs) == 0 {
+		return Config{}, fmt.Errorf("gateway.device_ids must include at least one runtime device")
+	}
+	for _, deviceID := range cfg.Gateway.DeviceIDs {
+		if err := validateGatewayDeviceID(deviceID); err != nil {
+			return Config{}, fmt.Errorf("gateway.device_ids: %w", err)
+		}
 	}
 	if cfg.Gateway.Auth.SharedSecretEnv == "" {
 		cfg.Gateway.Auth.SharedSecretEnv = DefaultGatewayAuthSecretEnv
@@ -218,6 +229,32 @@ func (f *fileConfig) normalize() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func normalizeGatewayDeviceIDs(deviceIDs []string) []string {
+	out := make([]string, 0, len(deviceIDs))
+	seen := map[string]bool{}
+	for _, deviceID := range deviceIDs {
+		if seen[deviceID] {
+			continue
+		}
+		seen[deviceID] = true
+		out = append(out, deviceID)
+	}
+	return out
+}
+
+func validateGatewayDeviceID(deviceID string) error {
+	if deviceID == "" {
+		return fmt.Errorf("device_id must not be empty")
+	}
+	if strings.TrimSpace(deviceID) != deviceID {
+		return fmt.Errorf("device_id %q must not contain leading or trailing whitespace", deviceID)
+	}
+	if strings.ContainsAny(deviceID, "/+#|") {
+		return fmt.Errorf("device_id %q must not contain MQTT separators, wildcards, or auth delimiters", deviceID)
+	}
+	return nil
 }
 
 func isKnownProvider(name string) bool {

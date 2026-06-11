@@ -163,3 +163,20 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestEvictStaleRemovesFutureDatedNode(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{
+		DeviceID:   "node-future",
+		Status:     "healthy",
+		LastSeenMS: 2000,
+	})
+
+	evicted := reg.EvictStale(1000, 100)
+	if len(evicted) != 1 {
+		t.Fatalf("future-dated node should be evicted, got %d evictions", len(evicted))
+	}
+	if evicted[0].DeviceID != "node-future" {
+		t.Fatalf("unexpected evicted device_id: %q", evicted[0].DeviceID)
+	}
+}

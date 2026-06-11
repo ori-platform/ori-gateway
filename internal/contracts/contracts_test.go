@@ -37,8 +37,29 @@ func TestTopicsMatchGatewaySpec(t *testing.T) {
 	if HeartbeatMessageType != "gateway.heartbeat" {
 		t.Fatalf("unexpected heartbeat message type: %s", HeartbeatMessageType)
 	}
+	if RuntimeHeartbeatMessageType != "runtime.heartbeat" {
+		t.Fatalf("unexpected runtime heartbeat message type: %s", RuntimeHeartbeatMessageType)
+	}
+	if RuntimeNodeHeartbeatTopicFilter != "ori/+/runtime/heartbeat" {
+		t.Fatalf("unexpected runtime heartbeat filter: %s", RuntimeNodeHeartbeatTopicFilter)
+	}
 	if HeartbeatAuthScheme != "hmac-sha256" {
 		t.Fatalf("unexpected heartbeat auth scheme: %s", HeartbeatAuthScheme)
+	}
+
+	runtimeBeatTopic, err := RuntimeNodeHeartbeatTopic("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeBeatTopic != "ori/site-a/runtime/heartbeat" {
+		t.Fatalf("unexpected runtime heartbeat topic: %s", runtimeBeatTopic)
+	}
+	deviceID, err := DeviceIDFromRuntimeNodeHeartbeatTopic(runtimeBeatTopic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deviceID != "site-a" {
+		t.Fatalf("unexpected runtime heartbeat topic device_id: %s", deviceID)
 	}
 
 	exportReqTopic, err := ExportRequestTopic("site-a")
@@ -74,6 +95,7 @@ func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
 		"site/a",
 		"site+a",
 		"site#a",
+		"site|a",
 	}
 
 	for _, deviceID := range invalid {
@@ -85,6 +107,9 @@ func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
 		}
 		if topic, err := ExportRequestTopic(deviceID); err == nil {
 			t.Fatalf("ExportRequestTopic(%q) returned %q, expected error", deviceID, topic)
+		}
+		if topic, err := RuntimeNodeHeartbeatTopic(deviceID); err == nil {
+			t.Fatalf("RuntimeNodeHeartbeatTopic(%q) returned %q, expected error", deviceID, topic)
 		}
 		if topic, err := ExportResponseTopicFilter(deviceID); err == nil {
 			t.Fatalf("ExportResponseTopicFilter(%q) returned %q, expected error", deviceID, topic)
@@ -173,6 +198,7 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 		{"testdata/reasoning_response.json", &ReasoningResponse{}},
 		{"testdata/reasoning_error_response.json", &ReasoningResponse{}},
 		{"testdata/heartbeat.json", &Heartbeat{}},
+		{"testdata/runtime_node_heartbeat.json", &RuntimeNodeHeartbeat{}},
 		{"testdata/tier_c_enrichment_request.json", &TierCEnrichmentRequest{}},
 		{"testdata/tier_c_enrichment_response.json", &TierCEnrichmentResponse{}},
 		{"testdata/tier_c_enrichment_error_response.json", &TierCEnrichmentResponse{}},

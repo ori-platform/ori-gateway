@@ -11,7 +11,9 @@ import (
 const (
 	GatewayHealthTopic                 = "ori/gateway/health"
 	GatewayReasoningRequestTopicFilter = "ori/+/reasoning/request"
+	RuntimeNodeHeartbeatTopicFilter    = "ori/+/runtime/heartbeat"
 	HeartbeatMessageType               = "gateway.heartbeat"
+	RuntimeHeartbeatMessageType        = "runtime.heartbeat"
 	HeartbeatAuthScheme                = "hmac-sha256"
 
 	ActionTierA = "A"
@@ -70,6 +72,16 @@ type Heartbeat struct {
 	Auth         *HeartbeatAuth `json:"auth,omitempty"`
 }
 
+// RuntimeNodeHeartbeat is published by each runtime on ori/{device_id}/runtime/heartbeat.
+type RuntimeNodeHeartbeat struct {
+	DeviceID       string         `json:"device_id"`
+	Status         string         `json:"status"`
+	LastSeenMS     int64          `json:"last_seen_ms"`
+	GatewaySeenMS  int64          `json:"gateway_seen_ms"`
+	ActiveTriggers []string       `json:"active_triggers"`
+	Auth           *HeartbeatAuth `json:"auth,omitempty"`
+}
+
 func RequestTopic(deviceID string) (string, error) {
 	if err := validateMQTTDeviceID(deviceID); err != nil {
 		return "", err
@@ -82,6 +94,24 @@ func ResponseTopic(deviceID string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("ori/%s/reasoning/response", deviceID), nil
+}
+
+func RuntimeNodeHeartbeatTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/runtime/heartbeat", deviceID), nil
+}
+
+func DeviceIDFromRuntimeNodeHeartbeatTopic(topic string) (string, error) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 4 || parts[0] != "ori" || parts[2] != "runtime" || parts[3] != "heartbeat" {
+		return "", fmt.Errorf("invalid runtime heartbeat topic %q", topic)
+	}
+	if err := validateMQTTDeviceID(parts[1]); err != nil {
+		return "", err
+	}
+	return parts[1], nil
 }
 
 func ExportRequestTopic(deviceID string) (string, error) {
@@ -115,8 +145,8 @@ func validateMQTTDeviceID(deviceID string) error {
 	if strings.TrimSpace(deviceID) != deviceID {
 		return fmt.Errorf("device_id must not contain leading or trailing whitespace")
 	}
-	if strings.ContainsAny(deviceID, "/+#") {
-		return fmt.Errorf("device_id must not contain MQTT topic separators or wildcards")
+	if strings.ContainsAny(deviceID, "/+#|") {
+		return fmt.Errorf("device_id must not contain MQTT topic separators, wildcards, or auth delimiters")
 	}
 	return nil
 }

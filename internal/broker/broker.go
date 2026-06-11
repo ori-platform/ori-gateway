@@ -243,6 +243,10 @@ func (c *Client) IsConnected() bool {
 
 func (c *Client) wrapHandler(handler MessageHandler) mqtt.MessageHandler {
 	return func(_ mqtt.Client, msg mqtt.Message) {
+		if msg.Retained() {
+			c.log.Warn("mqtt retained message rejected", "topic", msg.Topic())
+			return
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				c.log.Warn("mqtt message handler panic", "topic", msg.Topic(), "recover", r)

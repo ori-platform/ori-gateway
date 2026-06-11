@@ -23,8 +23,10 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/dispatcher"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
 	"github.com/ori-platform/ori-gateway/internal/sim"
+	"github.com/ori-platform/ori-gateway/internal/site"
 )
 
 const (
@@ -45,12 +47,13 @@ type heartbeatRunner interface {
 }
 
 type appDependencies struct {
-	loadConfig   func(path string) (config.Config, error)
-	newProvider  func(cfg config.ProviderConfig) (provider.Provider, error)
-	newBroker    func(opts broker.Options) (brokerClient, error)
-	newSIM       func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
-	newFleet     func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
-	newHeartbeat func(
+	loadConfig      func(path string) (config.Config, error)
+	newProvider     func(cfg config.ProviderConfig) (provider.Provider, error)
+	newBroker       func(opts broker.Options) (brokerClient, error)
+	newSIM          func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
+	newFleet        func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
+	newSiteRegistry func() *site.Registry
+	newHeartbeat    func(
 		publish heartbeat.PublishFunc,
 		prov heartbeat.ProviderStatus,
 		simStatus heartbeat.SIMStatus,
@@ -67,8 +70,9 @@ func defaultDependencies() appDependencies {
 		newBroker: func(opts broker.Options) (brokerClient, error) {
 			return broker.New(opts)
 		},
-		newSIM:   sim.New,
-		newFleet: fleet.New,
+		newSIM:          sim.New,
+		newFleet:        fleet.New,
+		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
 			publish heartbeat.PublishFunc,
 			prov heartbeat.ProviderStatus,
@@ -156,6 +160,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return err
 	}
 
+	siteRegistry := deps.newSiteRegistry()
+	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromConfig(cfg.Gateway.Auth, heartbeatAuth.SharedSecret, siteRegistry, deps.now)
+	if err != nil {
+		cancel()
+		return err
+	}
+
 	hb, err := deps.newHeartbeat(
 		func(ctx context.Context, payload []byte) error {
 			return client.Publish(ctx, contracts.GatewayHealthTopic, broker.QoSHeartbeat, false, payload)
@@ -187,6 +198,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 		heartbeatErr <- nil
 	}()
+
+	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
 
 	reasoningDispatcher, err := dispatcher.New(client, reasoningProvider, dispatcher.Options{
 		ProviderTimeoutMS: cfg.Provider.TimeoutMS,
@@ -224,6 +237,24 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return fmt.Errorf("subscribe reasoning requests: %w", err)
 	}
 
+	for _, deviceID := range cfg.Gateway.DeviceIDs {
+		topic, err := contracts.RuntimeNodeHeartbeatTopic(deviceID)
+		if err != nil {
+			cancel()
+			<-heartbeatErr
+			return fmt.Errorf("runtime node heartbeat topic: %w", err)
+		}
+		if err := client.Subscribe(runCtx, topic, broker.QoSHeartbeat, func(topic string, payload []byte) {
+			if err := runtimeHeartbeatHandler.Handle(topic, payload); err != nil {
+				deps.logger.Warn("runtime node heartbeat rejected", "topic", topic, "error", err)
+			}
+		}); err != nil {
+			cancel()
+			<-heartbeatErr
+			return fmt.Errorf("subscribe runtime node heartbeats: %w", err)
+		}
+	}
+
 	select {
 	case <-ctx.Done():
 		cancel()
@@ -247,9 +278,55 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}
 }
 
+func evictStaleRuntimeNodes(
+	ctx context.Context,
+	registry *site.Registry,
+	interval time.Duration,
+	now func() time.Time,
+	logger *slog.Logger,
+) {
+	if registry == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Duration(config.DefaultHeartbeatIntervalS) * time.Second
+	}
+	if now == nil {
+		now = time.Now
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ttlMS := (3 * interval).Milliseconds()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			evicted := registry.EvictStale(now().UnixMilli(), ttlMS)
+			for _, node := range evicted {
+				logger.Warn("runtime node heartbeat stale", "device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
+			}
+		}
+	}
+}
+
 func heartbeatAuthFromConfig(auth config.GatewayAuthConfig) (heartbeat.AuthConfig, error) {
-	if !auth.Enabled {
+	secret, enabled, err := gatewayAuthSecretFromConfig(auth)
+	if err != nil {
+		return heartbeat.AuthConfig{}, err
+	}
+	if !enabled {
 		return heartbeat.AuthConfig{}, nil
+	}
+	return heartbeat.AuthConfig{Enabled: true, SharedSecret: secret}, nil
+}
+
+func gatewayAuthSecretFromConfig(auth config.GatewayAuthConfig) (string, bool, error) {
+	if !auth.Enabled {
+		return "", false, nil
 	}
 	envName := strings.TrimSpace(auth.SharedSecretEnv)
 	if envName == "" {
@@ -257,9 +334,32 @@ func heartbeatAuthFromConfig(auth config.GatewayAuthConfig) (heartbeat.AuthConfi
 	}
 	secret := strings.TrimSpace(os.Getenv(envName))
 	if secret == "" {
-		return heartbeat.AuthConfig{}, fmt.Errorf("gateway.auth.enabled is true but environment variable %q is empty", envName)
+		return "", false, fmt.Errorf("gateway.auth.enabled is true but environment variable %q is empty", envName)
 	}
-	return heartbeat.AuthConfig{Enabled: true, SharedSecret: secret}, nil
+	return secret, true, nil
+}
+
+func runtimeHeartbeatHandlerFromConfig(
+	auth config.GatewayAuthConfig,
+	sharedSecret string,
+	registry *site.Registry,
+	now func() time.Time,
+) (*site.RuntimeHeartbeatHandler, error) {
+	var verifier *mqttauth.Verifier
+	if auth.Enabled {
+		var err error
+		verifier, err = mqttauth.NewVerifier(mqttauth.Config{
+			SharedSecret: sharedSecret,
+			Now:          now,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return site.NewRuntimeHeartbeatHandler(registry, site.RuntimeHeartbeatHandlerOptions{
+		AuthVerifier: verifier,
+		Now:          now,
+	})
 }
 
 func normalizeDependencies(deps appDependencies) appDependencies {
@@ -278,6 +378,9 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	}
 	if deps.newFleet == nil {
 		deps.newFleet = defaults.newFleet
+	}
+	if deps.newSiteRegistry == nil {
+		deps.newSiteRegistry = defaults.newSiteRegistry
 	}
 	if deps.newHeartbeat == nil {
 		deps.newHeartbeat = defaults.newHeartbeat

@@ -24,6 +24,7 @@ func TestLoadValidConfig(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
   heartbeat_interval_s: 30
 provider:
   name: echo
@@ -67,6 +68,7 @@ func TestLoadUnknownProvider(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: bogus
 `)
@@ -84,6 +86,7 @@ func TestLlamaCppProviderRequiresURLWhenSelected(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: llama_cpp
   llama_cpp:
@@ -103,6 +106,7 @@ func TestLlamaCppProviderLoadsWithURL(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: llama_cpp
   timeout_ms: 5000
@@ -130,6 +134,7 @@ func TestDefaults(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 `)
@@ -178,6 +183,7 @@ func TestGatewayAuthConfigLoads(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
   auth:
     enabled: true
     shared_secret_env: "CUSTOM_GATEWAY_SECRET"
@@ -201,6 +207,7 @@ func TestGatewayAuthSecretEnvRejectsWhitespace(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
   auth:
     enabled: true
     shared_secret_env: "BAD SECRET"
@@ -227,6 +234,7 @@ func TestLoadInvalidHeartbeatInterval(t *testing.T) {
 			content: `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
   heartbeat_interval_s: 0
 provider:
   name: echo
@@ -238,6 +246,7 @@ provider:
 			content: `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
   heartbeat_interval_s: -1
 provider:
   name: echo
@@ -264,6 +273,7 @@ func TestLoadInvalidProviderTimeout(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
   timeout_ms: -1
@@ -282,6 +292,7 @@ func TestSIMDisabledNoModemRequired(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 sim:
@@ -298,6 +309,7 @@ func TestFleetDisabledNoCloudURL(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 fleet:
@@ -314,6 +326,7 @@ func TestSIMEnabledRequiresModemPath(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 sim:
@@ -334,6 +347,7 @@ func TestFleetEnabledRequiresCloudURL(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 fleet:
@@ -354,6 +368,7 @@ func TestUnknownTopLevelKeyIgnored(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 future_feature:
@@ -383,6 +398,7 @@ func TestReportingConfigDefaultsDisabled(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -411,6 +427,7 @@ func TestWeeklyReportRequiresProviderConfigWhenEnabled(t *testing.T) {
 	base := `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -459,6 +476,7 @@ func TestTierCEnrichmentRequiresProviderConfigWhenEnabled(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -480,6 +498,7 @@ reporting:
 	path = writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -503,6 +522,7 @@ func TestReportingProviderDoesNotAffectReasoningProvider(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -541,6 +561,7 @@ func TestWeeklyReportRejectsInvalidSchedule(t *testing.T) {
 			content: `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -560,6 +581,7 @@ reporting:
 			content: `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -580,6 +602,7 @@ reporting:
 			content: `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -614,6 +637,7 @@ func TestReportingRejectsUnknownProviderEvenWhenDisabled(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -637,6 +661,7 @@ func TestCloudLLMProviderRequiresProviderConfigWhenSelected(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: cloud_llm
   cloud_llm:
@@ -655,6 +680,7 @@ provider:
 	path = writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: cloud_llm
   cloud_llm:
@@ -687,6 +713,7 @@ func TestCloudLLMProviderSupportsSwappableVendors(t *testing.T) {
 			path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: cloud_llm
   cloud_llm:
@@ -709,6 +736,7 @@ func TestCloudLLMOpenAICompatibleRequiresBaseURL(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: cloud_llm
   cloud_llm:
@@ -730,6 +758,7 @@ func TestCloudLLMRejectsUnknownVendor(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: cloud_llm
   cloud_llm:
@@ -751,6 +780,7 @@ func TestCloudLLMAPIKeyEnvMustBeEnvVarName(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: cloud_llm
   cloud_llm:
@@ -772,6 +802,7 @@ func TestReportingAPIKeyEnvMustBeEnvVarName(t *testing.T) {
 	path := writeConfig(t, `
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
 provider:
   name: echo
 reporting:
@@ -789,5 +820,45 @@ reporting:
 	}
 	if !strings.Contains(err.Error(), "api_key_env") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayDeviceIDsRequired(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+provider:
+  name: echo
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected gateway.device_ids validation error")
+	}
+	if !strings.Contains(err.Error(), "gateway.device_ids") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayDeviceIDsRejectMQTTAndAuthDelimiters(t *testing.T) {
+	cases := []string{"dev/01", "dev+01", "dev#01", "dev|01", " dev-01"}
+	for _, deviceID := range cases {
+		t.Run(deviceID, func(t *testing.T) {
+			path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["`+deviceID+`"]
+provider:
+  name: echo
+`)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("expected gateway.device_ids validation error")
+			}
+			if !strings.Contains(err.Error(), "gateway.device_ids") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
