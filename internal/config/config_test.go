@@ -144,6 +144,12 @@ provider:
 	if cfg.Provider.TimeoutMS != DefaultProviderTimeoutMS {
 		t.Fatalf("timeout default: got %d want %d", cfg.Provider.TimeoutMS, DefaultProviderTimeoutMS)
 	}
+	if cfg.Gateway.Auth.Enabled {
+		t.Fatal("gateway auth should default disabled")
+	}
+	if cfg.Gateway.Auth.SharedSecretEnv != DefaultGatewayAuthSecretEnv {
+		t.Fatalf("auth env default: got %q want %q", cfg.Gateway.Auth.SharedSecretEnv, DefaultGatewayAuthSecretEnv)
+	}
 }
 
 func TestLoadMissingFile(t *testing.T) {
@@ -164,6 +170,49 @@ func TestLoadMalformedYAML(t *testing.T) {
 		t.Fatal("expected parse error")
 	}
 	if !strings.Contains(err.Error(), "parse config") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayAuthConfigLoads(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  auth:
+    enabled: true
+    shared_secret_env: "CUSTOM_GATEWAY_SECRET"
+provider:
+  name: echo
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Gateway.Auth.Enabled {
+		t.Fatal("expected gateway auth enabled")
+	}
+	if cfg.Gateway.Auth.SharedSecretEnv != "CUSTOM_GATEWAY_SECRET" {
+		t.Fatalf("unexpected shared_secret_env: %q", cfg.Gateway.Auth.SharedSecretEnv)
+	}
+}
+
+func TestGatewayAuthSecretEnvRejectsWhitespace(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  auth:
+    enabled: true
+    shared_secret_env: "BAD SECRET"
+provider:
+  name: echo
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected shared_secret_env validation error")
+	}
+	if !strings.Contains(err.Error(), "gateway.auth.shared_secret_env") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

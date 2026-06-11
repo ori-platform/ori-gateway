@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	DefaultHeartbeatIntervalS = 30
-	DefaultProviderTimeoutMS  = 10000
+	DefaultHeartbeatIntervalS   = 30
+	DefaultProviderTimeoutMS    = 10000
+	DefaultGatewayAuthSecretEnv = "GATEWAY_SHARED_SECRET"
 
 	ProviderEcho     = "echo"
 	ProviderLlamaCpp = "llama_cpp"
@@ -39,8 +40,14 @@ type Config struct {
 }
 
 type GatewayConfig struct {
-	BrokerURL          string `yaml:"broker_url"`
-	HeartbeatIntervalS int    `yaml:"heartbeat_interval_s"`
+	BrokerURL          string            `yaml:"broker_url"`
+	HeartbeatIntervalS int               `yaml:"heartbeat_interval_s"`
+	Auth               GatewayAuthConfig `yaml:"auth"`
+}
+
+type GatewayAuthConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	SharedSecretEnv string `yaml:"shared_secret_env"`
 }
 
 type ProviderConfig struct {
@@ -107,8 +114,9 @@ type fileConfig struct {
 }
 
 type fileGatewayConfig struct {
-	BrokerURL          string `yaml:"broker_url"`
-	HeartbeatIntervalS *int   `yaml:"heartbeat_interval_s"`
+	BrokerURL          string            `yaml:"broker_url"`
+	HeartbeatIntervalS *int              `yaml:"heartbeat_interval_s"`
+	Auth               GatewayAuthConfig `yaml:"auth"`
 }
 
 type fileProviderConfig struct {
@@ -142,6 +150,10 @@ func (f *fileConfig) normalize() (Config, error) {
 	cfg := Config{
 		Gateway: GatewayConfig{
 			BrokerURL: strings.TrimSpace(f.Gateway.BrokerURL),
+			Auth: GatewayAuthConfig{
+				Enabled:         f.Gateway.Auth.Enabled,
+				SharedSecretEnv: strings.TrimSpace(f.Gateway.Auth.SharedSecretEnv),
+			},
 		},
 		Provider: normalizeProviderStrings(ProviderConfig{
 			Name:     f.Provider.Name,
@@ -155,6 +167,12 @@ func (f *fileConfig) normalize() (Config, error) {
 
 	if cfg.Gateway.BrokerURL == "" {
 		return Config{}, fmt.Errorf("gateway.broker_url must not be empty")
+	}
+	if cfg.Gateway.Auth.SharedSecretEnv == "" {
+		cfg.Gateway.Auth.SharedSecretEnv = DefaultGatewayAuthSecretEnv
+	}
+	if strings.ContainsAny(cfg.Gateway.Auth.SharedSecretEnv, " \t\r\n") {
+		return Config{}, fmt.Errorf("gateway.auth.shared_secret_env must be an environment variable name")
 	}
 
 	if f.Gateway.HeartbeatIntervalS == nil {

@@ -1,6 +1,9 @@
 gateway:
   broker_url: "tcp://localhost:1883"
   heartbeat_interval_s: 30
+  auth:
+    enabled: false
+    shared_secret_env: "GATEWAY_SHARED_SECRET"
 
 provider:
   name: "echo" # echo | llama_cpp | cloud_llm

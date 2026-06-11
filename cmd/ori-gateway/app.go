@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -149,6 +150,12 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	heartbeatAuth, err := heartbeatAuthFromConfig(cfg.Gateway.Auth)
+	if err != nil {
+		cancel()
+		return err
+	}
+
 	hb, err := deps.newHeartbeat(
 		func(ctx context.Context, payload []byte) error {
 			return client.Publish(ctx, contracts.GatewayHealthTopic, broker.QoSHeartbeat, false, payload)
@@ -165,6 +172,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			StartedAt: deps.now(),
 			Now:       deps.now,
 			Logger:    deps.logger,
+			Auth:      heartbeatAuth,
 		},
 	)
 	if err != nil {
@@ -237,6 +245,21 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		<-heartbeatErr
 		return err
 	}
+}
+
+func heartbeatAuthFromConfig(auth config.GatewayAuthConfig) (heartbeat.AuthConfig, error) {
+	if !auth.Enabled {
+		return heartbeat.AuthConfig{}, nil
+	}
+	envName := strings.TrimSpace(auth.SharedSecretEnv)
+	if envName == "" {
+		envName = config.DefaultGatewayAuthSecretEnv
+	}
+	secret := strings.TrimSpace(os.Getenv(envName))
+	if secret == "" {
+		return heartbeat.AuthConfig{}, fmt.Errorf("gateway.auth.enabled is true but environment variable %q is empty", envName)
+	}
+	return heartbeat.AuthConfig{Enabled: true, SharedSecret: secret}, nil
 }
 
 func normalizeDependencies(deps appDependencies) appDependencies {

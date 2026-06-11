@@ -34,6 +34,12 @@ func TestTopicsMatchGatewaySpec(t *testing.T) {
 	if GatewayReasoningRequestTopicFilter != "ori/+/reasoning/request" {
 		t.Fatalf("unexpected request subscription topic: %s", GatewayReasoningRequestTopicFilter)
 	}
+	if HeartbeatMessageType != "gateway.heartbeat" {
+		t.Fatalf("unexpected heartbeat message type: %s", HeartbeatMessageType)
+	}
+	if HeartbeatAuthScheme != "hmac-sha256" {
+		t.Fatalf("unexpected heartbeat auth scheme: %s", HeartbeatAuthScheme)
+	}
 
 	exportReqTopic, err := ExportRequestTopic("site-a")
 	if err != nil {

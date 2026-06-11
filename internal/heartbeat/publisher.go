@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,7 @@ type Publisher struct {
 	now          func() time.Time
 	log          *slog.Logger
 	fatal        func(code int)
+	auth         AuthConfig
 
 	mu            sync.Mutex
 	everPublished bool
@@ -52,6 +54,7 @@ type Options struct {
 	Now          func() time.Time
 	Logger       *slog.Logger
 	Fatal        func(code int)
+	Auth         AuthConfig
 }
 
 // NewPublisher constructs a supervised heartbeat publisher.
@@ -64,6 +67,9 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 	}
 	if opts.Interval <= 0 {
 		return nil, fmt.Errorf("heartbeat: interval must be positive")
+	}
+	if opts.Auth.Enabled && strings.TrimSpace(opts.Auth.SharedSecret) == "" {
+		return nil, fmt.Errorf("heartbeat: auth shared secret must not be empty")
 	}
 
 	failureLimit := opts.FailureLimit
@@ -101,6 +107,7 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 		now:          now,
 		log:          log,
 		fatal:        fatal,
+		auth:         opts.Auth,
 	}, nil
 }
 
@@ -209,6 +216,13 @@ func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 		Provider:     p.provider.Name(),
 		SIMAvailable: p.sim.Available(),
 		TimestampMS:  timestampMS,
+	}
+	if p.auth.Enabled {
+		signed, err := SignHeartbeat(beat, p.auth.SharedSecret)
+		if err != nil {
+			return nil, err
+		}
+		beat = signed
 	}
 	return json.Marshal(beat)
 }

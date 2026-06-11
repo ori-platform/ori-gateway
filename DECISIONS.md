@@ -73,3 +73,45 @@ Rationale:
   selection channel.
 - Keeping the response schema advisory-only lets product intelligence improve
   customer comprehension without weakening runtime safety invariants.
+
+---
+
+## 2026-06-11 — Gateway Heartbeat Signing and Broadcast Trust Model
+
+**Status:** Accepted
+
+The gateway publishes `ori/gateway/health` as the sole runtime-side
+`gateway_reachable` signal. Runtimes must not infer gateway reachability from
+public internet checks, REST probes, runtime node heartbeats, or export traffic.
+The effective gateway-loss detection window is:
+
+```text
+heartbeat_interval_s + runtime gateway_heartbeat_ttl_seconds
+```
+
+Tune both values together. A longer interval reduces LAN chatter but increases
+the time a runtime may still attempt Tier 3 escalation after the gateway has
+stopped publishing. Tier D and trigger-authoritative action tier rules remain
+independent of this signal.
+
+When `gateway.auth.enabled: true`, heartbeat payloads are signed with the same
+HMAC envelope shape as other runtime-gateway MQTT messages, but with the
+broadcast trust model:
+
+```text
+message_type = "gateway.heartbeat"
+device_id = ""
+request_id = ""
+signed_at_ms = heartbeat.timestamp_ms
+canonical_json = sorted-key JSON heartbeat payload without auth
+```
+
+The topic is site-wide, not device-scoped, so adding `device_id` binding to the
+heartbeat signature would break the LAN broadcast contract. Replay protection is
+handled by the runtime using `message_type + signed_at_ms + signature`.
+
+When `gateway.auth.enabled: false`, existing unsigned heartbeat behavior is
+preserved for initial LAN setup, but production deployments should enable HMAC
+and broker ACLs.
+
+Related: ori-runtime#144, ori-runtime#145, gateway #43.
