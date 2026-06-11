@@ -11,6 +11,8 @@ import (
 const (
 	GatewayHealthTopic                 = "ori/gateway/health"
 	GatewayReasoningRequestTopicFilter = "ori/+/reasoning/request"
+	HeartbeatMessageType               = "gateway.heartbeat"
+	HeartbeatAuthScheme                = "hmac-sha256"
 
 	ActionTierA = "A"
 	ActionTierB = "B"
@@ -53,12 +55,19 @@ type ReasoningResponse struct {
 	Error          *string `json:"error,omitempty"`
 }
 
+type HeartbeatAuth struct {
+	Scheme     string `json:"scheme"`
+	SignedAtMS int64  `json:"signed_at_ms"`
+	Signature  string `json:"signature"`
+}
+
 type Heartbeat struct {
-	Status       string  `json:"status"`
-	UptimeS      float64 `json:"uptime_s"`
-	Provider     string  `json:"provider"`
-	SIMAvailable bool    `json:"sim_available"`
-	TimestampMS  int64   `json:"timestamp_ms"`
+	Status       string         `json:"status"`
+	UptimeS      float64        `json:"uptime_s"`
+	Provider     string         `json:"provider"`
+	SIMAvailable bool           `json:"sim_available"`
+	TimestampMS  int64          `json:"timestamp_ms"`
+	Auth         *HeartbeatAuth `json:"auth,omitempty"`
 }
 
 func RequestTopic(deviceID string) (string, error) {

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -502,6 +503,96 @@ func TestHeartbeatUptimeIsFloat64(t *testing.T) {
 	}
 	if uptime != 2.5 {
 		t.Fatalf("uptime_s = %v, want 2.5", uptime)
+	}
+}
+
+func TestHeartbeatUnsignedWhenAuthDisabled(t *testing.T) {
+	payloads := make(chan []byte, 1)
+	publish := func(_ context.Context, payload []byte) error {
+		payloads <- append([]byte(nil), payload...)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval: time.Hour,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(ctx) }()
+
+	var beat contracts.Heartbeat
+	select {
+	case payload := <-payloads:
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no heartbeat published")
+	}
+	if beat.Auth != nil {
+		t.Fatalf("expected unsigned heartbeat when auth disabled, got %#v", beat.Auth)
+	}
+}
+
+func TestHeartbeatSignedWhenAuthEnabled(t *testing.T) {
+	payloads := make(chan []byte, 1)
+	publish := func(_ context.Context, payload []byte) error {
+		payloads <- append([]byte(nil), payload...)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startedAt := time.Unix(1_700_000_000, 0)
+	now := startedAt.Add(2500 * time.Millisecond)
+	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval:  time.Hour,
+		StartedAt: startedAt,
+		Now:       func() time.Time { return now },
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Auth:      AuthConfig{Enabled: true, SharedSecret: "site-local-secret"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(ctx) }()
+
+	var beat contracts.Heartbeat
+	select {
+	case payload := <-payloads:
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no heartbeat published")
+	}
+	if beat.Auth == nil {
+		t.Fatal("expected signed heartbeat")
+	}
+	if beat.Auth.SignedAtMS != beat.TimestampMS {
+		t.Fatalf("signed_at_ms = %d, want timestamp_ms %d", beat.Auth.SignedAtMS, beat.TimestampMS)
+	}
+	if beat.Auth.Scheme != contracts.HeartbeatAuthScheme {
+		t.Fatalf("scheme = %q", beat.Auth.Scheme)
+	}
+	if !strings.HasPrefix(beat.Auth.Signature, "hmac-sha256:") {
+		t.Fatalf("unexpected signature: %q", beat.Auth.Signature)
+	}
+}
+
+func TestHeartbeatAuthRequiresSecret(t *testing.T) {
+	_, err := NewPublisher(func(context.Context, []byte) error { return nil }, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval: time.Hour,
+		Auth:     AuthConfig{Enabled: true},
+	})
+	if err == nil {
+		t.Fatal("expected auth secret validation error")
 	}
 }
 

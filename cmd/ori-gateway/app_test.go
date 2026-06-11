@@ -269,6 +269,111 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 	}
 }
 
+func TestHeartbeatAuthFromConfigReadsEnvSecret(t *testing.T) {
+	t.Setenv("CUSTOM_GATEWAY_SECRET", "site-local-secret")
+
+	auth, err := heartbeatAuthFromConfig(config.GatewayAuthConfig{
+		Enabled:         true,
+		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !auth.Enabled || auth.SharedSecret != "site-local-secret" {
+		t.Fatalf("unexpected auth config: %#v", auth)
+	}
+}
+
+func TestHeartbeatAuthFromConfigFailsWhenEnvSecretMissing(t *testing.T) {
+	t.Setenv("MISSING_GATEWAY_SECRET", "")
+
+	_, err := heartbeatAuthFromConfig(config.GatewayAuthConfig{
+		Enabled:         true,
+		SharedSecretEnv: "MISSING_GATEWAY_SECRET",
+	})
+	if err == nil {
+		t.Fatal("expected missing env secret error")
+	}
+	if !strings.Contains(err.Error(), "MISSING_GATEWAY_SECRET") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayAuthSecretPassesToHeartbeatOptions(t *testing.T) {
+	t.Setenv("CUSTOM_GATEWAY_SECRET", "site-local-secret")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{
+		Enabled:         true,
+		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	var captured heartbeat.AuthConfig
+	deps.newHeartbeat = func(
+		_ heartbeat.PublishFunc,
+		_ heartbeat.ProviderStatus,
+		_ heartbeat.SIMStatus,
+		opts heartbeat.Options,
+	) (heartbeatRunner, error) {
+		captured = opts.Auth
+		return hb, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	if !captured.Enabled || captured.SharedSecret != "site-local-secret" {
+		t.Fatalf("heartbeat auth = %#v", captured)
+	}
+}
+
+func TestGatewayAuthMissingSecretStopsBeforeHeartbeat(t *testing.T) {
+	t.Setenv("CUSTOM_GATEWAY_SECRET", "")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{
+		Enabled:         true,
+		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	heartbeatCalled := false
+	deps.newHeartbeat = func(
+		heartbeat.PublishFunc,
+		heartbeat.ProviderStatus,
+		heartbeat.SIMStatus,
+		heartbeat.Options,
+	) (heartbeatRunner, error) {
+		heartbeatCalled = true
+		return hb, nil
+	}
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "CUSTOM_GATEWAY_SECRET") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if heartbeatCalled {
+		t.Fatal("heartbeat should not be constructed when auth secret is missing")
+	}
+}
+
 func TestMainStartupMissingConfig(t *testing.T) {
 	providerCalled := false
 	err := runGateway(context.Background(), "missing.yaml", appDependencies{
