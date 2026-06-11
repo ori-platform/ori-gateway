@@ -42,13 +42,14 @@ func (r *Registry) Snapshot() []NodeHeartbeat {
 }
 
 // EvictStale removes nodes where nowMS-lastSeenMS > ttlMS and returns them.
-// A node exactly at the TTL boundary is retained.
+// A node exactly at the TTL boundary is retained. Future-dated heartbeats are
+// evicted because clock-skewed nodes must not become immortal in the registry.
 func (r *Registry) EvictStale(nowMS, ttlMS int64) []NodeHeartbeat {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	evicted := make([]NodeHeartbeat, 0)
 	for deviceID, heartbeat := range r.nodes {
-		if nowMS-heartbeat.LastSeenMS > ttlMS {
+		if heartbeat.LastSeenMS > nowMS || nowMS-heartbeat.LastSeenMS > ttlMS {
 			evicted = append(evicted, heartbeat)
 			delete(r.nodes, deviceID)
 		}

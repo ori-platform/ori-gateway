@@ -7,10 +7,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
 	"testing"
 
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 )
 
 func TestSignHeartbeatUsesRuntimeCompatibleCanonicalString(t *testing.T) {
@@ -37,7 +37,7 @@ func TestSignHeartbeatUsesRuntimeCompatibleCanonicalString(t *testing.T) {
 	}
 
 	canonical := `{"provider":"llama_cpp","sim_available":false,"status":"healthy","timestamp_ms":1234567890000,"uptime_s":12.5}`
-	gotCanonical, err := canonicalHeartbeatJSON(beat)
+	gotCanonical, err := mqttauth.CanonicalJSONWithoutAuth(beat)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,13 +46,7 @@ func TestSignHeartbeatUsesRuntimeCompatibleCanonicalString(t *testing.T) {
 	}
 
 	mac := hmac.New(sha256.New, []byte("site-local-secret"))
-	_, _ = mac.Write([]byte(strings.Join([]string{
-		contracts.HeartbeatMessageType,
-		"",
-		"",
-		"1234567890000",
-		canonical,
-	}, "\n")))
+	_, _ = mac.Write([]byte(mqttauth.SigningInput(contracts.HeartbeatMessageType, "", "", 1234567890000, []byte(canonical))))
 	wantSignature := "hmac-sha256:" + hex.EncodeToString(mac.Sum(nil))
 	if signed.Auth.Signature != wantSignature {
 		t.Fatalf("signature mismatch:\nwant %s\n got %s", wantSignature, signed.Auth.Signature)

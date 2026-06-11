@@ -115,3 +115,39 @@ preserved for initial LAN setup, but production deployments should enable HMAC
 and broker ACLs.
 
 Related: ori-runtime#144, ori-runtime#145, gateway #43.
+
+---
+
+## 2026-06-11 — Runtime Node Heartbeat Consumption
+
+**Status:** Accepted
+
+The gateway subscribes to concrete `ori/{device_id}/runtime/heartbeat` topics
+for devices listed in `gateway.device_ids` and updates its site registry from
+runtime-published node liveness payloads. Runtime node
+heartbeat is gateway infrastructure, not sensor data, so it is consumed by a
+site registry handler directly and does not pass through any sensor/event bus or
+the reasoning dispatcher.
+
+When `gateway.auth.enabled: true`, runtime node heartbeat payloads must verify
+with the dedicated runtime-gateway HMAC secret using:
+
+```text
+message_type = "runtime.heartbeat"
+device_id = topic device_id
+request_id = ""
+signed_at_ms = auth.signed_at_ms
+canonical_json = sorted-key JSON heartbeat payload without auth
+```
+
+Invalid, retained, stale, replayed, mismatched, or malformed heartbeat payloads
+are rejected and logged without stopping the gateway. Subscription failure is fatal
+at startup because the gateway cannot maintain reliable site liveness without
+the runtime-node heartbeat stream.
+
+Registry eviction treats future-dated `last_seen_ms` values as stale. A node
+with a bad forward clock must not become immortal in the site registry. Far-future
+`last_seen_ms` values are rejected at ingest and future-dated entries are also
+evicted defensively during registry sweeps.
+
+Related: ori-runtime#145, ori-gateway#45.

@@ -19,24 +19,30 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
 	"github.com/ori-platform/ori-gateway/internal/sim"
+	"github.com/ori-platform/ori-gateway/internal/site"
 )
 
 type fakeBroker struct {
 	mu sync.Mutex
 
-	connectErr    error
-	subscribeErr  error
-	disconnectErr error
-	publishErr    error
+	connectErr          error
+	subscribeErr        error
+	subscribeErrByTopic map[string]error
+	disconnectErr       error
+	publishErr          error
 
 	connected    bool
 	disconnected bool
 
-	subscribeTopic string
-	subscribeQoS   byte
-	handler        broker.MessageHandler
+	subscribeTopic      string
+	subscribeQoS        byte
+	handler             broker.MessageHandler
+	subscribeTopics     []string
+	subscribeQoSByTopic map[string]byte
+	handlers            map[string]broker.MessageHandler
 
 	published []publishedMessage
 
@@ -67,8 +73,10 @@ func (b *subscribeEventBroker) Subscribe(ctx context.Context, topic string, qos 
 
 func newFakeBroker() *fakeBroker {
 	return &fakeBroker{
-		subscribed:     make(chan struct{}),
-		disconnectedCh: make(chan struct{}),
+		subscribeQoSByTopic: map[string]byte{},
+		handlers:            map[string]broker.MessageHandler{},
+		subscribed:          make(chan struct{}),
+		disconnectedCh:      make(chan struct{}),
 	}
 }
 
@@ -97,9 +105,15 @@ func (b *fakeBroker) Subscribe(_ context.Context, topic string, qos byte, handle
 	if b.subscribeErr != nil {
 		return b.subscribeErr
 	}
+	if err := b.subscribeErrByTopic[topic]; err != nil {
+		return err
+	}
 	b.subscribeTopic = topic
 	b.subscribeQoS = qos
 	b.handler = handler
+	b.subscribeTopics = append(b.subscribeTopics, topic)
+	b.subscribeQoSByTopic[topic] = qos
+	b.handlers[topic] = handler
 	b.subscribedOnce.Do(func() { close(b.subscribed) })
 	return nil
 }
@@ -120,9 +134,13 @@ func (b *fakeBroker) Publish(_ context.Context, topic string, qos byte, retain b
 }
 
 func (b *fakeBroker) currentHandler() broker.MessageHandler {
+	return b.handlerFor(contracts.GatewayReasoningRequestTopicFilter)
+}
+
+func (b *fakeBroker) handlerFor(topic string) broker.MessageHandler {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.handler
+	return b.handlers[topic]
 }
 
 func (b *fakeBroker) publishedResponse(t *testing.T) contracts.ReasoningResponse {
@@ -199,6 +217,7 @@ func validConfig() config.Config {
 	return config.Config{
 		Gateway: config.GatewayConfig{
 			BrokerURL:          "tcp://localhost:1883",
+			DeviceIDs:          []string{"dev-01"},
 			HeartbeatIntervalS: 30,
 		},
 		Provider: config.ProviderConfig{
@@ -254,6 +273,7 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 			}
 			return fleet.New(cfg, opts)
 		},
+		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
 			heartbeat.PublishFunc,
 			heartbeat.ProviderStatus,
@@ -461,6 +481,25 @@ func TestGatewayStartupSubscribeFailureCancelsHeartbeatAndDisconnects(t *testing
 	}
 }
 
+func TestGatewayStartupRuntimeHeartbeatSubscribeFailureCancelsHeartbeatAndDisconnects(t *testing.T) {
+	fb := newFakeBroker()
+	fb.subscribeErrByTopic = map[string]error{
+		"ori/dev-01/runtime/heartbeat": errors.New("runtime heartbeat subscribe failed"),
+	}
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+
+	err := runGateway(context.Background(), "gateway.yaml", baseDeps(t, validConfig(), fb, fp, hb))
+	if err == nil || !strings.Contains(err.Error(), "subscribe runtime node heartbeats") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	select {
+	case <-fb.disconnectedCh:
+	case <-time.After(time.Second):
+		t.Fatal("broker should be disconnected after runtime heartbeat subscribe failure")
+	}
+}
+
 func TestGatewayHeartbeatFailureReturnsError(t *testing.T) {
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
@@ -526,11 +565,11 @@ func TestMainWiresDispatcher(t *testing.T) {
 		t.Fatal("gateway did not subscribe")
 	}
 	fb.mu.Lock()
-	if fb.subscribeTopic != contracts.GatewayReasoningRequestTopicFilter {
-		t.Fatalf("subscribe topic = %q", fb.subscribeTopic)
+	if _, ok := fb.handlers[contracts.GatewayReasoningRequestTopicFilter]; !ok {
+		t.Fatalf("missing reasoning subscription, got topics %v", fb.subscribeTopics)
 	}
-	if fb.subscribeQoS != broker.QoSReasoning {
-		t.Fatalf("subscribe qos = %d", fb.subscribeQoS)
+	if fb.subscribeQoSByTopic[contracts.GatewayReasoningRequestTopicFilter] != broker.QoSReasoning {
+		t.Fatalf("reasoning subscribe qos = %d", fb.subscribeQoSByTopic[contracts.GatewayReasoningRequestTopicFilter])
 	}
 	fb.mu.Unlock()
 
@@ -642,7 +681,7 @@ func TestMainStartsHeartbeatBeforeSubscribe(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(events) != 2 || events[0] != "heartbeat" || events[1] != "subscribe" {
+	if len(events) < 2 || events[0] != "heartbeat" || events[1] != "subscribe" {
 		t.Fatalf("startup events = %v, want heartbeat before subscribe", events)
 	}
 }
@@ -673,4 +712,217 @@ func TestMainDisabledOptionalModulesDoNotFailStartup(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("gateway did not stop")
 	}
+}
+
+func TestMainSubscribesToRuntimeNodeHeartbeats(t *testing.T) {
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", baseDeps(t, validConfig(), fb, fp, hb))
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fb.mu.Lock()
+		_, ok := fb.handlers["ori/dev-01/runtime/heartbeat"]
+		qos := fb.subscribeQoSByTopic["ori/dev-01/runtime/heartbeat"]
+		fb.mu.Unlock()
+		if ok {
+			if qos != broker.QoSHeartbeat {
+				t.Fatalf("runtime heartbeat qos = %d", qos)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("runGateway returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("gateway did not stop")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("missing runtime heartbeat subscription, got topics %v", fb.subscribeTopics)
+}
+
+func TestMainRuntimeHeartbeatUpdatesInjectedRegistry(t *testing.T) {
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	registry := site.NewRegistry()
+	deps := baseDeps(t, validConfig(), fb, fp, hb)
+	deps.newSiteRegistry = func() *site.Registry { return registry }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", deps)
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		handler = fb.handlerFor("ori/dev-01/runtime/heartbeat")
+		if handler != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing runtime heartbeat handler, got topics %v", fb.subscribeTopics)
+	}
+	payload, err := json.Marshal(contracts.RuntimeNodeHeartbeat{
+		DeviceID:       "dev-01",
+		Status:         site.NodeStatusHealthy,
+		LastSeenMS:     1234567890000,
+		GatewaySeenMS:  0,
+		ActiveTriggers: []string{"grid_low"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler("ori/dev-01/runtime/heartbeat", payload)
+
+	snapshot := registry.Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("expected one runtime node, got %d", len(snapshot))
+	}
+	if snapshot[0].DeviceID != "dev-01" || snapshot[0].GatewaySeen != 1_700_000_000_000 {
+		t.Fatalf("unexpected registry snapshot: %#v", snapshot[0])
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+}
+
+func TestMainRuntimeHeartbeatVerifiesSignedPayloadWhenGatewayAuthEnabled(t *testing.T) {
+	t.Setenv("CUSTOM_GATEWAY_SECRET", "site-local-secret")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{
+		Enabled:         true,
+		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	registry := site.NewRegistry()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newSiteRegistry = func() *site.Registry { return registry }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", deps)
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		handler = fb.handlerFor("ori/dev-01/runtime/heartbeat")
+		if handler != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing runtime heartbeat handler, got topics %v", fb.subscribeTopics)
+	}
+	signedAt := int64(1_700_000_000_000)
+	beat := contracts.RuntimeNodeHeartbeat{
+		DeviceID:       "dev-01",
+		Status:         site.NodeStatusHealthy,
+		LastSeenMS:     signedAt,
+		GatewaySeenMS:  0,
+		ActiveTriggers: []string{},
+	}
+	auth, err := mqttauth.Sign(beat, contracts.RuntimeHeartbeatMessageType, "dev-01", "", signedAt, "site-local-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beat.Auth = &auth
+	payload, err := json.Marshal(beat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler("ori/dev-01/runtime/heartbeat", payload)
+	if len(registry.Snapshot()) != 1 {
+		t.Fatalf("signed runtime heartbeat should update registry, got %#v", registry.Snapshot())
+	}
+
+	unsigned, err := json.Marshal(contracts.RuntimeNodeHeartbeat{
+		DeviceID:       "dev-02",
+		Status:         site.NodeStatusHealthy,
+		LastSeenMS:     signedAt,
+		ActiveTriggers: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler("ori/dev-02/runtime/heartbeat", unsigned)
+	if len(registry.Snapshot()) != 1 {
+		t.Fatalf("unsigned runtime heartbeat should be rejected when auth enabled, got %#v", registry.Snapshot())
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+}
+
+func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
+	registry := site.NewRegistry()
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "stale", Status: site.NodeStatusHealthy, LastSeenMS: 1000})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "future", Status: site.NodeStatusHealthy, LastSeenMS: 100_000})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "fresh", Status: site.NodeStatusHealthy, LastSeenMS: 9999})
+	now := time.UnixMilli(10_000)
+	calls := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go evictStaleRuntimeNodes(ctx, registry, time.Millisecond, func() time.Time {
+		calls++
+		return now
+	}, slog.Default())
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := registry.Snapshot()
+		if len(snapshot) == 1 && snapshot[0].DeviceID == "fresh" && calls > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("stale runtime nodes were not evicted: %#v", registry.Snapshot())
 }

@@ -1,5 +1,7 @@
 gateway:
   broker_url: "tcp://localhost:1883"
+  device_ids:
+    - "ori-edge-site-a-01"
   heartbeat_interval_s: 30
   auth:
     enabled: false

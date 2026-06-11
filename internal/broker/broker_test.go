@@ -645,3 +645,36 @@ func TestSubscribeRespectsDeadline(t *testing.T) {
 		t.Fatalf("Subscribe: got %v, want %v", err, context.DeadlineExceeded)
 	}
 }
+
+type retainedTestMessage struct {
+	topic    string
+	payload  []byte
+	retained bool
+}
+
+func (m retainedTestMessage) Duplicate() bool   { return false }
+func (m retainedTestMessage) Qos() byte         { return QoSHeartbeat }
+func (m retainedTestMessage) Retained() bool    { return m.retained }
+func (m retainedTestMessage) Topic() string     { return m.topic }
+func (m retainedTestMessage) MessageID() uint16 { return 1 }
+func (m retainedTestMessage) Payload() []byte   { return m.payload }
+func (m retainedTestMessage) Ack()              {}
+
+func TestWrapHandlerRejectsRetainedMessages(t *testing.T) {
+	c, err := New(Options{
+		BrokerURL: "tcp://localhost:1883",
+		ClientID:  "test-retained",
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	handler := c.wrapHandler(func(string, []byte) {
+		called = true
+	})
+	handler(nil, retainedTestMessage{topic: "ori/dev-01/runtime/heartbeat", payload: []byte("stale"), retained: true})
+	if called {
+		t.Fatal("retained message should not reach application handler")
+	}
+}
