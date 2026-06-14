@@ -5,7 +5,9 @@ package runtimeclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -19,6 +21,19 @@ func TestHealthRequestValidation(t *testing.T) {
 	}
 	if _, err := NormalizeHealthRequest(HealthRequest{}); err == nil {
 		t.Fatal("expected missing device_id to fail")
+	}
+}
+
+func TestHealthSnapshotOmitsAbsentPostureFields(t *testing.T) {
+	payload, err := json.Marshal(HealthSnapshot{DeviceID: "edge-1", Status: "healthy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(payload)
+	for _, key := range []string{"gateway_broker_posture", "state_store_encryption", "alert_outbox"} {
+		if strings.Contains(encoded, key) {
+			t.Fatalf("expected %s to be omitted from %s", key, encoded)
+		}
 	}
 }
 

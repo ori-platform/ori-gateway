@@ -405,14 +405,74 @@ func mapHealthSnapshot(item map[string]any, fallbackDeviceID string) (HealthSnap
 		}
 	}
 	return HealthSnapshot{
-		DeviceID:          stringValue(item, "device_id", fallbackDeviceID),
-		Status:            status,
-		UptimeS:           floatValue(item, "uptime_s"),
-		LastReadingMS:     lastReadingMS,
-		GatewaySeen:       gatewaySeen,
-		PolicyStatus:      policyStatus,
-		LockoutRiskLevels: mapLockoutRiskLevels(item),
+		DeviceID:             stringValue(item, "device_id", fallbackDeviceID),
+		Status:               status,
+		UptimeS:              floatValue(item, "uptime_s"),
+		LastReadingMS:        lastReadingMS,
+		GatewaySeen:          gatewaySeen,
+		PolicyStatus:         policyStatus,
+		GatewayBrokerPosture: mapGatewayBrokerPosture(item),
+		StateStoreEncryption: mapStateStoreEncryptionPosture(item),
+		AlertOutbox:          mapAlertOutboxPosture(item),
+		LockoutRiskLevels:    mapLockoutRiskLevels(item),
 	}, nil
+}
+
+func mapGatewayBrokerPosture(item map[string]any) *GatewayBrokerPosture {
+	posture, ok := subMap(item, "gateway_broker_posture")
+	if !ok {
+		return nil
+	}
+	return &GatewayBrokerPosture{
+		Available:             boolValue(posture, "available"),
+		GatewayEnabled:        boolValue(posture, "gateway_enabled"),
+		DeploymentCheck:       stringValue(posture, "deployment_check", ""),
+		AnonymousAccess:       stringValue(posture, "anonymous_access", ""),
+		ACLPolicy:             stringValue(posture, "acl_policy", ""),
+		RequireCredentials:    boolValue(posture, "require_credentials"),
+		CredentialsConfigured: boolValue(posture, "credentials_configured"),
+		RequiresACLHardening:  boolValue(posture, "requires_acl_hardening"),
+	}
+}
+
+func mapStateStoreEncryptionPosture(item map[string]any) *StateStoreEncryptionPosture {
+	posture, ok := subMap(item, "state_store_encryption")
+	if !ok {
+		return nil
+	}
+	return &StateStoreEncryptionPosture{
+		Available:            boolValue(posture, "available"),
+		Mode:                 stringValue(posture, "mode", ""),
+		Satisfied:            boolValue(posture, "satisfied"),
+		MarkerConfigured:     boolValue(posture, "marker_configured"),
+		PathPrefixConfigured: boolValue(posture, "path_prefix_configured"),
+	}
+}
+
+func mapAlertOutboxPosture(item map[string]any) *AlertOutboxPosture {
+	posture, ok := subMap(item, "alert_outbox")
+	if !ok {
+		return nil
+	}
+	return &AlertOutboxPosture{
+		Available:                     true,
+		BacklogCount:                  intValue(posture, "backlog_count"),
+		OldestQueuedOriginalMS:        int64Value(posture, "oldest_queued_original_ts"),
+		OldestQueuedAgeMS:             int64Value(posture, "oldest_queued_age_ms"),
+		RetryIntervalMinutes:          floatValue(posture, "retry_interval_minutes"),
+		MaxNonTierDAttempts:           intValue(posture, "max_non_tier_d_attempts"),
+		TierDCriticalWarningThreshold: intValue(posture, "tier_d_critical_warning_threshold"),
+		BatchSize:                     intValue(posture, "batch_size"),
+	}
+}
+
+func subMap(item map[string]any, key string) (map[string]any, bool) {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return nil, false
+	}
+	out, ok := value.(map[string]any)
+	return out, ok
 }
 
 func mapSensorAggregate(item map[string]any, fallbackDeviceID string, fallbackSensorID string) (SensorAggregate, error) {
