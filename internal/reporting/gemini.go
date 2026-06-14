@@ -158,6 +158,7 @@ func buildGeminiWeeklyPrompt(input WeeklyReportInput) (string, error) {
 	}
 	return "You are Ori, an operational intelligence assistant for Nigerian SMEs. " +
 		"Write a concise weekly energy report for the business owner. Focus on cost, reliability, likely causes, and practical next actions. " +
+		"If runtime posture warnings are present, explain them as operational reliability risks without exposing secrets or internal implementation details. " +
 		"Do not claim that physical actions were taken unless they appear in the action log. " +
 		"Use plain language and keep it under 350 words.\n\n" +
 		"Structured weekly input JSON:\n" + string(encoded), nil
