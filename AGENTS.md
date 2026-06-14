@@ -113,6 +113,14 @@ the broker. Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupSubscribeFailureCancelsHeartbeatAndDisconnects`,
 `TestMainStartsHeartbeatBeforeSubscribe`, and `TestGracefulShutdown`.
 
+16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
+Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
+webhook bridge is the allowed production adapter for that case: it validates
+source CIDRs, caps request body size, preserves the raw provider body, adds
+`X-Ori-Webhook-*` HMAC headers using environment-sourced secrets, and forwards
+only to the runtime's local webhook URL. The bridge must never log SMS body
+content, phone numbers, bearer tokens, or HMAC secrets.
+
 ## Layout
 
 ```text
@@ -129,6 +137,7 @@ internal/runtimeclient/
 internal/session/
 internal/sim/
 internal/site/
+internal/webhookbridge/
 ```
 
 ## Verification

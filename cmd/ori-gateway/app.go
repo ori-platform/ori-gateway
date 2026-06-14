@@ -28,6 +28,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/provider"
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
+	"github.com/ori-platform/ori-gateway/internal/webhookbridge"
 )
 
 const (
@@ -47,6 +48,10 @@ type heartbeatRunner interface {
 	Run(ctx context.Context) error
 }
 
+type webhookBridgeRunner interface {
+	Run(ctx context.Context) error
+}
+
 type appDependencies struct {
 	loadConfig                 func(path string) (config.Config, error)
 	newProvider                func(cfg config.ProviderConfig) (provider.Provider, error)
@@ -54,6 +59,7 @@ type appDependencies struct {
 	newBroker                  func(opts broker.Options) (brokerClient, error)
 	newSIM                     func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
 	newFleet                   func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
+	newWebhookBridge           func(cfg config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error)
 	newSiteRegistry            func() *site.Registry
 	newHeartbeat               func(
 		publish heartbeat.PublishFunc,
@@ -75,8 +81,11 @@ func defaultDependencies() appDependencies {
 		newBroker: func(opts broker.Options) (brokerClient, error) {
 			return broker.New(opts)
 		},
-		newSIM:          sim.New,
-		newFleet:        fleet.New,
+		newSIM:   sim.New,
+		newFleet: fleet.New,
+		newWebhookBridge: func(cfg config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error) {
+			return webhookbridge.New(cfg, opts)
+		},
 		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
 			publish heartbeat.PublishFunc,
@@ -125,6 +134,17 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}
 	providerStatus := providerStatusFromProvider(reasoningProvider)
 
+	var webhookBridge webhookBridgeRunner
+	if cfg.WebhookBridge.Enabled {
+		webhookBridge, err = deps.newWebhookBridge(cfg.WebhookBridge, webhookbridge.Options{
+			Logger: deps.logger,
+			Now:    deps.now,
+		})
+		if err != nil {
+			return fmt.Errorf("construct webhook bridge: %w", err)
+		}
+	}
+
 	client, err := deps.newBroker(broker.Options{
 		BrokerURL: cfg.Gateway.BrokerURL,
 		ClientID:  defaultClientID,
@@ -159,9 +179,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	var webhookBridgeErr <-chan error
+	if webhookBridge != nil {
+		ch := make(chan error, 1)
+		webhookBridgeErr = ch
+		go func() {
+			if err := webhookBridge.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				ch <- err
+				return
+			}
+			ch <- nil
+		}()
+	}
+
 	heartbeatAuth, err := heartbeatAuthFromConfig(cfg.Gateway.Auth)
 	if err != nil {
 		cancel()
+		_ = waitOptionalRunner(webhookBridgeErr)
 		return err
 	}
 
@@ -169,6 +203,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromConfig(cfg.Gateway.Auth, heartbeatAuth.SharedSecret, siteRegistry, deps.now)
 	if err != nil {
 		cancel()
+		_ = waitOptionalRunner(webhookBridgeErr)
 		return err
 	}
 
@@ -192,6 +227,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		},
 	)
 	if err != nil {
+		cancel()
+		_ = waitOptionalRunner(webhookBridgeErr)
 		return fmt.Errorf("construct heartbeat: %w", err)
 	}
 
@@ -212,6 +249,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err != nil {
 		cancel()
 		<-heartbeatErr
+		_ = waitOptionalRunner(webhookBridgeErr)
 		return fmt.Errorf("construct dispatcher: %w", err)
 	}
 
@@ -239,6 +277,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}); err != nil {
 		cancel()
 		<-heartbeatErr
+		_ = waitOptionalRunner(webhookBridgeErr)
 		return fmt.Errorf("subscribe reasoning requests: %w", err)
 	}
 
@@ -247,6 +286,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			cancel()
 			<-heartbeatErr
+			_ = waitOptionalRunner(webhookBridgeErr)
 			return fmt.Errorf("runtime node heartbeat topic: %w", err)
 		}
 		if err := client.Subscribe(runCtx, topic, broker.QoSHeartbeat, func(topic string, payload []byte) {
@@ -256,6 +296,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}); err != nil {
 			cancel()
 			<-heartbeatErr
+			_ = waitOptionalRunner(webhookBridgeErr)
 			return fmt.Errorf("subscribe runtime node heartbeats: %w", err)
 		}
 	}
@@ -265,12 +306,14 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			cancel()
 			<-heartbeatErr
+			_ = waitOptionalRunner(webhookBridgeErr)
 			return fmt.Errorf("construct tier c enrichment provider: %w", err)
 		}
 		enrichmentHandler, err := enrichment.NewHandler(client, enrichmentProvider, enrichment.Options{Logger: deps.logger})
 		if err != nil {
 			cancel()
 			<-heartbeatErr
+			_ = waitOptionalRunner(webhookBridgeErr)
 			return fmt.Errorf("construct tier c enrichment handler: %w", err)
 		}
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
@@ -278,6 +321,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			if err != nil {
 				cancel()
 				<-heartbeatErr
+				_ = waitOptionalRunner(webhookBridgeErr)
 				return fmt.Errorf("tier c enrichment request topic: %w", err)
 			}
 			if err := client.Subscribe(runCtx, topic, broker.QoSReasoning, func(topic string, payload []byte) {
@@ -287,6 +331,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			}); err != nil {
 				cancel()
 				<-heartbeatErr
+				_ = waitOptionalRunner(webhookBridgeErr)
 				return fmt.Errorf("subscribe tier c enrichment requests: %w", err)
 			}
 		}
@@ -296,6 +341,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	case <-ctx.Done():
 		cancel()
 		<-heartbeatErr
+		_ = waitOptionalRunner(webhookBridgeErr)
 		err := client.Disconnect(context.Background())
 		disconnect = false
 		if err != nil {
@@ -304,15 +350,31 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return nil
 	case err := <-heartbeatErr:
 		cancel()
+		_ = waitOptionalRunner(webhookBridgeErr)
 		if err != nil {
 			return fmt.Errorf("heartbeat stopped: %w", err)
 		}
 		return fmt.Errorf("heartbeat stopped unexpectedly")
+	case err := <-webhookBridgeErr:
+		cancel()
+		<-heartbeatErr
+		if err != nil {
+			return fmt.Errorf("webhook bridge stopped: %w", err)
+		}
+		return fmt.Errorf("webhook bridge stopped unexpectedly")
 	case err := <-requestErr:
 		cancel()
 		<-heartbeatErr
+		_ = waitOptionalRunner(webhookBridgeErr)
 		return err
 	}
+}
+
+func waitOptionalRunner(ch <-chan error) error {
+	if ch == nil {
+		return nil
+	}
+	return <-ch
 }
 
 func evictStaleRuntimeNodes(
@@ -418,6 +480,9 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	}
 	if deps.newFleet == nil {
 		deps.newFleet = defaults.newFleet
+	}
+	if deps.newWebhookBridge == nil {
+		deps.newWebhookBridge = defaults.newWebhookBridge
 	}
 	if deps.newSiteRegistry == nil {
 		deps.newSiteRegistry = defaults.newSiteRegistry

@@ -899,3 +899,170 @@ reporting:
 		t.Fatalf("unexpected reporting config: %#v", cfg.Reporting)
 	}
 }
+
+func TestWebhookBridgeDefaultsDisabled(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebhookBridge.Enabled {
+		t.Fatal("webhook bridge should default disabled")
+	}
+	if cfg.WebhookBridge.ListenAddr != DefaultWebhookBridgeListenAddr {
+		t.Fatalf("listen addr = %q", cfg.WebhookBridge.ListenAddr)
+	}
+	if cfg.WebhookBridge.Path != DefaultWebhookBridgePath {
+		t.Fatalf("path = %q", cfg.WebhookBridge.Path)
+	}
+}
+
+func TestWebhookBridgeLoadsWhenEnabled(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+webhook_bridge:
+  enabled: true
+  listen_addr: "127.0.0.1:8090"
+  path: "/webhooks/sms/africastalking"
+  target_url: "http://127.0.0.1:8080/webhooks/sms/africastalking"
+  runtime_token_env: "ORI_SMS_WEBHOOK_TOKEN"
+  hmac_secret_env: "ORI_SMS_WEBHOOK_HMAC_SECRET"
+  request_timeout_ms: 3000
+  max_body_bytes: 65536
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WebhookBridge.Enabled {
+		t.Fatal("expected webhook bridge enabled")
+	}
+	if cfg.WebhookBridge.TargetURL == "" || cfg.WebhookBridge.RuntimeTokenEnv == "" || cfg.WebhookBridge.HMACSecretEnv == "" {
+		t.Fatalf("unexpected bridge config: %#v", cfg.WebhookBridge)
+	}
+}
+
+func TestWebhookBridgeRejectsInvalidConfig(t *testing.T) {
+	base := `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+webhook_bridge:
+  enabled: true
+  listen_addr: "127.0.0.1:8090"
+  path: "/webhooks/sms/africastalking"
+  target_url: "http://127.0.0.1:8080/webhooks/sms/africastalking"
+  runtime_token_env: "ORI_SMS_WEBHOOK_TOKEN"
+  hmac_secret_env: "ORI_SMS_WEBHOOK_HMAC_SECRET"
+  request_timeout_ms: 3000
+  max_body_bytes: 65536
+`
+	cases := []struct {
+		name    string
+		content string
+		field   string
+	}{
+		{
+			name: "missing target url",
+			content: strings.Replace(base, `  target_url: "http://127.0.0.1:8080/webhooks/sms/africastalking"
+`, `  target_url: ""
+`, 1),
+			field: "target_url",
+		},
+		{
+			name: "bad path",
+			content: strings.Replace(base, `  path: "/webhooks/sms/africastalking"
+`, `  path: "webhooks/sms/africastalking"
+`, 1),
+			field: "path",
+		},
+		{
+			name: "literal secret env",
+			content: strings.Replace(base, `  hmac_secret_env: "ORI_SMS_WEBHOOK_HMAC_SECRET"
+`, `  hmac_secret_env: "bad secret"
+`, 1),
+			field: "hmac_secret_env",
+		},
+		{
+			name: "env name with equals rejected",
+			content: strings.Replace(base, `  runtime_token_env: "ORI_SMS_WEBHOOK_TOKEN"
+`, `  runtime_token_env: "ORI_SMS_WEBHOOK_TOKEN=value"
+`, 1),
+			field: "runtime_token_env",
+		},
+		{
+			name: "non loopback requires source cidrs",
+			content: strings.Replace(base, `  listen_addr: "127.0.0.1:8090"
+`, `  listen_addr: "0.0.0.0:8090"
+`, 1),
+			field: "provider_source_cidrs",
+		},
+		{
+			name: "catch all cidr rejected",
+			content: base + `  provider_source_cidrs:
+    - "0.0.0.0/0"
+`,
+			field: "catch-all",
+		},
+		{
+			name: "too broad ipv4 cidr rejected",
+			content: base + `  provider_source_cidrs:
+    - "0.0.0.0/1"
+`,
+			field: "too broad",
+		},
+		{
+			name: "oversized max body rejected",
+			content: strings.Replace(base, `  max_body_bytes: 65536
+`, `  max_body_bytes: 1048577
+`, 1),
+			field: "max_body_bytes",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.content)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestWebhookBridgeNonLoopbackAcceptsProviderCIDR(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+webhook_bridge:
+  enabled: true
+  listen_addr: "0.0.0.0:8090"
+  path: "/webhooks/sms/africastalking"
+  target_url: "http://127.0.0.1:8080/webhooks/sms/africastalking"
+  provider_source_cidrs:
+    - "127.0.0.1/32"
+  runtime_token_env: "ORI_SMS_WEBHOOK_TOKEN"
+  hmac_secret_env: "ORI_SMS_WEBHOOK_HMAC_SECRET"
+`)
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+}

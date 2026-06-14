@@ -32,6 +32,20 @@ reporting:
   tier_c_enrichment:
     enabled: false
 
+
+webhook_bridge:
+  # Optional ingress bridge for providers that cannot sign webhook bodies.
+  # Production topology: provider -> gateway bridge -> runtime localhost webhook.
+  enabled: false
+  listen_addr: "127.0.0.1:8090"
+  path: "/webhooks/sms/africastalking"
+  target_url: "http://127.0.0.1:8080/webhooks/sms/africastalking"
+  provider_source_cidrs: [] # required for non-loopback listen_addr; never use 0.0.0.0/0
+  runtime_token_env: "ORI_SMS_WEBHOOK_TOKEN"
+  hmac_secret_env: "ORI_SMS_WEBHOOK_HMAC_SECRET"
+  request_timeout_ms: 3000
+  max_body_bytes: 65536
+
 sim:
   enabled: false
   modem_path: "/dev/ttyUSB0"

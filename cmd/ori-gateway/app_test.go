@@ -24,6 +24,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/provider"
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
+	"github.com/ori-platform/ori-gateway/internal/webhookbridge"
 )
 
 type fakeBroker struct {
@@ -227,14 +228,37 @@ type fakeHeartbeat struct {
 	err     error
 }
 
+type fakeWebhookBridge struct {
+	started   chan struct{}
+	once      sync.Once
+	err       error
+	returnNil bool
+}
+
 func newFakeHeartbeat() *fakeHeartbeat {
 	return &fakeHeartbeat{started: make(chan struct{})}
+}
+
+func newFakeWebhookBridge() *fakeWebhookBridge {
+	return &fakeWebhookBridge{started: make(chan struct{})}
 }
 
 func (h *fakeHeartbeat) Run(ctx context.Context) error {
 	h.once.Do(func() { close(h.started) })
 	if h.err != nil {
 		return h.err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (b *fakeWebhookBridge) Run(ctx context.Context) error {
+	b.once.Do(func() { close(b.started) })
+	if b.err != nil {
+		return b.err
+	}
+	if b.returnNil {
+		return nil
 	}
 	<-ctx.Done()
 	return ctx.Err()
@@ -302,6 +326,12 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 				return nil, errors.New("main wiring must not inject fleet network/auth hooks in disabled path")
 			}
 			return fleet.New(cfg, opts)
+		},
+		newWebhookBridge: func(cfg config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error) {
+			if !cfg.Enabled {
+				return nil, errors.New("webhook bridge should not be constructed when disabled")
+			}
+			return newFakeWebhookBridge(), nil
 		},
 		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
@@ -1147,5 +1177,117 @@ func TestMainTierCEnrichmentSubscribeFailureCancelsHeartbeatAndDisconnects(t *te
 	case <-fb.disconnectedCh:
 	case <-time.After(time.Second):
 		t.Fatal("broker should be disconnected after tier c enrichment subscribe failure")
+	}
+}
+
+func TestGatewayStartsWebhookBridgeWhenEnabled(t *testing.T) {
+	cfg := validConfig()
+	cfg.WebhookBridge = config.WebhookBridgeConfig{
+		Enabled:          true,
+		ListenAddr:       "127.0.0.1:8090",
+		Path:             "/webhooks/sms/africastalking",
+		TargetURL:        "http://127.0.0.1:8080/webhooks/sms/africastalking",
+		RuntimeTokenEnv:  "RUNTIME_TOKEN",
+		HMACSecretEnv:    "WEBHOOK_HMAC_SECRET",
+		RequestTimeoutMS: 1000,
+		MaxBodyBytes:     65536,
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	bridge := newFakeWebhookBridge()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	constructed := false
+	deps.newWebhookBridge = func(got config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error) {
+		constructed = true
+		if !got.Enabled || got.TargetURL != cfg.WebhookBridge.TargetURL {
+			t.Fatalf("unexpected bridge config: %#v", got)
+		}
+		if opts.Now == nil || opts.Logger == nil {
+			t.Fatal("expected bridge options to include clock and logger")
+		}
+		return bridge, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-bridge.started:
+	case <-time.After(time.Second):
+		t.Fatal("webhook bridge did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	if !constructed {
+		t.Fatal("webhook bridge was not constructed")
+	}
+}
+
+func TestGatewayWebhookBridgeRuntimeErrorReturnsError(t *testing.T) {
+	cfg := validConfig()
+	cfg.WebhookBridge = config.WebhookBridgeConfig{Enabled: true}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	bridge := &fakeWebhookBridge{started: make(chan struct{}), err: errors.New("listener failed")}
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newWebhookBridge = func(config.WebhookBridgeConfig, webhookbridge.Options) (webhookBridgeRunner, error) {
+		return bridge, nil
+	}
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "webhook bridge stopped") || !strings.Contains(err.Error(), "listener failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayWebhookBridgeUnexpectedNilReturnIsError(t *testing.T) {
+	cfg := validConfig()
+	cfg.WebhookBridge = config.WebhookBridgeConfig{Enabled: true}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	bridge := &fakeWebhookBridge{started: make(chan struct{}), returnNil: true}
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newWebhookBridge = func(config.WebhookBridgeConfig, webhookbridge.Options) (webhookBridgeRunner, error) {
+		return bridge, nil
+	}
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "webhook bridge stopped unexpectedly") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayWebhookBridgeFailureReturnsErrorBeforeBrokerConnect(t *testing.T) {
+	cfg := validConfig()
+	cfg.WebhookBridge = config.WebhookBridgeConfig{Enabled: true}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	brokerCalled := false
+	deps.newBroker = func(broker.Options) (brokerClient, error) {
+		brokerCalled = true
+		return fb, nil
+	}
+	deps.newWebhookBridge = func(config.WebhookBridgeConfig, webhookbridge.Options) (webhookBridgeRunner, error) {
+		return nil, errors.New("bridge config invalid")
+	}
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "construct webhook bridge") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if brokerCalled {
+		t.Fatal("broker should not be constructed after webhook bridge config failure")
 	}
 }
