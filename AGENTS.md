@@ -114,11 +114,17 @@ and must not add direct SQLite access.
 Startup order is config, provider, broker connect, optional modules, heartbeat,
 dispatcher, then MQTT subscribe. Failure at any required stage must prevent
 later stages from starting. Shutdown must cancel background work and disconnect
-the broker. Verified by `TestMainStartupMissingConfig`,
+the broker. Long-running app tasks must be supervised through the shared
+`errgroup`-backed supervisor rather than open-coded result channels, so adding a
+new runner does not require updating every early-return drain path by hand.
+Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
 `TestGatewayStartupSubscribeFailureCancelsHeartbeatAndDisconnects`,
-`TestMainStartsHeartbeatBeforeSubscribe`, and `TestGracefulShutdown`.
+`TestMainStartsHeartbeatBeforeSubscribe`, `TestGracefulShutdown`,
+`TestSupervisedRunnersReportsRunnerErrors`,
+`TestSupervisedRunnersWaitsForAllRunners`, and
+`TestSupervisedRunnersUnexpectedNilReturnIsError`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway

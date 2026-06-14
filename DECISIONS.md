@@ -267,3 +267,34 @@ Rationale:
 The weekly report is a product feature, not a safety or action path. Keeping it
 on the gateway lets a site generate useful customer-facing intelligence from
 local runtime data while preserving runtime ownership of state and actuation.
+
+---
+
+## 2026-06-14 — Gateway Runner Supervision Is Centralized
+
+Status: Accepted
+
+The gateway process now supervises heartbeat, webhook bridge, weekly report, and
+future long-running app tasks through one `errgroup`-backed supervisor. Startup
+code registers runners by name, and shutdown waits through a single path instead
+of maintaining one channel and one drain call per runner at every early return.
+
+Rules:
+
+- Required long-running app loops must be registered with the shared
+  `errgroup`-backed supervisor once constructed.
+- A runner error before process cancellation remains fatal and is reported with
+  the runner name.
+- A runner returning nil before process cancellation remains an unexpected-stop
+  error.
+- A runner returning nil or `context.Canceled` after process cancellation is a
+  clean shutdown.
+- Future runners must not reintroduce ad hoc `fooErr` channels, sized result
+  buffers, or repeated manual drain calls in `runGateway`.
+
+Rationale:
+
+The gateway now has multiple supervised loops. Keeping shutdown supervision on
+`errgroup` prevents future optional modules from leaking goroutines or broker
+resources when startup fails after some runners have already begun, without
+fixed-size result buffers or call-site drain counters.
