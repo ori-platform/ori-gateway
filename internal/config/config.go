@@ -49,15 +49,21 @@ type Config struct {
 }
 
 type GatewayConfig struct {
-	BrokerURL          string            `yaml:"broker_url"`
-	DeviceIDs          []string          `yaml:"device_ids"`
-	HeartbeatIntervalS int               `yaml:"heartbeat_interval_s"`
-	Auth               GatewayAuthConfig `yaml:"auth"`
+	BrokerURL          string                  `yaml:"broker_url"`
+	DeviceIDs          []string                `yaml:"device_ids"`
+	HeartbeatIntervalS int                     `yaml:"heartbeat_interval_s"`
+	Auth               GatewayAuthConfig       `yaml:"auth"`
+	Encryption         GatewayEncryptionConfig `yaml:"encryption"`
 }
 
 type GatewayAuthConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	SharedSecretEnv string `yaml:"shared_secret_env"`
+	Enabled                 bool   `yaml:"enabled"`
+	SharedSecretEnv         string `yaml:"shared_secret_env"`
+	PreviousSharedSecretEnv string `yaml:"previous_shared_secret_env"`
+}
+
+type GatewayEncryptionConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 type ProviderConfig struct {
@@ -139,10 +145,11 @@ type fileConfig struct {
 }
 
 type fileGatewayConfig struct {
-	BrokerURL          string            `yaml:"broker_url"`
-	DeviceIDs          []string          `yaml:"device_ids"`
-	HeartbeatIntervalS *int              `yaml:"heartbeat_interval_s"`
-	Auth               GatewayAuthConfig `yaml:"auth"`
+	BrokerURL          string                  `yaml:"broker_url"`
+	DeviceIDs          []string                `yaml:"device_ids"`
+	HeartbeatIntervalS *int                    `yaml:"heartbeat_interval_s"`
+	Auth               GatewayAuthConfig       `yaml:"auth"`
+	Encryption         GatewayEncryptionConfig `yaml:"encryption"`
 }
 
 type fileProviderConfig struct {
@@ -190,9 +197,11 @@ func (f *fileConfig) normalize() (Config, error) {
 			BrokerURL: strings.TrimSpace(f.Gateway.BrokerURL),
 			DeviceIDs: normalizeGatewayDeviceIDs(f.Gateway.DeviceIDs),
 			Auth: GatewayAuthConfig{
-				Enabled:         f.Gateway.Auth.Enabled,
-				SharedSecretEnv: strings.TrimSpace(f.Gateway.Auth.SharedSecretEnv),
+				Enabled:                 f.Gateway.Auth.Enabled,
+				SharedSecretEnv:         strings.TrimSpace(f.Gateway.Auth.SharedSecretEnv),
+				PreviousSharedSecretEnv: strings.TrimSpace(f.Gateway.Auth.PreviousSharedSecretEnv),
 			},
+			Encryption: f.Gateway.Encryption,
 		},
 		Provider: normalizeProviderStrings(ProviderConfig{
 			Name:     f.Provider.Name,
@@ -219,8 +228,14 @@ func (f *fileConfig) normalize() (Config, error) {
 	if cfg.Gateway.Auth.SharedSecretEnv == "" {
 		cfg.Gateway.Auth.SharedSecretEnv = DefaultGatewayAuthSecretEnv
 	}
-	if strings.ContainsAny(cfg.Gateway.Auth.SharedSecretEnv, " \t\r\n") {
+	if strings.ContainsAny(cfg.Gateway.Auth.SharedSecretEnv, " \t\r\n=") {
 		return Config{}, fmt.Errorf("gateway.auth.shared_secret_env must be an environment variable name")
+	}
+	if cfg.Gateway.Auth.PreviousSharedSecretEnv != "" && strings.ContainsAny(cfg.Gateway.Auth.PreviousSharedSecretEnv, " \t\r\n=") {
+		return Config{}, fmt.Errorf("gateway.auth.previous_shared_secret_env must be an environment variable name")
+	}
+	if cfg.Gateway.Encryption.Enabled && !cfg.Gateway.Auth.Enabled {
+		return Config{}, fmt.Errorf("gateway.encryption.enabled requires gateway.auth.enabled")
 	}
 
 	if f.Gateway.HeartbeatIntervalS == nil {

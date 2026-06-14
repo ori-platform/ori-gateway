@@ -123,6 +123,16 @@ readiness and limit posture, but `ready` must reflect bridge-loop liveness rathe
 than static config. It must never expose target URLs, env var names, provider
 CIDR values, SMS body content, phone numbers, bearer tokens, or HMAC secrets.
 
+
+17. `GW-17` Runtime export clients must match runtime MQTT security posture.
+When `gateway.auth.enabled=true`, export requests must be HMAC-signed and
+export responses must be verified with current-or-previous gateway secrets.
+When `gateway.encryption.enabled=true`, sensitive runtime export responses
+(`sensor_history`, `action_log`, `reasoning_log`, `tier_c_decision_log`) must
+be AES-GCM decrypted after HMAC verification. Health exports may remain
+plaintext but still authenticated. New outbound signatures must use the current
+secret only; previous secrets are verify-only.
+
 ## Layout
 
 ```text

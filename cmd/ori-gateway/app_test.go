@@ -22,6 +22,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
+	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
 	"github.com/ori-platform/ori-gateway/internal/webhookbridge"
@@ -1392,5 +1393,141 @@ func TestGatewayWebhookBridgeFailureReturnsErrorBeforeBrokerConnect(t *testing.T
 	}
 	if brokerCalled {
 		t.Fatal("broker should not be constructed after webhook bridge config failure")
+	}
+}
+
+func TestGatewayAuthSecretsFromConfigReadsPreviousSecret(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET_CURRENT", "current-secret")
+	t.Setenv("GATEWAY_SECRET_PREVIOUS", "previous-secret")
+
+	secrets, err := gatewayAuthSecretsFromConfig(config.GatewayAuthConfig{
+		Enabled:                 true,
+		SharedSecretEnv:         "GATEWAY_SECRET_CURRENT",
+		PreviousSharedSecretEnv: "GATEWAY_SECRET_PREVIOUS",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secrets.Enabled || secrets.CurrentSecret != "current-secret" || secrets.PreviousSecret != "previous-secret" {
+		t.Fatalf("unexpected secrets: %#v", secrets)
+	}
+}
+
+func TestGatewayAuthSecretsFromConfigRejectsMissingPreviousSecret(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET_CURRENT", "current-secret")
+	t.Setenv("GATEWAY_SECRET_PREVIOUS", "")
+
+	_, err := gatewayAuthSecretsFromConfig(config.GatewayAuthConfig{
+		Enabled:                 true,
+		SharedSecretEnv:         "GATEWAY_SECRET_CURRENT",
+		PreviousSharedSecretEnv: "GATEWAY_SECRET_PREVIOUS",
+	})
+	if err == nil || !strings.Contains(err.Error(), "GATEWAY_SECRET_PREVIOUS") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayAuthSecretsFromConfigRejectsMatchingPreviousSecret(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET_CURRENT", "same-secret")
+	t.Setenv("GATEWAY_SECRET_PREVIOUS", "same-secret")
+
+	_, err := gatewayAuthSecretsFromConfig(config.GatewayAuthConfig{
+		Enabled:                 true,
+		SharedSecretEnv:         "GATEWAY_SECRET_CURRENT",
+		PreviousSharedSecretEnv: "GATEWAY_SECRET_PREVIOUS",
+	})
+	if err == nil || !strings.Contains(err.Error(), "must reference a secret different") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRuntimeClientOptionsFromConfigBuildsSecureOptions(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET_CURRENT", "current-secret")
+	t.Setenv("GATEWAY_SECRET_PREVIOUS", "previous-secret")
+	cfg := validConfig().Gateway
+	cfg.Auth = config.GatewayAuthConfig{
+		Enabled:                 true,
+		SharedSecretEnv:         "GATEWAY_SECRET_CURRENT",
+		PreviousSharedSecretEnv: "GATEWAY_SECRET_PREVIOUS",
+	}
+	cfg.Encryption.Enabled = true
+
+	opts, err := runtimeClientOptionsFromConfig(cfg, func() time.Time { return time.UnixMilli(1234567890000) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opts) != 2 {
+		t.Fatalf("expected auth and encryption options, got %d", len(opts))
+	}
+}
+
+func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET_CURRENT", "current-secret")
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_SECRET_CURRENT"}
+	cfg.Gateway.Encryption.Enabled = true
+	cfg.Reporting = config.ReportingConfig{
+		Provider:     config.ReportingProviderGemini,
+		Gemini:       config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos"},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	called := false
+	deps.newRuntimeClient = func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		called = true
+		if b == nil {
+			t.Fatal("runtime client broker is nil")
+		}
+		if len(opts) != 2 {
+			t.Fatalf("expected auth and encryption options, got %d", len(opts))
+		}
+		return runtimeclient.NewMQTTClient(b, opts...)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	if !called {
+		t.Fatal("weekly reporting did not construct runtime export client")
+	}
+}
+
+func TestGatewayWeeklyReportRuntimeClientFailureStopsStartup(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider:     config.ReportingProviderGemini,
+		Gemini:       config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos"},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newRuntimeClient = func(brokerClient, ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		return nil, errors.New("runtime export unavailable")
+	}
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "construct runtime export client") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

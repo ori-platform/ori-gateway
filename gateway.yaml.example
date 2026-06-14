@@ -6,6 +6,9 @@ gateway:
   auth:
     enabled: false
     shared_secret_env: "GATEWAY_SHARED_SECRET"
+    previous_shared_secret_env: "" # optional verify-only previous secret during rotation
+  encryption:
+    enabled: false # decrypt sensitive runtime export responses; requires auth.enabled
 
 provider:
   name: "echo" # echo | llama_cpp | cloud_llm

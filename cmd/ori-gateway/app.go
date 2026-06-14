@@ -27,6 +27,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
+	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
 	"github.com/ori-platform/ori-gateway/internal/webhookbridge"
@@ -61,6 +62,7 @@ type appDependencies struct {
 	newSIM                     func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
 	newFleet                   func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
 	newWebhookBridge           func(cfg config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error)
+	newRuntimeClient           func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error)
 	newSiteRegistry            func() *site.Registry
 	newHeartbeat               func(
 		publish heartbeat.PublishFunc,
@@ -86,6 +88,9 @@ func defaultDependencies() appDependencies {
 		newFleet: fleet.New,
 		newWebhookBridge: func(cfg config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error) {
 			return webhookbridge.New(cfg, opts)
+		},
+		newRuntimeClient: func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+			return runtimeclient.NewMQTTClient(b, opts...)
 		},
 		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
@@ -125,6 +130,10 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	deps = normalizeDependencies(deps)
 
 	cfg, err := deps.loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	gatewaySecrets, err := gatewayAuthSecretsFromConfig(cfg.Gateway.Auth)
 	if err != nil {
 		return err
 	}
@@ -178,6 +187,20 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// includes fleet health fields.
 	_ = fleetClient
 
+	if cfg.Reporting.WeeklyReport.Enabled {
+		runtimeClientOptions, err := runtimeClientOptionsFromSecrets(cfg.Gateway.Encryption, gatewaySecrets, deps.now)
+		if err != nil {
+			return fmt.Errorf("construct runtime export client options: %w", err)
+		}
+		runtimeExportClient, err := deps.newRuntimeClient(client, runtimeClientOptions...)
+		if err != nil {
+			return fmt.Errorf("construct runtime export client: %w", err)
+		}
+		// Weekly report scheduling is not active yet, but enabling the feature must
+		// still validate the runtime export security boundary at startup.
+		_ = runtimeExportClient
+	}
+
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -196,15 +219,10 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}()
 	}
 
-	heartbeatAuth, err := heartbeatAuthFromConfig(cfg.Gateway.Auth)
-	if err != nil {
-		cancel()
-		_ = waitOptionalRunner(webhookBridgeErr)
-		return err
-	}
+	heartbeatAuth := heartbeatAuthFromSecrets(gatewaySecrets)
 
 	siteRegistry := deps.newSiteRegistry()
-	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromConfig(cfg.Gateway.Auth, heartbeatAuth.SharedSecret, siteRegistry, deps.now)
+	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromSecrets(gatewaySecrets, siteRegistry, deps.now)
 	if err != nil {
 		cancel()
 		_ = waitOptionalRunner(webhookBridgeErr)
@@ -441,20 +459,30 @@ func webhookBridgePostureProbe(cfg config.WebhookBridgeConfig, ready func() bool
 	}
 }
 
+type gatewayAuthSecrets struct {
+	Enabled        bool
+	CurrentSecret  string
+	PreviousSecret string
+}
+
 func heartbeatAuthFromConfig(auth config.GatewayAuthConfig) (heartbeat.AuthConfig, error) {
-	secret, enabled, err := gatewayAuthSecretFromConfig(auth)
+	secrets, err := gatewayAuthSecretsFromConfig(auth)
 	if err != nil {
 		return heartbeat.AuthConfig{}, err
 	}
-	if !enabled {
-		return heartbeat.AuthConfig{}, nil
-	}
-	return heartbeat.AuthConfig{Enabled: true, SharedSecret: secret}, nil
+	return heartbeatAuthFromSecrets(secrets), nil
 }
 
-func gatewayAuthSecretFromConfig(auth config.GatewayAuthConfig) (string, bool, error) {
+func heartbeatAuthFromSecrets(secrets gatewayAuthSecrets) heartbeat.AuthConfig {
+	if !secrets.Enabled {
+		return heartbeat.AuthConfig{}
+	}
+	return heartbeat.AuthConfig{Enabled: true, SharedSecret: secrets.CurrentSecret}
+}
+
+func gatewayAuthSecretsFromConfig(auth config.GatewayAuthConfig) (gatewayAuthSecrets, error) {
 	if !auth.Enabled {
-		return "", false, nil
+		return gatewayAuthSecrets{}, nil
 	}
 	envName := strings.TrimSpace(auth.SharedSecretEnv)
 	if envName == "" {
@@ -462,23 +490,62 @@ func gatewayAuthSecretFromConfig(auth config.GatewayAuthConfig) (string, bool, e
 	}
 	secret := strings.TrimSpace(os.Getenv(envName))
 	if secret == "" {
-		return "", false, fmt.Errorf("gateway.auth.enabled is true but environment variable %q is empty", envName)
+		return gatewayAuthSecrets{}, fmt.Errorf("gateway.auth.enabled is true but environment variable %q is empty", envName)
 	}
-	return secret, true, nil
+	previousSecret := ""
+	previousEnv := strings.TrimSpace(auth.PreviousSharedSecretEnv)
+	if previousEnv != "" {
+		previousSecret = strings.TrimSpace(os.Getenv(previousEnv))
+		if previousSecret == "" {
+			return gatewayAuthSecrets{}, fmt.Errorf("gateway.auth.previous_shared_secret_env is set but environment variable %q is empty", previousEnv)
+		}
+		if previousSecret == secret {
+			return gatewayAuthSecrets{}, fmt.Errorf("gateway.auth.previous_shared_secret_env must reference a secret different from gateway.auth.shared_secret_env")
+		}
+	}
+	return gatewayAuthSecrets{Enabled: true, CurrentSecret: secret, PreviousSecret: previousSecret}, nil
 }
 
-func runtimeHeartbeatHandlerFromConfig(
-	auth config.GatewayAuthConfig,
-	sharedSecret string,
+func runtimeClientOptionsFromConfig(gateway config.GatewayConfig, now func() time.Time) ([]runtimeclient.MQTTClientOption, error) {
+	secrets, err := gatewayAuthSecretsFromConfig(gateway.Auth)
+	if err != nil {
+		return nil, err
+	}
+	return runtimeClientOptionsFromSecrets(gateway.Encryption, secrets, now)
+}
+
+func runtimeClientOptionsFromSecrets(
+	encryption config.GatewayEncryptionConfig,
+	secrets gatewayAuthSecrets,
+	now func() time.Time,
+) ([]runtimeclient.MQTTClientOption, error) {
+	if !secrets.Enabled {
+		if encryption.Enabled {
+			return nil, fmt.Errorf("gateway.encryption.enabled requires gateway.auth.enabled")
+		}
+		return nil, nil
+	}
+	options := []runtimeclient.MQTTClientOption{
+		runtimeclient.WithMessageAuth(secrets.CurrentSecret, secrets.PreviousSecret, now),
+	}
+	if encryption.Enabled {
+		options = append(options, runtimeclient.WithMessageEncryption(secrets.CurrentSecret))
+	}
+	return options, nil
+}
+
+func runtimeHeartbeatHandlerFromSecrets(
+	secrets gatewayAuthSecrets,
 	registry *site.Registry,
 	now func() time.Time,
 ) (*site.RuntimeHeartbeatHandler, error) {
 	var verifier *mqttauth.Verifier
-	if auth.Enabled {
+	if secrets.Enabled {
 		var err error
 		verifier, err = mqttauth.NewVerifier(mqttauth.Config{
-			SharedSecret: sharedSecret,
-			Now:          now,
+			SharedSecret:         secrets.CurrentSecret,
+			PreviousSharedSecret: secrets.PreviousSecret,
+			Now:                  now,
 		})
 		if err != nil {
 			return nil, err
@@ -512,6 +579,9 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	}
 	if deps.newWebhookBridge == nil {
 		deps.newWebhookBridge = defaults.newWebhookBridge
+	}
+	if deps.newRuntimeClient == nil {
+		deps.newRuntimeClient = defaults.newRuntimeClient
 	}
 	if deps.newSiteRegistry == nil {
 		deps.newSiteRegistry = defaults.newSiteRegistry
