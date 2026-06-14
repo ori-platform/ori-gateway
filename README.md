@@ -49,7 +49,7 @@ Implemented in this repository:
 - Request/response correlation and topic/device validation
 - Session registry primitives for request lifecycle tracking
 - Site heartbeat aggregation primitives
-- LAN health heartbeat publisher with supervision
+- LAN health heartbeat publisher with supervision and webhook bridge posture
 - Gateway process wiring: config, provider, broker, heartbeat, dispatcher, and graceful shutdown
 - Runtime export client contracts and MQTT runtime export client
 - Runtime health posture mapping for broker hardening, state-store encryption, and alert outbox backlog

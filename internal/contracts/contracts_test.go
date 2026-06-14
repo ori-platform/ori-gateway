@@ -253,3 +253,27 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestHeartbeatWebhookBridgePostureJSON(t *testing.T) {
+	beat := Heartbeat{
+		Status:        "healthy",
+		UptimeS:       1.5,
+		Provider:      "echo",
+		TimestampMS:   123,
+		WebhookBridge: &WebhookBridgePosture{Enabled: true, Ready: true, ProviderCIDRCount: 2},
+	}
+	payload, err := json.Marshal(beat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), "webhook_bridge") {
+		t.Fatalf("webhook bridge posture omitted: %s", payload)
+	}
+	var decoded Heartbeat
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.WebhookBridge == nil || !decoded.WebhookBridge.Ready || decoded.WebhookBridge.ProviderCIDRCount != 2 {
+		t.Fatalf("posture did not round-trip: %#v", decoded.WebhookBridge)
+	}
+}

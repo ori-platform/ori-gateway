@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -135,6 +136,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	providerStatus := providerStatusFromProvider(reasoningProvider)
 
 	var webhookBridge webhookBridgeRunner
+	var webhookBridgeReady atomic.Bool
 	if cfg.WebhookBridge.Enabled {
 		webhookBridge, err = deps.newWebhookBridge(cfg.WebhookBridge, webhookbridge.Options{
 			Logger: deps.logger,
@@ -183,7 +185,9 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if webhookBridge != nil {
 		ch := make(chan error, 1)
 		webhookBridgeErr = ch
+		webhookBridgeReady.Store(true)
 		go func() {
+			defer webhookBridgeReady.Store(false)
 			if err := webhookBridge.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 				ch <- err
 				return
@@ -219,11 +223,12 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			},
 		},
 		heartbeat.Options{
-			Interval:  time.Duration(cfg.Gateway.HeartbeatIntervalS) * time.Second,
-			StartedAt: deps.now(),
-			Now:       deps.now,
-			Logger:    deps.logger,
-			Auth:      heartbeatAuth,
+			Interval:      time.Duration(cfg.Gateway.HeartbeatIntervalS) * time.Second,
+			StartedAt:     deps.now(),
+			Now:           deps.now,
+			Logger:        deps.logger,
+			Auth:          heartbeatAuth,
+			WebhookBridge: webhookBridgePostureProbe(cfg.WebhookBridge, webhookBridgeReady.Load),
 		},
 	)
 	if err != nil {
@@ -408,6 +413,30 @@ func evictStaleRuntimeNodes(
 			for _, node := range evicted {
 				logger.Warn("runtime node heartbeat stale", "device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
 			}
+		}
+	}
+}
+
+func webhookBridgePostureProbe(cfg config.WebhookBridgeConfig, ready func() bool) func() *contracts.WebhookBridgePosture {
+	if !cfg.Enabled {
+		return nil
+	}
+	return func() *contracts.WebhookBridgePosture {
+		sourceCIDRCount := len(cfg.ProviderSourceCIDRs)
+		runtimeTargetConfigured := cfg.TargetURL != ""
+		bridgeReady := false
+		if ready != nil {
+			bridgeReady = ready()
+		}
+		return &contracts.WebhookBridgePosture{
+			Enabled:                 true,
+			Ready:                   bridgeReady,
+			LoopbackOnly:            sourceCIDRCount == 0,
+			SourceCIDRsConfigured:   sourceCIDRCount > 0,
+			ProviderCIDRCount:       sourceCIDRCount,
+			RuntimeTargetConfigured: runtimeTargetConfigured,
+			BodyLimitBytes:          cfg.MaxBodyBytes,
+			RequestTimeoutMS:        cfg.RequestTimeoutMS,
 		}
 	}
 }
