@@ -32,6 +32,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
 	"github.com/ori-platform/ori-gateway/internal/webhookbridge"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -235,33 +236,21 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	var weeklyReportErr <-chan error
-	if weeklyReport != nil {
-		ch := make(chan error, 1)
-		weeklyReportErr = ch
-		go func() {
-			if err := weeklyReport.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-				ch <- err
-				return
-			}
-			ch <- nil
-		}()
+	runners := newSupervisedRunners(runCtx)
+	shutdownRunners := func() {
+		cancel()
+		_ = runners.wait()
 	}
 
-	var webhookBridgeErr <-chan error
+	if weeklyReport != nil {
+		runners.start("weekly report runner", weeklyReport.Run)
+	}
 	if webhookBridge != nil {
-		ch := make(chan error, 1)
-		webhookBridgeErr = ch
 		webhookBridgeReady.Store(true)
-		go func() {
+		runners.start("webhook bridge", func(ctx context.Context) error {
 			defer webhookBridgeReady.Store(false)
-			if err := webhookBridge.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-				ch <- err
-				return
-			}
-			ch <- nil
-		}()
+			return webhookBridge.Run(ctx)
+		})
 	}
 
 	heartbeatAuth := heartbeatAuthFromSecrets(gatewaySecrets)
@@ -269,9 +258,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	siteRegistry := deps.newSiteRegistry()
 	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromSecrets(gatewaySecrets, siteRegistry, deps.now)
 	if err != nil {
-		cancel()
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
+		shutdownRunners()
 		return err
 	}
 
@@ -296,20 +283,10 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		},
 	)
 	if err != nil {
-		cancel()
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
+		shutdownRunners()
 		return fmt.Errorf("construct heartbeat: %w", err)
 	}
-
-	heartbeatErr := make(chan error, 1)
-	go func() {
-		if err := hb.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-			heartbeatErr <- err
-			return
-		}
-		heartbeatErr <- nil
-	}()
+	runners.start("heartbeat", hb.Run)
 
 	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
 
@@ -317,10 +294,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		ProviderTimeoutMS: cfg.Provider.TimeoutMS,
 	})
 	if err != nil {
-		cancel()
-		<-heartbeatErr
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
+		shutdownRunners()
 		return fmt.Errorf("construct dispatcher: %w", err)
 	}
 
@@ -346,20 +320,14 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		requestFailures = 0
 		requestFailureMu.Unlock()
 	}); err != nil {
-		cancel()
-		<-heartbeatErr
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
+		shutdownRunners()
 		return fmt.Errorf("subscribe reasoning requests: %w", err)
 	}
 
 	for _, deviceID := range cfg.Gateway.DeviceIDs {
 		topic, err := contracts.RuntimeNodeHeartbeatTopic(deviceID)
 		if err != nil {
-			cancel()
-			<-heartbeatErr
-			_ = waitOptionalRunner(webhookBridgeErr)
-			_ = waitOptionalRunner(weeklyReportErr)
+			shutdownRunners()
 			return fmt.Errorf("runtime node heartbeat topic: %w", err)
 		}
 		if err := client.Subscribe(runCtx, topic, broker.QoSHeartbeat, func(topic string, payload []byte) {
@@ -367,10 +335,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				deps.logger.Warn("runtime node heartbeat rejected", "topic", topic, "error", err)
 			}
 		}); err != nil {
-			cancel()
-			<-heartbeatErr
-			_ = waitOptionalRunner(webhookBridgeErr)
-			_ = waitOptionalRunner(weeklyReportErr)
+			shutdownRunners()
 			return fmt.Errorf("subscribe runtime node heartbeats: %w", err)
 		}
 	}
@@ -378,27 +343,18 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if cfg.Reporting.TierCEnrichment.Enabled {
 		enrichmentProvider, err := deps.newTierCEnrichmentProvider(cfg.Reporting)
 		if err != nil {
-			cancel()
-			<-heartbeatErr
-			_ = waitOptionalRunner(webhookBridgeErr)
-			_ = waitOptionalRunner(weeklyReportErr)
+			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment provider: %w", err)
 		}
 		enrichmentHandler, err := enrichment.NewHandler(client, enrichmentProvider, enrichment.Options{Logger: deps.logger})
 		if err != nil {
-			cancel()
-			<-heartbeatErr
-			_ = waitOptionalRunner(webhookBridgeErr)
-			_ = waitOptionalRunner(weeklyReportErr)
+			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment handler: %w", err)
 		}
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
 			topic, err := contracts.TierCEnrichmentRequestTopic(deviceID)
 			if err != nil {
-				cancel()
-				<-heartbeatErr
-				_ = waitOptionalRunner(webhookBridgeErr)
-				_ = waitOptionalRunner(weeklyReportErr)
+				shutdownRunners()
 				return fmt.Errorf("tier c enrichment request topic: %w", err)
 			}
 			if err := client.Subscribe(runCtx, topic, broker.QoSReasoning, func(topic string, payload []byte) {
@@ -406,10 +362,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 					deps.logger.Warn("tier c enrichment request handling failed", "topic", topic, "error", err)
 				}
 			}); err != nil {
-				cancel()
-				<-heartbeatErr
-				_ = waitOptionalRunner(webhookBridgeErr)
-				_ = waitOptionalRunner(weeklyReportErr)
+				shutdownRunners()
 				return fmt.Errorf("subscribe tier c enrichment requests: %w", err)
 			}
 		}
@@ -417,78 +370,79 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	select {
 	case <-ctx.Done():
+		shutdownRunners()
+		return disconnectBroker(client, &disconnect)
+	case err := <-runners.done():
 		cancel()
-		<-heartbeatErr
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
-		err := client.Disconnect(context.Background())
-		disconnect = false
-		if err != nil {
-			return fmt.Errorf("disconnect broker: %w", err)
-		}
-		return nil
-	case err := <-heartbeatErr:
-		cancel()
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
-		if err != nil {
-			return fmt.Errorf("heartbeat stopped: %w", err)
-		}
 		if ctx.Err() != nil {
-			err := client.Disconnect(context.Background())
-			disconnect = false
-			if err != nil {
-				return fmt.Errorf("disconnect broker: %w", err)
-			}
-			return nil
+			return disconnectBroker(client, &disconnect)
 		}
-		return fmt.Errorf("heartbeat stopped unexpectedly")
-	case err := <-weeklyReportErr:
-		cancel()
-		<-heartbeatErr
-		_ = waitOptionalRunner(webhookBridgeErr)
 		if err != nil {
-			return fmt.Errorf("weekly report runner stopped: %w", err)
+			return err
 		}
-		if ctx.Err() != nil {
-			err := client.Disconnect(context.Background())
-			disconnect = false
-			if err != nil {
-				return fmt.Errorf("disconnect broker: %w", err)
-			}
-			return nil
-		}
-		return fmt.Errorf("weekly report runner stopped unexpectedly")
-	case err := <-webhookBridgeErr:
-		cancel()
-		<-heartbeatErr
-		_ = waitOptionalRunner(weeklyReportErr)
-		if err != nil {
-			return fmt.Errorf("webhook bridge stopped: %w", err)
-		}
-		if ctx.Err() != nil {
-			err := client.Disconnect(context.Background())
-			disconnect = false
-			if err != nil {
-				return fmt.Errorf("disconnect broker: %w", err)
-			}
-			return nil
-		}
-		return fmt.Errorf("webhook bridge stopped unexpectedly")
+		return fmt.Errorf("runner group stopped unexpectedly")
 	case err := <-requestErr:
-		cancel()
-		<-heartbeatErr
-		_ = waitOptionalRunner(webhookBridgeErr)
-		_ = waitOptionalRunner(weeklyReportErr)
+		shutdownRunners()
 		return err
 	}
 }
 
-func waitOptionalRunner(ch <-chan error) error {
-	if ch == nil {
+func disconnectBroker(client brokerClient, disconnect *bool) error {
+	err := client.Disconnect(context.Background())
+	*disconnect = false
+	if err != nil {
+		return fmt.Errorf("disconnect broker: %w", err)
+	}
+	return nil
+}
+
+type supervisedRunners struct {
+	ctx      context.Context
+	group    *errgroup.Group
+	count    int
+	doneOnce sync.Once
+	doneCh   chan error
+}
+
+func newSupervisedRunners(ctx context.Context) *supervisedRunners {
+	group, groupCtx := errgroup.WithContext(ctx)
+	return &supervisedRunners{ctx: groupCtx, group: group, doneCh: make(chan error, 1)}
+}
+
+func (r *supervisedRunners) start(name string, run func(context.Context) error) {
+	if run == nil {
+		return
+	}
+	r.count++
+	r.group.Go(func() error {
+		err := run(r.ctx)
+		if errors.Is(err, context.Canceled) || r.ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%s stopped: %w", name, err)
+		}
+		return fmt.Errorf("%s stopped unexpectedly", name)
+	})
+}
+
+func (r *supervisedRunners) done() <-chan error {
+	if r.count == 0 {
 		return nil
 	}
-	return <-ch
+	r.doneOnce.Do(func() {
+		go func() {
+			r.doneCh <- r.group.Wait()
+		}()
+	})
+	return r.doneCh
+}
+
+func (r *supervisedRunners) wait() error {
+	if r.count == 0 {
+		return nil
+	}
+	return <-r.done()
 }
 
 func evictStaleRuntimeNodes(

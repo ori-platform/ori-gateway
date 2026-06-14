@@ -1625,3 +1625,53 @@ func TestGatewayWeeklyReportRuntimeClientFailureStopsStartup(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestSupervisedRunnersReportsRunnerErrors(t *testing.T) {
+	runners := newSupervisedRunners(context.Background())
+	wantErr := errors.New("boom")
+	runners.start("test runner", func(context.Context) error { return wantErr })
+
+	err := runners.wait()
+	if err == nil || !strings.Contains(err.Error(), "test runner stopped") || !errors.Is(err, wantErr) {
+		t.Fatalf("unexpected runner error: %v", err)
+	}
+}
+
+func TestSupervisedRunnersWaitsForAllRunners(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runners := newSupervisedRunners(ctx)
+	started := make(chan struct{}, 2)
+	runners.start("one", func(ctx context.Context) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	runners.start("two", func(ctx context.Context) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	<-started
+	<-started
+	cancel()
+	if err := runners.wait(); err != nil {
+		t.Fatalf("unexpected runner shutdown error: %v", err)
+	}
+}
+
+func TestSupervisedRunnersUnexpectedNilReturnIsError(t *testing.T) {
+	runners := newSupervisedRunners(context.Background())
+	runners.start("nil runner", func(context.Context) error { return nil })
+
+	err := runners.wait()
+	if err == nil || !strings.Contains(err.Error(), "nil runner stopped unexpectedly") {
+		t.Fatalf("unexpected runner error: %v", err)
+	}
+}
+
+func TestSupervisedRunnersDoneIsNilWhenNoRunners(t *testing.T) {
+	runners := newSupervisedRunners(context.Background())
+	if runners.done() != nil {
+		t.Fatal("empty runner group should not produce a selectable channel")
+	}
+}
