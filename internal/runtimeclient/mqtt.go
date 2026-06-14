@@ -11,9 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 )
 
 const (
@@ -34,13 +36,20 @@ type requestIDFunc func() (string, error)
 
 // MQTTClient implements Client over runtime MQTT export request/response topics.
 type MQTTClient struct {
-	broker    mqttBroker
-	qos       byte
-	requestID requestIDFunc
+	broker              mqttBroker
+	qos                 byte
+	requestID           requestIDFunc
+	authSecret          string
+	authRequested       bool
+	encryptionRequested bool
+	verifier            *mqttauth.Verifier
+	encryptor           *mqttauth.Encryptor
+	optionErr           error
+	now                 func() time.Time
 
 	subscribeMu sync.Mutex
 	mu          sync.Mutex
-	pending     map[string]chan exportResponse
+	pending     map[string]pendingExport
 	subscribed  map[string]bool
 }
 
@@ -56,6 +65,40 @@ func WithRequestIDFunc(fn requestIDFunc) MQTTClientOption {
 	}
 }
 
+// WithMessageAuth enables runtime-compatible HMAC signing and verification.
+func WithMessageAuth(sharedSecret string, previousSharedSecret string, now func() time.Time) MQTTClientOption {
+	return func(c *MQTTClient) {
+		c.authRequested = true
+		c.authSecret = sharedSecret
+		if now != nil {
+			c.now = now
+		}
+		verifier, err := mqttauth.NewVerifier(mqttauth.Config{
+			SharedSecret:         sharedSecret,
+			PreviousSharedSecret: previousSharedSecret,
+			Now:                  c.now,
+		})
+		if err != nil {
+			c.optionErr = fmt.Errorf("message auth: %w", err)
+			return
+		}
+		c.verifier = verifier
+	}
+}
+
+// WithMessageEncryption enables AES-GCM decryption for sensitive runtime export responses.
+func WithMessageEncryption(sharedSecret string) MQTTClientOption {
+	return func(c *MQTTClient) {
+		c.encryptionRequested = true
+		encryptor, err := mqttauth.NewEncryptor(sharedSecret)
+		if err != nil {
+			c.optionErr = fmt.Errorf("message encryption: %w", err)
+			return
+		}
+		c.encryptor = encryptor
+	}
+}
+
 // NewMQTTClient constructs a runtime export client backed by the gateway broker.
 func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) {
 	if b == nil {
@@ -65,11 +108,24 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 		broker:     b,
 		qos:        broker.QoSReasoning,
 		requestID:  randomRequestID,
-		pending:    make(map[string]chan exportResponse),
+		now:        time.Now,
+		pending:    make(map[string]pendingExport),
 		subscribed: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(client)
+	}
+	if client.optionErr != nil {
+		return nil, fmt.Errorf("runtimeclient: %w", client.optionErr)
+	}
+	if client.authRequested && client.verifier == nil {
+		return nil, fmt.Errorf("runtimeclient: invalid message auth configuration")
+	}
+	if client.encryptionRequested && client.encryptor == nil {
+		return nil, fmt.Errorf("runtimeclient: invalid message encryption configuration")
+	}
+	if client.encryptor != nil && client.verifier == nil {
+		return nil, fmt.Errorf("runtimeclient: message encryption requires message auth")
 	}
 	return client, nil
 }
@@ -286,17 +342,17 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	}
 	req.RequestID = requestID
 
-	responseCh := make(chan exportResponse, 1)
+	responseCh := make(chan exportResult, 1)
 	c.mu.Lock()
 	if _, exists := c.pending[requestID]; exists {
 		c.mu.Unlock()
 		return exportResponse{}, fmt.Errorf("runtimeclient: duplicate request_id %q", requestID)
 	}
-	c.pending[requestID] = responseCh
+	c.pending[requestID] = pendingExport{ch: responseCh, req: req}
 	c.mu.Unlock()
 	defer c.removePending(requestID)
 
-	payload, err := json.Marshal(req)
+	payload, err := c.encodeRequest(req)
 	if err != nil {
 		return exportResponse{}, err
 	}
@@ -311,7 +367,11 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	select {
 	case <-ctx.Done():
 		return exportResponse{}, ctx.Err()
-	case resp := <-responseCh:
+	case result := <-responseCh:
+		if result.err != nil {
+			return exportResponse{}, result.err
+		}
+		resp := result.resp
 		if resp.RequestID != requestID {
 			return exportResponse{}, fmt.Errorf("runtimeclient: response request_id %q does not match %q", resp.RequestID, requestID)
 		}
@@ -326,26 +386,110 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 }
 
 func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
-	var resp exportResponse
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	if err := decoder.Decode(&resp); err != nil {
-		return
-	}
-	if resp.RequestID == "" {
+	raw, requestID, err := decodePayloadMap(payload)
+	if err != nil || requestID == "" {
 		return
 	}
 
 	c.mu.Lock()
-	ch := c.pending[resp.RequestID]
+	pending := c.pending[requestID]
 	c.mu.Unlock()
-	if ch == nil {
+	if pending.ch == nil {
 		return
 	}
 
+	resp, err := c.decodeResponsePayload(payload, raw, pending.req)
+	result := exportResult{resp: resp, err: err}
 	select {
-	case ch <- resp:
+	case pending.ch <- result:
 	default:
+	}
+}
+
+func (c *MQTTClient) encodeRequest(req exportRequest) ([]byte, error) {
+	if c.verifier == nil {
+		return json.Marshal(req)
+	}
+	payload, err := mapFromValue(req)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := mqttauth.Sign(payload, contracts.ExportRequestMessageType, req.DeviceID, req.RequestID, c.now().UnixMilli(), c.authSecret)
+	if err != nil {
+		return nil, err
+	}
+	payload["auth"] = auth
+	return json.Marshal(payload)
+}
+
+func (c *MQTTClient) decodeResponsePayload(payload []byte, raw map[string]any, req exportRequest) (exportResponse, error) {
+	decoded := raw
+	if c.verifier != nil {
+		verified, err := c.verifier.VerifyJSON(payload, contracts.ExportResponseMessageType, req.DeviceID, req.RequestID)
+		if err != nil {
+			return exportResponse{}, fmt.Errorf("runtimeclient: verify export response: %w", err)
+		}
+		decoded = verified
+	}
+
+	if isSensitiveExport(req.ExportType) {
+		if c.encryptor != nil {
+			if encrypted, _ := decoded["encrypted"].(bool); !encrypted {
+				return exportResponse{}, fmt.Errorf("runtimeclient: sensitive export response is not encrypted")
+			}
+			plain, err := c.encryptor.Decrypt(decoded, contracts.ExportResponseMessageType, req.DeviceID, req.RequestID)
+			if err != nil {
+				return exportResponse{}, fmt.Errorf("runtimeclient: decrypt export response: %w", err)
+			}
+			decoded = plain
+		} else if encrypted, _ := decoded["encrypted"].(bool); encrypted {
+			return exportResponse{}, fmt.Errorf("runtimeclient: encrypted export response received but encryption is not configured")
+		}
+	}
+
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		return exportResponse{}, err
+	}
+	var resp exportResponse
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(&resp); err != nil {
+		return exportResponse{}, err
+	}
+	return resp, nil
+}
+
+func decodePayloadMap(payload []byte) (map[string]any, string, error) {
+	var raw map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, "", err
+	}
+	return raw, fmt.Sprint(raw["request_id"]), nil
+}
+
+func mapFromValue(value any) (map[string]any, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func isSensitiveExport(exportType string) bool {
+	switch exportType {
+	case exportTypeSensorHistory, exportTypeActionLog, exportTypeTierCDecisionLog, exportTypeReasoningLog:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -353,6 +497,16 @@ func (c *MQTTClient) removePending(requestID string) {
 	c.mu.Lock()
 	delete(c.pending, requestID)
 	c.mu.Unlock()
+}
+
+type pendingExport struct {
+	ch  chan exportResult
+	req exportRequest
+}
+
+type exportResult struct {
+	resp exportResponse
+	err  error
 }
 
 type exportRequest struct {

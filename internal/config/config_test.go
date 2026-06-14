@@ -1066,3 +1066,68 @@ webhook_bridge:
 		t.Fatal(err)
 	}
 }
+
+func TestGatewayAuthPreviousSecretAndEncryptionLoad(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+  auth:
+    enabled: true
+    shared_secret_env: "GATEWAY_SECRET_CURRENT"
+    previous_shared_secret_env: "GATEWAY_SECRET_PREVIOUS"
+  encryption:
+    enabled: true
+provider:
+  name: echo
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Gateway.Auth.Enabled || cfg.Gateway.Auth.SharedSecretEnv != "GATEWAY_SECRET_CURRENT" {
+		t.Fatalf("unexpected auth config: %#v", cfg.Gateway.Auth)
+	}
+	if cfg.Gateway.Auth.PreviousSharedSecretEnv != "GATEWAY_SECRET_PREVIOUS" {
+		t.Fatalf("unexpected previous secret env: %#v", cfg.Gateway.Auth)
+	}
+	if !cfg.Gateway.Encryption.Enabled {
+		t.Fatal("expected gateway encryption enabled")
+	}
+}
+
+func TestGatewayEncryptionRequiresAuth(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+  encryption:
+    enabled: true
+provider:
+  name: echo
+`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gateway.encryption.enabled requires gateway.auth.enabled") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGatewayPreviousSecretEnvRejectsWhitespace(t *testing.T) {
+	path := writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+  auth:
+    enabled: true
+    previous_shared_secret_env: "BAD SECRET"
+provider:
+  name: echo
+`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gateway.auth.previous_shared_secret_env") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

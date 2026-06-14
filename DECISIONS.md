@@ -211,3 +211,30 @@ This keeps the runtime webhook security model strict without requiring every
 third-party SMS provider to support Ori-specific signatures. It also preserves
 the runtime boundary: the gateway adapts provider ingress, while the runtime
 continues to verify the same replay-resistant raw-body signature contract.
+
+## 2026-06-14 — Gateway Runtime Export Auth and Encryption Parity
+
+Status: Accepted
+
+The gateway runtime export client signs `export_request` payloads when
+`gateway.auth.enabled` is true and verifies `export_response` payloads before
+mapping them into reporting data. Sensitive runtime exports are decrypted when
+`gateway.encryption.enabled` is true, using the same gateway shared secret,
+HKDF-SHA256 domain label, AES-256-GCM scheme, and authenticated metadata used
+by the runtime.
+
+Rules:
+
+- New outbound gateway signatures use `gateway.auth.shared_secret_env` only.
+- `gateway.auth.previous_shared_secret_env` is verify-only for zero-downtime
+  rotation.
+- Sensitive export responses must be HMAC-verified before AES-GCM decryption.
+- Health exports may remain plaintext operational posture.
+- Gateway encryption cannot be enabled unless gateway auth is enabled.
+
+Rationale:
+
+The runtime production posture can require authenticated gateway MQTT and
+encrypted sensitive exports. Gateway reporting and future cloud sync must work
+through that same contract instead of requiring operators to weaken runtime
+security for product features.

@@ -51,7 +51,7 @@ Implemented in this repository:
 - Site heartbeat aggregation primitives
 - LAN health heartbeat publisher with supervision and webhook bridge posture
 - Gateway process wiring: config, provider, broker, heartbeat, dispatcher, and graceful shutdown
-- Runtime export client contracts and MQTT runtime export client
+- Runtime export client contracts and MQTT runtime export client with HMAC auth and sensitive export decryption
 - Runtime health posture mapping for broker hardening, state-store encryption, and alert outbox backlog
 - SMS webhook signing bridge for providers that cannot sign raw webhook bodies
 - Weekly report generation against runtime export interfaces

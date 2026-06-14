@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 )
 
 type fakeBroker struct {
@@ -63,6 +65,18 @@ func (f *fakeBroker) Publish(_ context.Context, topic string, qos byte, retain b
 }
 
 func (f *fakeBroker) respond(deviceID string, requestID string, payload map[string]any) {
+	payload["request_id"] = requestID
+	if _, ok := payload["device_id"]; !ok {
+		payload["device_id"] = deviceID
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	f.respondRaw(deviceID, requestID, encoded)
+}
+
+func (f *fakeBroker) respondRaw(deviceID string, requestID string, encoded []byte) {
 	topic, err := contracts.ExportResponseTopicFilter(deviceID)
 	if err != nil {
 		panic(err)
@@ -72,14 +86,6 @@ func (f *fakeBroker) respond(deviceID string, requestID string, payload map[stri
 	f.mu.Unlock()
 	if handler == nil {
 		panic("missing response handler")
-	}
-	payload["request_id"] = requestID
-	if _, ok := payload["device_id"]; !ok {
-		payload["device_id"] = deviceID
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		panic(err)
 	}
 	handler("ori/"+deviceID+"/export/response/"+requestID, encoded)
 }
@@ -102,6 +108,20 @@ func (f *fakeBroker) publishedRequests() []exportRequest {
 		out = append(out, req)
 	}
 	return out
+}
+
+func signedExportPayload(t *testing.T, payload map[string]any, secret string, now time.Time) []byte {
+	t.Helper()
+	auth, err := mqttauth.Sign(payload, contracts.ExportResponseMessageType, fmt.Sprint(payload["device_id"]), fmt.Sprint(payload["request_id"]), now.UnixMilli(), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload["auth"] = auth
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func newTestMQTTClient(t *testing.T, b *fakeBroker, ids ...string) *MQTTClient {
@@ -669,5 +689,187 @@ func TestMQTTRuntimeClientRuntimeError(t *testing.T) {
 	_, err := client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
 	if err == nil || !strings.Contains(err.Error(), "state store unavailable") {
 		t.Fatalf("expected runtime error, got %v", err)
+	}
+}
+
+func TestMQTTRuntimeClientSignsExportRequestAndVerifiesResponse(t *testing.T) {
+	b := newFakeBroker()
+	now := time.UnixMilli(1234567890000)
+	client, err := NewMQTTClient(
+		b,
+		WithRequestIDFunc(func() (string, error) { return "health-signed", nil }),
+		WithMessageAuth("current-secret", "", func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.publishHook = func(_ string, payload []byte) {
+		verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "current-secret", Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		unsigned, err := verifier.VerifyJSON(payload, contracts.ExportRequestMessageType, "edge-1", "health-signed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unsigned["export_type"] != "health" {
+			t.Fatalf("unexpected export request: %#v", unsigned)
+		}
+		resp := map[string]any{"request_id": "health-signed", "device_id": "edge-1", "export_type": "health", "complete": true, "items": []any{map[string]any{"device_id": "edge-1", "status": "healthy"}}}
+		b.respondRaw("edge-1", "health-signed", signedExportPayload(t, resp, "current-secret", now))
+	}
+	if _, err := client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMQTTRuntimeClientAcceptsPreviousSecretForResponse(t *testing.T) {
+	b := newFakeBroker()
+	now := time.UnixMilli(1234567890000)
+	client, err := NewMQTTClient(
+		b,
+		WithRequestIDFunc(func() (string, error) { return "health-prev", nil }),
+		WithMessageAuth("current-secret", "previous-secret", func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.publishHook = func(_ string, _ []byte) {
+		resp := map[string]any{"request_id": "health-prev", "device_id": "edge-1", "export_type": "health", "complete": true, "items": []any{map[string]any{"device_id": "edge-1", "status": "healthy"}}}
+		b.respondRaw("edge-1", "health-prev", signedExportPayload(t, resp, "previous-secret", now))
+	}
+	if _, err := client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMQTTRuntimeClientRejectsUnsignedResponseWhenAuthEnabled(t *testing.T) {
+	b := newFakeBroker()
+	now := time.UnixMilli(1234567890000)
+	client, err := NewMQTTClient(
+		b,
+		WithRequestIDFunc(func() (string, error) { return "health-unsigned", nil }),
+		WithMessageAuth("current-secret", "", func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.publishHook = func(_ string, _ []byte) {
+		b.respond("edge-1", "health-unsigned", map[string]any{"export_type": "health", "complete": true, "items": []any{map[string]any{"device_id": "edge-1"}}})
+	}
+	_, err = client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
+	if err == nil || !strings.Contains(err.Error(), "verify export response") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMQTTRuntimeClientDecryptsSensitiveExportResponse(t *testing.T) {
+	b := newFakeBroker()
+	now := time.UnixMilli(1234567890000)
+	client, err := NewMQTTClient(
+		b,
+		WithRequestIDFunc(func() (string, error) { return "history-secure", nil }),
+		WithMessageAuth("current-secret", "", func() time.Time { return now }),
+		WithMessageEncryption("current-secret"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.publishHook = func(_ string, _ []byte) {
+		encryptor, err := mqttauth.NewEncryptor("current-secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		plain := map[string]any{"request_id": "history-secure", "device_id": "edge-1", "export_type": "sensor_history", "complete": true, "items": []any{map[string]any{"sensor_id": "current-main", "value": 4.2}}}
+		encrypted, err := encryptor.Encrypt(plain, contracts.ExportResponseMessageType, []byte("123456789012"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.respondRaw("edge-1", "history-secure", signedExportPayload(t, encrypted, "current-secret", now))
+	}
+	rows, err := client.SensorHistory(context.Background(), SensorHistoryRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, UntilMS: 2, Limit: 10}, SensorID: "current-main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].AvgValue != 4.2 {
+		t.Fatalf("unexpected rows: %#v", rows)
+	}
+}
+
+func TestMQTTRuntimeClientRejectsTamperedEncryptedExportResponse(t *testing.T) {
+	b := newFakeBroker()
+	now := time.UnixMilli(1234567890000)
+	client, err := NewMQTTClient(
+		b,
+		WithRequestIDFunc(func() (string, error) { return "history-tampered", nil }),
+		WithMessageAuth("current-secret", "", func() time.Time { return now }),
+		WithMessageEncryption("current-secret"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.publishHook = func(_ string, _ []byte) {
+		encryptor, err := mqttauth.NewEncryptor("current-secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		plain := map[string]any{"request_id": "history-tampered", "device_id": "edge-1", "export_type": "sensor_history", "complete": true, "items": []any{}}
+		encrypted, err := encryptor.Encrypt(plain, contracts.ExportResponseMessageType, []byte("123456789012"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		envelope := encrypted["encryption"].(map[string]any)
+		envelope["ciphertext"] = "AAAA" + envelope["ciphertext"].(string)
+		b.respondRaw("edge-1", "history-tampered", signedExportPayload(t, encrypted, "current-secret", now))
+	}
+	_, err = client.SensorHistory(context.Background(), SensorHistoryRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, UntilMS: 2, Limit: 10}, SensorID: "current-main"})
+	if err == nil || !strings.Contains(err.Error(), "decrypt export response") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMQTTRuntimeClientRejectsPlainSensitiveExportWhenEncryptionEnabled(t *testing.T) {
+	b := newFakeBroker()
+	now := time.UnixMilli(1234567890000)
+	client, err := NewMQTTClient(
+		b,
+		WithRequestIDFunc(func() (string, error) { return "history-plain", nil }),
+		WithMessageAuth("current-secret", "", func() time.Time { return now }),
+		WithMessageEncryption("current-secret"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.publishHook = func(_ string, _ []byte) {
+		plain := map[string]any{"request_id": "history-plain", "device_id": "edge-1", "export_type": "sensor_history", "complete": true, "items": []any{}}
+		b.respondRaw("edge-1", "history-plain", signedExportPayload(t, plain, "current-secret", now))
+	}
+	_, err = client.SensorHistory(context.Background(), SensorHistoryRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, UntilMS: 2, Limit: 10}, SensorID: "current-main"})
+	if err == nil || !strings.Contains(err.Error(), "not encrypted") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMQTTRuntimeClientEncryptionRequiresAuth(t *testing.T) {
+	b := newFakeBroker()
+	_, err := NewMQTTClient(b, WithMessageEncryption("current-secret"))
+	if err == nil || !strings.Contains(err.Error(), "encryption requires message auth") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMQTTRuntimeClientPreservesAuthOptionError(t *testing.T) {
+	b := newFakeBroker()
+	_, err := NewMQTTClient(b, WithMessageAuth("same-secret", "same-secret", time.Now))
+	if err == nil || !strings.Contains(err.Error(), "previous shared secret") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMQTTRuntimeClientPreservesEncryptionOptionError(t *testing.T) {
+	b := newFakeBroker()
+	_, err := NewMQTTClient(b, WithMessageEncryption(""))
+	if err == nil || !strings.Contains(err.Error(), "shared secret must not be empty") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

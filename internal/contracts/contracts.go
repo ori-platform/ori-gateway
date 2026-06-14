@@ -15,6 +15,8 @@ const (
 	TierCEnrichmentRequestTopicFilter  = "ori/+/tier_c/enrichment/request"
 	HeartbeatMessageType               = "gateway.heartbeat"
 	RuntimeHeartbeatMessageType        = "runtime.heartbeat"
+	ExportRequestMessageType           = "export_request"
+	ExportResponseMessageType          = "export_response"
 	HeartbeatAuthScheme                = "hmac-sha256"
 
 	ActionTierA = "A"

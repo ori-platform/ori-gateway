@@ -26,18 +26,20 @@ const (
 
 // Config controls HMAC verification for site-local runtime/gateway MQTT messages.
 type Config struct {
-	SharedSecret string
-	MaxSkew      time.Duration
-	ReplayTTL    time.Duration
-	Now          func() time.Time
+	SharedSecret         string
+	PreviousSharedSecret string
+	MaxSkew              time.Duration
+	ReplayTTL            time.Duration
+	Now                  func() time.Time
 }
 
 // Verifier validates signed MQTT envelopes and rejects short-window replays.
 type Verifier struct {
-	sharedSecret string
-	maxSkew      time.Duration
-	replayTTL    time.Duration
-	now          func() time.Time
+	sharedSecret         string
+	previousSharedSecret string
+	maxSkew              time.Duration
+	replayTTL            time.Duration
+	now                  func() time.Time
 
 	mu       sync.Mutex
 	seenKeys map[string]time.Time
@@ -61,12 +63,17 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	if now == nil {
 		now = time.Now
 	}
+	previousSecret := strings.TrimSpace(cfg.PreviousSharedSecret)
+	if previousSecret != "" && hmac.Equal([]byte(previousSecret), []byte(secret)) {
+		return nil, fmt.Errorf("mqtt auth previous shared secret must differ from shared secret")
+	}
 	return &Verifier{
-		sharedSecret: secret,
-		maxSkew:      maxSkew,
-		replayTTL:    replayTTL,
-		now:          now,
-		seenKeys:     map[string]time.Time{},
+		sharedSecret:         secret,
+		previousSharedSecret: previousSecret,
+		maxSkew:              maxSkew,
+		replayTTL:            replayTTL,
+		now:                  now,
+		seenKeys:             map[string]time.Time{},
 	}, nil
 }
 
@@ -131,8 +138,7 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize mqtt auth payload: %w", err)
 	}
-	want := signaturePrefix + computeSignature(v.sharedSecret, SigningInput(messageType, expectedDeviceID, expectedRequestID, auth.SignedAtMS, canonical))
-	if !hmac.Equal([]byte(auth.Signature), []byte(want)) {
+	if !v.signatureMatches(auth.Signature, messageType, expectedDeviceID, expectedRequestID, auth.SignedAtMS, canonical) {
 		return nil, fmt.Errorf("mqtt auth signature mismatch")
 	}
 	if err := v.checkFreshAndRecord(messageType, expectedDeviceID, expectedRequestID, auth); err != nil {
@@ -166,6 +172,18 @@ func SigningInput(messageType string, deviceID string, requestID string, signedA
 		fmt.Sprintf("%d", signedAtMS),
 		string(canonicalPayload),
 	}, "\n")
+}
+
+func (v *Verifier) signatureMatches(signature string, messageType string, deviceID string, requestID string, signedAtMS int64, canonical []byte) bool {
+	want := signaturePrefix + computeSignature(v.sharedSecret, SigningInput(messageType, deviceID, requestID, signedAtMS, canonical))
+	if hmac.Equal([]byte(signature), []byte(want)) {
+		return true
+	}
+	if v.previousSharedSecret == "" {
+		return false
+	}
+	wantPrevious := signaturePrefix + computeSignature(v.previousSharedSecret, SigningInput(messageType, deviceID, requestID, signedAtMS, canonical))
+	return hmac.Equal([]byte(signature), []byte(wantPrevious))
 }
 
 func computeSignature(secret string, signingInput string) string {
