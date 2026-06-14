@@ -151,3 +151,28 @@ with a bad forward clock must not become immortal in the site registry. Far-futu
 evicted defensively during registry sweeps.
 
 Related: ori-runtime#145, ori-gateway#45.
+
+---
+
+## 2026-06-14 — Runtime Health Posture Fields Are Gateway-Visible
+
+**Status:** Accepted
+
+The gateway consumes runtime health through runtime-owned MQTT export contracts.
+The runtime now exposes deployment posture fields for broker hardening,
+state-store encryption-at-rest posture, and alert outbox backlog health. The
+gateway maps these into typed runtimeclient fields rather than treating them as
+opaque JSON.
+
+This preserves the boundary that gateway must not read runtime SQLite or runtime
+configuration files directly. Runtime remains the source of truth for local
+posture; gateway and future cloud/product layers can surface site risk from the
+health export.
+
+Non-goals:
+
+- This does not prove the runtime broker posture declarations are true.
+  Deployment tooling still needs to validate Mosquitto or broker config where it
+  has access to broker files/admin APIs.
+- This does not implement the SMS webhook signing bridge. That remains a
+  gateway/deployment ingress feature.

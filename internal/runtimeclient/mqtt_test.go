@@ -138,6 +138,32 @@ func TestMQTTRuntimeClientHealth(t *testing.T) {
 				"capability_posture": map[string]any{"gateway_reachable": true},
 				"sensors":            []any{map[string]any{"last_seen_ms": float64(1234)}},
 				"device_policy":      map[string]any{"tier": "trial"},
+				"gateway_broker_posture": map[string]any{
+					"available":              true,
+					"gateway_enabled":        true,
+					"deployment_check":       "required",
+					"anonymous_access":       "disabled",
+					"acl_policy":             "per_device_required",
+					"require_credentials":    true,
+					"credentials_configured": true,
+					"requires_acl_hardening": false,
+				},
+				"state_store_encryption": map[string]any{
+					"available":              true,
+					"mode":                   "filesystem_required",
+					"satisfied":              true,
+					"marker_configured":      true,
+					"path_prefix_configured": true,
+				},
+				"alert_outbox": map[string]any{
+					"backlog_count":                     float64(2),
+					"oldest_queued_original_ts":         float64(123456),
+					"oldest_queued_age_ms":              float64(60000),
+					"retry_interval_minutes":            0.5,
+					"max_non_tier_d_attempts":           float64(10),
+					"tier_d_critical_warning_threshold": float64(3),
+					"batch_size":                        float64(50),
+				},
 				"remote_command_lockout": map[string]any{"senders": []any{map[string]any{
 					"channel":       "sms",
 					"from_number":   "+2348012345678",
@@ -160,6 +186,24 @@ func TestMQTTRuntimeClientHealth(t *testing.T) {
 	if health.LastReadingMS != 1234 || health.PolicyStatus != "trial" {
 		t.Fatalf("runtime health fields not mapped: %#v", health)
 	}
+	if health.GatewayBrokerPosture == nil || !health.GatewayBrokerPosture.Available || health.GatewayBrokerPosture.RequiresACLHardening {
+		t.Fatalf("gateway broker posture not mapped: %#v", health.GatewayBrokerPosture)
+	}
+	if health.GatewayBrokerPosture.ACLPolicy != "per_device_required" || !health.GatewayBrokerPosture.CredentialsConfigured {
+		t.Fatalf("gateway broker posture fields not mapped: %#v", health.GatewayBrokerPosture)
+	}
+	if health.StateStoreEncryption == nil || !health.StateStoreEncryption.Satisfied || health.StateStoreEncryption.Mode != "filesystem_required" {
+		t.Fatalf("state store encryption posture not mapped: %#v", health.StateStoreEncryption)
+	}
+	if !health.StateStoreEncryption.PathPrefixConfigured {
+		t.Fatalf("state store encryption path prefix flag not mapped: %#v", health.StateStoreEncryption)
+	}
+	if health.AlertOutbox == nil || !health.AlertOutbox.Available || health.AlertOutbox.BacklogCount != 2 {
+		t.Fatalf("alert outbox posture not mapped: %#v", health.AlertOutbox)
+	}
+	if health.AlertOutbox.OldestQueuedOriginalMS != 123456 || health.AlertOutbox.OldestQueuedAgeMS != 60000 {
+		t.Fatalf("alert outbox timestamp fields not mapped: %#v", health.AlertOutbox)
+	}
 	state := health.LockoutRiskLevels["sms:+2348012345678"]
 	if state.RiskLevel != "elevated" || state.CheckedAtMS != 99 {
 		t.Fatalf("lockout state not mapped: %#v", health.LockoutRiskLevels)
@@ -174,6 +218,39 @@ func TestMQTTRuntimeClientHealth(t *testing.T) {
 	}
 	if b.publishes[0].topic != "ori/edge-1/export/request" {
 		t.Fatalf("unexpected publish topic: %s", b.publishes[0].topic)
+	}
+}
+
+func TestMQTTRuntimeClientHealthLeavesAbsentPostureNil(t *testing.T) {
+	b := newFakeBroker()
+	client := newTestMQTTClient(t, b, "health-legacy")
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Fatal(err)
+		}
+		b.respond(req.DeviceID, req.RequestID, map[string]any{
+			"export_type": "health",
+			"complete":    true,
+			"items": []any{map[string]any{
+				"device_id": "edge-1",
+				"status":    "healthy",
+			}},
+		})
+	}
+
+	health, err := client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.GatewayBrokerPosture != nil {
+		t.Fatalf("gateway broker posture should be nil when absent: %#v", health.GatewayBrokerPosture)
+	}
+	if health.StateStoreEncryption != nil {
+		t.Fatalf("state store encryption posture should be nil when absent: %#v", health.StateStoreEncryption)
+	}
+	if health.AlertOutbox != nil {
+		t.Fatalf("alert outbox posture should be nil when absent: %#v", health.AlertOutbox)
 	}
 }
 

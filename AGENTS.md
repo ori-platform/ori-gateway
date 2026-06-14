@@ -95,11 +95,13 @@ modem or serial hardware. Verified by `TestDisabledSIMNoSerialProbe` and
 14. `GW-14` Gateway data access goes through runtime-owned interfaces.
 Gateway must not read runtime SQLite files directly. Sensor history, action
 logs, Tier C decisions, and runtime health must be consumed through explicit
-runtime-owned export interfaces. Current enforcement is structural: the gateway
-has no SQLite driver dependency and runtime-client tests such as
-`TestTierCDecisionLogRequestValidation` validate the export request contract.
-Future transport tests must preserve this boundary and must not add direct
-SQLite access.
+runtime-owned export interfaces. Runtime health posture fields such as broker
+hardening, state-store encryption, and alert outbox backlog must be mapped from
+the health export rather than inferred by reading runtime files. Current
+enforcement is structural: the gateway has no SQLite driver dependency and
+runtime-client tests such as `TestTierCDecisionLogRequestValidation` validate
+the export request contract. Future transport tests must preserve this boundary
+and must not add direct SQLite access.
 
 15. `GW-15` Gateway process startup and shutdown must be ordered and explicit.
 Startup order is config, provider, broker connect, optional modules, heartbeat,

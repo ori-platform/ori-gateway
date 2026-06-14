@@ -37,13 +37,49 @@ type HealthRequest struct {
 
 // HealthSnapshot is a gateway-consumable subset of runtime health.
 type HealthSnapshot struct {
-	DeviceID          string                      `json:"device_id"`
-	Status            string                      `json:"status"`
-	UptimeS           float64                     `json:"uptime_s"`
-	LastReadingMS     int64                       `json:"last_reading_ms"`
-	GatewaySeen       bool                        `json:"gateway_seen"`
-	PolicyStatus      string                      `json:"policy_status"`
-	LockoutRiskLevels map[string]LockoutRiskState `json:"lockout_risk_levels,omitempty"`
+	DeviceID             string                       `json:"device_id"`
+	Status               string                       `json:"status"`
+	UptimeS              float64                      `json:"uptime_s"`
+	LastReadingMS        int64                        `json:"last_reading_ms"`
+	GatewaySeen          bool                         `json:"gateway_seen"`
+	PolicyStatus         string                       `json:"policy_status"`
+	GatewayBrokerPosture *GatewayBrokerPosture        `json:"gateway_broker_posture,omitempty"`
+	StateStoreEncryption *StateStoreEncryptionPosture `json:"state_store_encryption,omitempty"`
+	AlertOutbox          *AlertOutboxPosture          `json:"alert_outbox,omitempty"`
+	LockoutRiskLevels    map[string]LockoutRiskState  `json:"lockout_risk_levels,omitempty"`
+}
+
+// GatewayBrokerPosture is runtime-declared MQTT broker hardening posture.
+type GatewayBrokerPosture struct {
+	Available             bool   `json:"available"`
+	GatewayEnabled        bool   `json:"gateway_enabled"`
+	DeploymentCheck       string `json:"deployment_check"`
+	AnonymousAccess       string `json:"anonymous_access"`
+	ACLPolicy             string `json:"acl_policy"`
+	RequireCredentials    bool   `json:"require_credentials"`
+	CredentialsConfigured bool   `json:"credentials_configured"`
+	RequiresACLHardening  bool   `json:"requires_acl_hardening"`
+}
+
+// StateStoreEncryptionPosture is runtime-declared encryption-at-rest posture.
+type StateStoreEncryptionPosture struct {
+	Available            bool   `json:"available"`
+	Mode                 string `json:"mode"`
+	Satisfied            bool   `json:"satisfied"`
+	MarkerConfigured     bool   `json:"marker_configured"`
+	PathPrefixConfigured bool   `json:"path_prefix_configured"`
+}
+
+// AlertOutboxPosture reports runtime notification delivery backlog health.
+type AlertOutboxPosture struct {
+	Available                     bool    `json:"available"`
+	BacklogCount                  int     `json:"backlog_count"`
+	OldestQueuedOriginalMS        int64   `json:"oldest_queued_original_ts"`
+	OldestQueuedAgeMS             int64   `json:"oldest_queued_age_ms"`
+	RetryIntervalMinutes          float64 `json:"retry_interval_minutes"`
+	MaxNonTierDAttempts           int     `json:"max_non_tier_d_attempts"`
+	TierDCriticalWarningThreshold int     `json:"tier_d_critical_warning_threshold"`
+	BatchSize                     int     `json:"batch_size"`
 }
 
 // LockoutRiskState is advisory remote-command sender risk state from runtime health.
