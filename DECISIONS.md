@@ -323,3 +323,40 @@ Rationale:
 The weekly report is a product-facing proxy for site health. It should explain
 operational risk that affects customer trust, but it must preserve the runtime
 boundary and avoid leaking security-sensitive implementation details.
+
+---
+
+## 2026-06-15 — Site Health Projection Owned by the Gateway
+
+Status: Accepted
+
+The gateway owns site-level health projection. No equivalent type exists in
+`ori-runtime`; the runtime exports per-device `HealthSnapshot` records, and the
+gateway's `internal/site` package is responsible for aggregating these into a
+multi-device site view.
+
+Rules:
+
+- `internal/site.Projector` is the single point of site health projection. It
+  reads only from the node registry (`Registry.Snapshot`) and a caller-supplied
+  `GatewayView`; it does not read runtime SQLite files or runtime config.
+- `SiteHealth` and `SiteNode` are advisory and read-only. They must not change
+  action authority or be used to gate actuation decisions.
+- `ActiveTriggers` from node heartbeats are surfaced as a count only
+  (`ActiveTriggerCount int`). Trigger-name strings must not appear in projected
+  output.
+- `GatewayView` must not contain target URLs, MQTT URLs, env var names, bearer
+  tokens, HMAC secrets, phone numbers, or filesystem paths.
+- Future consumers (ori-cloud sync, dashboard HTTP) must depend on the
+  `site.Viewer` interface, not on MQTT internals or the registry directly.
+- Webhook bridge enablement and other optional module flags are carried in
+  `GatewayView` as booleans only and do not affect the aggregate site status
+  computation; they are informational.
+
+Rationale:
+
+The runtime is device-scoped and offline-first. Site-level coordination —
+knowing which nodes are present, stale, or missing relative to a configured
+fleet — is a gateway responsibility. Keeping this projection in `internal/site`
+prevents it from being scattered across reporting, fleet, or heartbeat packages
+and makes the secrets boundary explicit and testable.

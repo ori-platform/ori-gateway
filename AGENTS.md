@@ -149,6 +149,22 @@ be AES-GCM decrypted after HMAC verification. Health exports may remain
 plaintext but still authenticated. New outbound signatures must use the current
 secret only; previous secrets are verify-only.
 
+18. `GW-18` Site health projection is read-only, advisory, and secrets-free.
+`internal/site.Projector` computes a `SiteHealth` snapshot from the node registry
+and a caller-supplied `GatewayView`. It must not read runtime SQLite files, read
+runtime config, or change action authority. `ActiveTriggers` from node heartbeats
+are represented only as a count (`ActiveTriggerCount int`) to prevent trigger-name
+strings from leaking. `GatewayView` must not contain target URLs, MQTT URLs, env
+var names, bearer tokens, HMAC secrets, phone numbers, or filesystem paths.
+Consumers depend on the `site.Viewer` interface, not on MQTT or registry internals.
+Verified by `TestProjectSiteHealthAllNodesHealthy`,
+`TestProjectSiteHealthStaleNode`, `TestProjectSiteHealthMissingNode`,
+`TestProjectSiteHealthGatewayDegradedStatus`,
+`TestProjectSiteHealthDisabledWebhookBridgeIsInert`,
+`TestProjectSiteHealthActiveTriggerCountNotStrings`,
+`TestProjectSiteHealthNoSecretsOrURLsInJSON`, and
+`TestProjectSiteHealthFutureDatedNodeIsStale`.
+
 ## Layout
 
 ```text
