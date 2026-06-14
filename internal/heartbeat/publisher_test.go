@@ -586,6 +586,60 @@ func TestHeartbeatSignedWhenAuthEnabled(t *testing.T) {
 	}
 }
 
+func TestSignedHeartbeatIncludesWebhookBridgeInCanonicalPayload(t *testing.T) {
+	payloads := make(chan []byte, 1)
+	publish := func(_ context.Context, payload []byte) error {
+		payloads <- append([]byte(nil), payload...)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startedAt := time.Unix(1_700_000_000, 0)
+	now := startedAt.Add(time.Second)
+	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval:  time.Hour,
+		StartedAt: startedAt,
+		Now:       func() time.Time { return now },
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Auth:      AuthConfig{Enabled: true, SharedSecret: "site-local-secret"},
+		WebhookBridge: func() *contracts.WebhookBridgePosture {
+			return &contracts.WebhookBridgePosture{Enabled: true, Ready: true, ProviderCIDRCount: 1}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(ctx) }()
+
+	var beat contracts.Heartbeat
+	select {
+	case payload := <-payloads:
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no heartbeat published")
+	}
+	if beat.WebhookBridge == nil || !beat.WebhookBridge.Ready {
+		t.Fatalf("webhook bridge posture missing from signed heartbeat: %#v", beat.WebhookBridge)
+	}
+	verified, err := SignHeartbeat(contracts.Heartbeat{
+		Status:        beat.Status,
+		UptimeS:       beat.UptimeS,
+		Provider:      beat.Provider,
+		SIMAvailable:  beat.SIMAvailable,
+		TimestampMS:   beat.TimestampMS,
+		WebhookBridge: beat.WebhookBridge,
+	}, "site-local-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beat.Auth == nil || verified.Auth == nil || beat.Auth.Signature != verified.Auth.Signature {
+		t.Fatalf("signature did not include webhook bridge canonical payload: got %#v want %#v", beat.Auth, verified.Auth)
+	}
+}
+
 func TestHeartbeatAuthRequiresSecret(t *testing.T) {
 	_, err := NewPublisher(func(context.Context, []byte) error { return nil }, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval: time.Hour,
@@ -611,5 +665,59 @@ func TestSIMAvailableFromConfig(t *testing.T) {
 	sim = SIMStatus{Enabled: false, Probe: func() bool { return true }}
 	if sim.Available() {
 		t.Fatal("expected sim unavailable when disabled")
+	}
+}
+
+func TestHeartbeatIncludesWebhookBridgePosture(t *testing.T) {
+	payloads := make(chan []byte, 1)
+	publish := func(_ context.Context, payload []byte) error {
+		payloads <- append([]byte(nil), payload...)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval: time.Hour,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WebhookBridge: func() *contracts.WebhookBridgePosture {
+			return &contracts.WebhookBridgePosture{
+				Enabled:                 true,
+				Ready:                   true,
+				LoopbackOnly:            false,
+				SourceCIDRsConfigured:   true,
+				ProviderCIDRCount:       2,
+				RuntimeTargetConfigured: true,
+				BodyLimitBytes:          65536,
+				RequestTimeoutMS:        3000,
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(ctx) }()
+
+	var beat contracts.Heartbeat
+	select {
+	case payload := <-payloads:
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			t.Fatal(err)
+		}
+		encoded := string(payload)
+		for _, forbidden := range []string{"ORI_SMS_WEBHOOK_TOKEN", "ORI_SMS_WEBHOOK_HMAC_SECRET", "http://", "127.0.0.1/32"} {
+			if strings.Contains(encoded, forbidden) {
+				t.Fatalf("heartbeat leaked sensitive bridge config %q in %s", forbidden, encoded)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no heartbeat published")
+	}
+	if beat.WebhookBridge == nil || !beat.WebhookBridge.Ready || beat.WebhookBridge.ProviderCIDRCount != 2 {
+		t.Fatalf("webhook bridge posture not published: %#v", beat.WebhookBridge)
+	}
+	if beat.WebhookBridge.BodyLimitBytes != 65536 || beat.WebhookBridge.RequestTimeoutMS != 3000 {
+		t.Fatalf("webhook bridge limits not published: %#v", beat.WebhookBridge)
 	}
 }

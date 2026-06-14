@@ -200,6 +200,10 @@ Rules:
   failure without exposing runtime internals.
 - The bridge must not log SMS body content, phone numbers, bearer tokens, or
   HMAC secrets.
+- Gateway heartbeat may publish bridge readiness and bounded posture fields.
+  Readiness is a live bridge-loop signal, not a static config assertion. The
+  heartbeat must not publish target URLs, env var names, provider CIDR values,
+  token values, HMAC secrets, or webhook body content.
 
 Rationale:
 

@@ -1180,6 +1180,109 @@ func TestMainTierCEnrichmentSubscribeFailureCancelsHeartbeatAndDisconnects(t *te
 	}
 }
 
+func TestGatewayPassesWebhookBridgePostureToHeartbeat(t *testing.T) {
+	cfg := validConfig()
+	cfg.WebhookBridge = config.WebhookBridgeConfig{
+		Enabled:             true,
+		ListenAddr:          "0.0.0.0:8090",
+		Path:                "/webhooks/sms/africastalking",
+		TargetURL:           "http://127.0.0.1:8080/webhooks/sms/africastalking",
+		ProviderSourceCIDRs: []string{"102.89.0.0/16", "197.210.0.0/16"},
+		RuntimeTokenEnv:     "ORI_SMS_WEBHOOK_TOKEN",
+		HMACSecretEnv:       "ORI_SMS_WEBHOOK_HMAC_SECRET",
+		RequestTimeoutMS:    3000,
+		MaxBodyBytes:        65536,
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	bridge := newFakeWebhookBridge()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newWebhookBridge = func(config.WebhookBridgeConfig, webhookbridge.Options) (webhookBridgeRunner, error) {
+		return bridge, nil
+	}
+	var captured func() *contracts.WebhookBridgePosture
+	deps.newHeartbeat = func(
+		_ heartbeat.PublishFunc,
+		_ heartbeat.ProviderStatus,
+		_ heartbeat.SIMStatus,
+		opts heartbeat.Options,
+	) (heartbeatRunner, error) {
+		captured = opts.WebhookBridge
+		return hb, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	select {
+	case <-bridge.started:
+	case <-time.After(time.Second):
+		t.Fatal("webhook bridge did not start")
+	}
+	if captured == nil {
+		t.Fatal("webhook bridge posture probe was not passed to heartbeat")
+	}
+	posture := captured()
+	if posture == nil || !posture.Enabled || !posture.Ready {
+		t.Fatalf("webhook bridge posture missing: %#v", posture)
+	}
+	if posture.LoopbackOnly || !posture.SourceCIDRsConfigured || posture.ProviderCIDRCount != 2 {
+		t.Fatalf("webhook bridge CIDR posture wrong: %#v", posture)
+	}
+	if posture.BodyLimitBytes != 65536 || posture.RequestTimeoutMS != 3000 {
+		t.Fatalf("webhook bridge limits wrong: %#v", posture)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
+	}
+}
+
+func TestWebhookBridgePostureOmittedForDisabledBridge(t *testing.T) {
+	probe := webhookBridgePostureProbe(config.WebhookBridgeConfig{
+		Enabled:          false,
+		ListenAddr:       "127.0.0.1:8090",
+		Path:             "/webhooks/sms/africastalking",
+		RequestTimeoutMS: config.DefaultWebhookBridgeRequestTimeoutMS,
+		MaxBodyBytes:     config.DefaultWebhookBridgeMaxBodyBytes,
+	}, func() bool { return true })
+	if probe != nil {
+		t.Fatalf("disabled bridge posture should be omitted, got %#v", probe())
+	}
+}
+
+func TestWebhookBridgePostureReadyTracksProbe(t *testing.T) {
+	ready := false
+	probe := webhookBridgePostureProbe(config.WebhookBridgeConfig{
+		Enabled:             true,
+		TargetURL:           "http://127.0.0.1:8080/webhook",
+		ProviderSourceCIDRs: []string{"127.0.0.1/32"},
+		RequestTimeoutMS:    3000,
+		MaxBodyBytes:        65536,
+	}, func() bool { return ready })
+	if probe == nil {
+		t.Fatal("expected enabled bridge probe")
+	}
+	if probe().Ready {
+		t.Fatal("bridge should not be ready before readiness probe is true")
+	}
+	ready = true
+	if !probe().Ready {
+		t.Fatal("bridge should be ready after readiness probe is true")
+	}
+}
+
 func TestGatewayStartsWebhookBridgeWhenEnabled(t *testing.T) {
 	cfg := validConfig()
 	cfg.WebhookBridge = config.WebhookBridgeConfig{

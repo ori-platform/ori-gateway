@@ -65,12 +65,26 @@ type HeartbeatAuth struct {
 }
 
 type Heartbeat struct {
-	Status       string         `json:"status"`
-	UptimeS      float64        `json:"uptime_s"`
-	Provider     string         `json:"provider"`
-	SIMAvailable bool           `json:"sim_available"`
-	TimestampMS  int64          `json:"timestamp_ms"`
-	Auth         *HeartbeatAuth `json:"auth,omitempty"`
+	Status        string                `json:"status"`
+	UptimeS       float64               `json:"uptime_s"`
+	Provider      string                `json:"provider"`
+	SIMAvailable  bool                  `json:"sim_available"`
+	TimestampMS   int64                 `json:"timestamp_ms"`
+	WebhookBridge *WebhookBridgePosture `json:"webhook_bridge,omitempty"`
+	Auth          *HeartbeatAuth        `json:"auth,omitempty"`
+}
+
+// WebhookBridgePosture reports gateway-local SMS webhook bridge readiness.
+// It intentionally excludes URLs, env var names, CIDR values, tokens, and HMAC secrets.
+type WebhookBridgePosture struct {
+	Enabled                 bool  `json:"enabled"`
+	Ready                   bool  `json:"ready"`
+	LoopbackOnly            bool  `json:"loopback_only"`
+	SourceCIDRsConfigured   bool  `json:"source_cidrs_configured"`
+	ProviderCIDRCount       int   `json:"provider_cidr_count"`
+	RuntimeTargetConfigured bool  `json:"runtime_target_configured"`
+	BodyLimitBytes          int64 `json:"body_limit_bytes"`
+	RequestTimeoutMS        int   `json:"request_timeout_ms"`
 }
 
 // RuntimeNodeHeartbeat is published by each runtime on ori/{device_id}/runtime/heartbeat.

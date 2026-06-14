@@ -40,6 +40,7 @@ type Publisher struct {
 	log          *slog.Logger
 	fatal        func(code int)
 	auth         AuthConfig
+	webhook      func() *contracts.WebhookBridgePosture
 
 	mu            sync.Mutex
 	everPublished bool
@@ -48,13 +49,14 @@ type Publisher struct {
 
 // Options configures Publisher.
 type Options struct {
-	Interval     time.Duration
-	FailureLimit int
-	StartedAt    time.Time
-	Now          func() time.Time
-	Logger       *slog.Logger
-	Fatal        func(code int)
-	Auth         AuthConfig
+	Interval      time.Duration
+	FailureLimit  int
+	StartedAt     time.Time
+	Now           func() time.Time
+	Logger        *slog.Logger
+	Fatal         func(code int)
+	Auth          AuthConfig
+	WebhookBridge func() *contracts.WebhookBridgePosture
 }
 
 // NewPublisher constructs a supervised heartbeat publisher.
@@ -108,6 +110,7 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 		log:          log,
 		fatal:        fatal,
 		auth:         opts.Auth,
+		webhook:      opts.WebhookBridge,
 	}, nil
 }
 
@@ -211,11 +214,12 @@ func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 	p.mu.Unlock()
 
 	beat := contracts.Heartbeat{
-		Status:       status,
-		UptimeS:      uptimeS,
-		Provider:     p.provider.Name(),
-		SIMAvailable: p.sim.Available(),
-		TimestampMS:  timestampMS,
+		Status:        status,
+		UptimeS:       uptimeS,
+		Provider:      p.provider.Name(),
+		SIMAvailable:  p.sim.Available(),
+		TimestampMS:   timestampMS,
+		WebhookBridge: p.webhookPosture(),
 	}
 	if p.auth.Enabled {
 		signed, err := SignHeartbeat(beat, p.auth.SharedSecret)
@@ -239,4 +243,16 @@ func (p *Publisher) status(ctx context.Context) string {
 		return StatusHealthy
 	}
 	return StatusDegraded
+}
+
+func (p *Publisher) webhookPosture() *contracts.WebhookBridgePosture {
+	if p.webhook == nil {
+		return nil
+	}
+	posture := p.webhook()
+	if posture == nil {
+		return nil
+	}
+	cloned := *posture
+	return &cloned
 }
