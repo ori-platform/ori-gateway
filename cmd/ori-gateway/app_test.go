@@ -22,6 +22,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
+	"github.com/ori-platform/ori-gateway/internal/reporting"
 	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
@@ -223,10 +224,43 @@ func (p *fakeTierCEnrichmentProvider) EnrichTierC(_ context.Context, req contrac
 	}, nil
 }
 
-type fakeHeartbeat struct {
+type fakeReportingProvider struct {
+	mu     sync.Mutex
+	inputs []reporting.WeeklyReportInput
+}
+
+func (p *fakeReportingProvider) GenerateWeeklyReport(_ context.Context, input reporting.WeeklyReportInput) (reporting.ProviderReport, error) {
+	p.mu.Lock()
+	p.inputs = append(p.inputs, input)
+	p.mu.Unlock()
+	return reporting.ProviderReport{Text: "report", Provider: "fake", Model: "fake-model"}, nil
+}
+
+type fakeWeeklyReportRunner struct {
 	started chan struct{}
 	once    sync.Once
 	err     error
+}
+
+func newFakeWeeklyReportRunner() *fakeWeeklyReportRunner {
+	return &fakeWeeklyReportRunner{started: make(chan struct{})}
+}
+
+func (r *fakeWeeklyReportRunner) Run(ctx context.Context) error {
+	r.once.Do(func() { close(r.started) })
+	if r.err != nil {
+		return r.err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type fakeHeartbeat struct {
+	started              chan struct{}
+	once                 sync.Once
+	err                  error
+	returnNil            bool
+	returnNilAfterCancel bool
 }
 
 type fakeWebhookBridge struct {
@@ -249,7 +283,13 @@ func (h *fakeHeartbeat) Run(ctx context.Context) error {
 	if h.err != nil {
 		return h.err
 	}
+	if h.returnNil {
+		return nil
+	}
 	<-ctx.Done()
+	if h.returnNilAfterCancel {
+		return nil
+	}
 	return ctx.Err()
 }
 
@@ -313,6 +353,9 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 		newTierCEnrichmentProvider: func(config.ReportingConfig) (enrichment.Provider, error) {
 			return &fakeTierCEnrichmentProvider{}, nil
 		},
+		newReportingProvider: func(config.ReportingConfig) (reporting.Provider, error) {
+			return &fakeReportingProvider{}, nil
+		},
 		newBroker: func(broker.Options) (brokerClient, error) {
 			return fb, nil
 		},
@@ -333,6 +376,9 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 				return nil, errors.New("webhook bridge should not be constructed when disabled")
 			}
 			return newFakeWebhookBridge(), nil
+		},
+		newWeeklyReportRunner: func(*reporting.WeeklyReportGenerator, reporting.WeeklyReportRequest, reporting.Schedule, reporting.RunnerOptions) (weeklyReportRunner, error) {
+			return newFakeWeeklyReportRunner(), nil
 		},
 		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
@@ -1441,23 +1487,42 @@ func TestGatewayAuthSecretsFromConfigRejectsMatchingPreviousSecret(t *testing.T)
 	}
 }
 
-func TestRuntimeClientOptionsFromConfigBuildsSecureOptions(t *testing.T) {
-	t.Setenv("GATEWAY_SECRET_CURRENT", "current-secret")
-	t.Setenv("GATEWAY_SECRET_PREVIOUS", "previous-secret")
-	cfg := validConfig().Gateway
-	cfg.Auth = config.GatewayAuthConfig{
-		Enabled:                 true,
-		SharedSecretEnv:         "GATEWAY_SECRET_CURRENT",
-		PreviousSharedSecretEnv: "GATEWAY_SECRET_PREVIOUS",
-	}
-	cfg.Encryption.Enabled = true
+func TestRuntimeClientOptionsFromSecretsBuildsSecureOptions(t *testing.T) {
+	secrets := gatewayAuthSecrets{Enabled: true, CurrentSecret: "current-secret", PreviousSecret: "previous-secret"}
+	encryption := config.GatewayEncryptionConfig{Enabled: true}
 
-	opts, err := runtimeClientOptionsFromConfig(cfg, func() time.Time { return time.UnixMilli(1234567890000) })
+	opts, err := runtimeClientOptionsFromSecrets(encryption, secrets, func() time.Time { return time.UnixMilli(1234567890000) })
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(opts) != 2 {
 		t.Fatalf("expected auth and encryption options, got %d", len(opts))
+	}
+}
+
+func TestGatewayCleanShutdownWhenHeartbeatReturnsNilAfterCancel(t *testing.T) {
+	cfg := validConfig()
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := &fakeHeartbeat{started: make(chan struct{}), returnNilAfterCancel: true}
+	deps := baseDeps(t, cfg, fb, fp, hb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-hb.started:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not stop")
 	}
 }
 
@@ -1470,15 +1535,18 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 	cfg.Reporting = config.ReportingConfig{
 		Provider:     config.ReportingProviderGemini,
 		Gemini:       config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
-		WeeklyReport: config.WeeklyReportConfig{Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos"},
+		WeeklyReport: config.WeeklyReportConfig{Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos", DeviceID: "site-a", SensorIDs: []string{"current-main"}},
 	}
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()
 	deps := baseDeps(t, cfg, fb, fp, hb)
-	called := false
+	runtimeClientCalled := false
+	reportingProviderCalled := false
+	weeklyRunnerCalled := false
+	weeklyRunner := newFakeWeeklyReportRunner()
 	deps.newRuntimeClient = func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
-		called = true
+		runtimeClientCalled = true
 		if b == nil {
 			t.Fatal("runtime client broker is nil")
 		}
@@ -1486,6 +1554,26 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 			t.Fatalf("expected auth and encryption options, got %d", len(opts))
 		}
 		return runtimeclient.NewMQTTClient(b, opts...)
+	}
+	deps.newReportingProvider = func(got config.ReportingConfig) (reporting.Provider, error) {
+		reportingProviderCalled = true
+		if got.Provider != config.ReportingProviderGemini {
+			t.Fatalf("unexpected reporting provider config: %#v", got)
+		}
+		return &fakeReportingProvider{}, nil
+	}
+	deps.newWeeklyReportRunner = func(generator *reporting.WeeklyReportGenerator, req reporting.WeeklyReportRequest, schedule reporting.Schedule, opts reporting.RunnerOptions) (weeklyReportRunner, error) {
+		weeklyRunnerCalled = true
+		if generator == nil || opts.Logger == nil || opts.Now == nil {
+			t.Fatal("weekly runner missing generator/options")
+		}
+		if req.DeviceID != "site-a" || len(req.SensorIDs) != 1 || req.SensorIDs[0] != "current-main" {
+			t.Fatalf("unexpected weekly request: %#v", req)
+		}
+		if schedule.Location == nil || schedule.Weekday != time.Monday {
+			t.Fatalf("unexpected schedule: %#v", schedule)
+		}
+		return weeklyRunner, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1505,8 +1593,14 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("gateway did not stop")
 	}
-	if !called {
+	if !runtimeClientCalled {
 		t.Fatal("weekly reporting did not construct runtime export client")
+	}
+	if !reportingProviderCalled {
+		t.Fatal("weekly reporting did not construct reporting provider")
+	}
+	if !weeklyRunnerCalled {
+		t.Fatal("weekly reporting did not construct runner")
 	}
 }
 
@@ -1516,7 +1610,7 @@ func TestGatewayWeeklyReportRuntimeClientFailureStopsStartup(t *testing.T) {
 	cfg.Reporting = config.ReportingConfig{
 		Provider:     config.ReportingProviderGemini,
 		Gemini:       config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
-		WeeklyReport: config.WeeklyReportConfig{Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos"},
+		WeeklyReport: config.WeeklyReportConfig{Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos", DeviceID: "site-a", SensorIDs: []string{"current-main"}},
 	}
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}

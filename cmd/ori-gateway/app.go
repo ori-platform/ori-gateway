@@ -27,6 +27,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
+	"github.com/ori-platform/ori-gateway/internal/reporting"
 	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
 	"github.com/ori-platform/ori-gateway/internal/sim"
 	"github.com/ori-platform/ori-gateway/internal/site"
@@ -54,15 +55,21 @@ type webhookBridgeRunner interface {
 	Run(ctx context.Context) error
 }
 
+type weeklyReportRunner interface {
+	Run(ctx context.Context) error
+}
+
 type appDependencies struct {
 	loadConfig                 func(path string) (config.Config, error)
 	newProvider                func(cfg config.ProviderConfig) (provider.Provider, error)
 	newTierCEnrichmentProvider func(cfg config.ReportingConfig) (enrichment.Provider, error)
+	newReportingProvider       func(cfg config.ReportingConfig) (reporting.Provider, error)
 	newBroker                  func(opts broker.Options) (brokerClient, error)
 	newSIM                     func(cfg config.SIMConfig, opts sim.Options) (*sim.Client, error)
 	newFleet                   func(cfg config.FleetConfig, opts fleet.Options) (*fleet.Client, error)
 	newWebhookBridge           func(cfg config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error)
 	newRuntimeClient           func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error)
+	newWeeklyReportRunner      func(generator *reporting.WeeklyReportGenerator, req reporting.WeeklyReportRequest, schedule reporting.Schedule, opts reporting.RunnerOptions) (weeklyReportRunner, error)
 	newSiteRegistry            func() *site.Registry
 	newHeartbeat               func(
 		publish heartbeat.PublishFunc,
@@ -81,6 +88,9 @@ func defaultDependencies() appDependencies {
 		newTierCEnrichmentProvider: func(config.ReportingConfig) (enrichment.Provider, error) {
 			return nil, fmt.Errorf("tier C enrichment reporting provider is not wired")
 		},
+		newReportingProvider: func(cfg config.ReportingConfig) (reporting.Provider, error) {
+			return reporting.NewProviderFromConfig(cfg, reporting.ProviderOptions{})
+		},
 		newBroker: func(opts broker.Options) (brokerClient, error) {
 			return broker.New(opts)
 		},
@@ -91,6 +101,9 @@ func defaultDependencies() appDependencies {
 		},
 		newRuntimeClient: func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
 			return runtimeclient.NewMQTTClient(b, opts...)
+		},
+		newWeeklyReportRunner: func(generator *reporting.WeeklyReportGenerator, req reporting.WeeklyReportRequest, schedule reporting.Schedule, opts reporting.RunnerOptions) (weeklyReportRunner, error) {
+			return reporting.NewWeeklyReportRunner(generator, req, schedule, opts)
 		},
 		newSiteRegistry: site.NewRegistry,
 		newHeartbeat: func(
@@ -187,6 +200,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// includes fleet health fields.
 	_ = fleetClient
 
+	var weeklyReport weeklyReportRunner
 	if cfg.Reporting.WeeklyReport.Enabled {
 		runtimeClientOptions, err := runtimeClientOptionsFromSecrets(cfg.Gateway.Encryption, gatewaySecrets, deps.now)
 		if err != nil {
@@ -196,13 +210,44 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct runtime export client: %w", err)
 		}
-		// Weekly report scheduling is not active yet, but enabling the feature must
-		// still validate the runtime export security boundary at startup.
-		_ = runtimeExportClient
+		reportingProvider, err := deps.newReportingProvider(cfg.Reporting)
+		if err != nil {
+			return fmt.Errorf("construct reporting provider: %w", err)
+		}
+		weeklyGenerator, err := reporting.NewWeeklyReportGenerator(runtimeExportClient, reportingProvider, reporting.WithNow(deps.now))
+		if err != nil {
+			return fmt.Errorf("construct weekly report generator: %w", err)
+		}
+		weeklySchedule, err := reporting.NewSchedule(cfg.Reporting.WeeklyReport.Day, cfg.Reporting.WeeklyReport.Time, cfg.Reporting.WeeklyReport.Timezone)
+		if err != nil {
+			return fmt.Errorf("construct weekly report schedule: %w", err)
+		}
+		weeklyReport, err = deps.newWeeklyReportRunner(
+			weeklyGenerator,
+			weeklyReportRequestFromConfig(cfg.Reporting.WeeklyReport),
+			weeklySchedule,
+			reporting.RunnerOptions{Logger: deps.logger, Now: deps.now},
+		)
+		if err != nil {
+			return fmt.Errorf("construct weekly report runner: %w", err)
+		}
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	var weeklyReportErr <-chan error
+	if weeklyReport != nil {
+		ch := make(chan error, 1)
+		weeklyReportErr = ch
+		go func() {
+			if err := weeklyReport.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				ch <- err
+				return
+			}
+			ch <- nil
+		}()
+	}
 
 	var webhookBridgeErr <-chan error
 	if webhookBridge != nil {
@@ -226,6 +271,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err != nil {
 		cancel()
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		return err
 	}
 
@@ -252,6 +298,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err != nil {
 		cancel()
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		return fmt.Errorf("construct heartbeat: %w", err)
 	}
 
@@ -273,6 +320,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		cancel()
 		<-heartbeatErr
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		return fmt.Errorf("construct dispatcher: %w", err)
 	}
 
@@ -301,6 +349,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		cancel()
 		<-heartbeatErr
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		return fmt.Errorf("subscribe reasoning requests: %w", err)
 	}
 
@@ -310,6 +359,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			cancel()
 			<-heartbeatErr
 			_ = waitOptionalRunner(webhookBridgeErr)
+			_ = waitOptionalRunner(weeklyReportErr)
 			return fmt.Errorf("runtime node heartbeat topic: %w", err)
 		}
 		if err := client.Subscribe(runCtx, topic, broker.QoSHeartbeat, func(topic string, payload []byte) {
@@ -320,6 +370,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			cancel()
 			<-heartbeatErr
 			_ = waitOptionalRunner(webhookBridgeErr)
+			_ = waitOptionalRunner(weeklyReportErr)
 			return fmt.Errorf("subscribe runtime node heartbeats: %w", err)
 		}
 	}
@@ -330,6 +381,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			cancel()
 			<-heartbeatErr
 			_ = waitOptionalRunner(webhookBridgeErr)
+			_ = waitOptionalRunner(weeklyReportErr)
 			return fmt.Errorf("construct tier c enrichment provider: %w", err)
 		}
 		enrichmentHandler, err := enrichment.NewHandler(client, enrichmentProvider, enrichment.Options{Logger: deps.logger})
@@ -337,6 +389,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			cancel()
 			<-heartbeatErr
 			_ = waitOptionalRunner(webhookBridgeErr)
+			_ = waitOptionalRunner(weeklyReportErr)
 			return fmt.Errorf("construct tier c enrichment handler: %w", err)
 		}
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
@@ -345,6 +398,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				cancel()
 				<-heartbeatErr
 				_ = waitOptionalRunner(webhookBridgeErr)
+				_ = waitOptionalRunner(weeklyReportErr)
 				return fmt.Errorf("tier c enrichment request topic: %w", err)
 			}
 			if err := client.Subscribe(runCtx, topic, broker.QoSReasoning, func(topic string, payload []byte) {
@@ -355,6 +409,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				cancel()
 				<-heartbeatErr
 				_ = waitOptionalRunner(webhookBridgeErr)
+				_ = waitOptionalRunner(weeklyReportErr)
 				return fmt.Errorf("subscribe tier c enrichment requests: %w", err)
 			}
 		}
@@ -365,6 +420,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		cancel()
 		<-heartbeatErr
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		err := client.Disconnect(context.Background())
 		disconnect = false
 		if err != nil {
@@ -374,21 +430,56 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	case err := <-heartbeatErr:
 		cancel()
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		if err != nil {
 			return fmt.Errorf("heartbeat stopped: %w", err)
 		}
+		if ctx.Err() != nil {
+			err := client.Disconnect(context.Background())
+			disconnect = false
+			if err != nil {
+				return fmt.Errorf("disconnect broker: %w", err)
+			}
+			return nil
+		}
 		return fmt.Errorf("heartbeat stopped unexpectedly")
+	case err := <-weeklyReportErr:
+		cancel()
+		<-heartbeatErr
+		_ = waitOptionalRunner(webhookBridgeErr)
+		if err != nil {
+			return fmt.Errorf("weekly report runner stopped: %w", err)
+		}
+		if ctx.Err() != nil {
+			err := client.Disconnect(context.Background())
+			disconnect = false
+			if err != nil {
+				return fmt.Errorf("disconnect broker: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("weekly report runner stopped unexpectedly")
 	case err := <-webhookBridgeErr:
 		cancel()
 		<-heartbeatErr
+		_ = waitOptionalRunner(weeklyReportErr)
 		if err != nil {
 			return fmt.Errorf("webhook bridge stopped: %w", err)
+		}
+		if ctx.Err() != nil {
+			err := client.Disconnect(context.Background())
+			disconnect = false
+			if err != nil {
+				return fmt.Errorf("disconnect broker: %w", err)
+			}
+			return nil
 		}
 		return fmt.Errorf("webhook bridge stopped unexpectedly")
 	case err := <-requestErr:
 		cancel()
 		<-heartbeatErr
 		_ = waitOptionalRunner(webhookBridgeErr)
+		_ = waitOptionalRunner(weeklyReportErr)
 		return err
 	}
 }
@@ -459,6 +550,16 @@ func webhookBridgePostureProbe(cfg config.WebhookBridgeConfig, ready func() bool
 	}
 }
 
+func weeklyReportRequestFromConfig(cfg config.WeeklyReportConfig) reporting.WeeklyReportRequest {
+	return reporting.WeeklyReportRequest{
+		DeviceID:     cfg.DeviceID,
+		CustomerName: cfg.CustomerName,
+		SiteName:     cfg.SiteName,
+		Timezone:     cfg.Timezone,
+		SensorIDs:    append([]string(nil), cfg.SensorIDs...),
+	}
+}
+
 type gatewayAuthSecrets struct {
 	Enabled        bool
 	CurrentSecret  string
@@ -504,14 +605,6 @@ func gatewayAuthSecretsFromConfig(auth config.GatewayAuthConfig) (gatewayAuthSec
 		}
 	}
 	return gatewayAuthSecrets{Enabled: true, CurrentSecret: secret, PreviousSecret: previousSecret}, nil
-}
-
-func runtimeClientOptionsFromConfig(gateway config.GatewayConfig, now func() time.Time) ([]runtimeclient.MQTTClientOption, error) {
-	secrets, err := gatewayAuthSecretsFromConfig(gateway.Auth)
-	if err != nil {
-		return nil, err
-	}
-	return runtimeClientOptionsFromSecrets(gateway.Encryption, secrets, now)
 }
 
 func runtimeClientOptionsFromSecrets(
@@ -568,6 +661,9 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	if deps.newTierCEnrichmentProvider == nil {
 		deps.newTierCEnrichmentProvider = defaults.newTierCEnrichmentProvider
 	}
+	if deps.newReportingProvider == nil {
+		deps.newReportingProvider = defaults.newReportingProvider
+	}
 	if deps.newBroker == nil {
 		deps.newBroker = defaults.newBroker
 	}
@@ -582,6 +678,9 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	}
 	if deps.newRuntimeClient == nil {
 		deps.newRuntimeClient = defaults.newRuntimeClient
+	}
+	if deps.newWeeklyReportRunner == nil {
+		deps.newWeeklyReportRunner = defaults.newWeeklyReportRunner
 	}
 	if deps.newSiteRegistry == nil {
 		deps.newSiteRegistry = defaults.newSiteRegistry
