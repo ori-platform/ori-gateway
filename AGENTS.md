@@ -80,9 +80,12 @@ action tiers. Runtime remains the physical action authority. Tier C enrichment
 is verified by `TestTierCEnrichmentCannotChangeActionAuthority` and
 `TestTierCEnrichmentDropsInjectedAuthorityFields`.
 Weekly report generation must consume bounded runtime exports through
-`runtimeclient.Client` and must not read runtime SQLite directly. Report output
-may be delivered or persisted by product/cloud layers, not by mutating runtime
-state. Weekly report boundaries are verified by
+`runtimeclient.Client` and must not read runtime SQLite directly. Runtime posture
+may be surfaced as non-secret customer-facing warnings, but reports must not leak
+remote-command sender identities, credentials, MQTT URLs, filesystem paths, or
+lockout risk details. Report output may be delivered or persisted by
+product/cloud layers, not by mutating runtime state. Weekly report boundaries are
+verified by
 `TestWeeklyReportBuildsInputFromRuntimeExports`,
 `TestGatewayConstructsSecureRuntimeClientForWeeklyReports`, and
 `TestWeeklyReportRunnerLogsFailureAndContinues`.

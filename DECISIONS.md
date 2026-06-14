@@ -298,3 +298,28 @@ The gateway now has multiple supervised loops. Keeping shutdown supervision on
 `errgroup` prevents future optional modules from leaking goroutines or broker
 resources when startup fails after some runners have already begun, without
 fixed-size result buffers or call-site drain counters.
+
+---
+
+## 2026-06-15 — Weekly Reports Surface Non-Secret Runtime Posture
+
+Status: Accepted
+
+Weekly report generation may include runtime health posture fields that are safe
+for customer-facing operational summaries: gateway broker hardening posture,
+state-store encryption posture, and alert outbox backlog health. These fields
+come only from the runtime health export through `runtimeclient.Client`.
+
+Rules:
+
+- Reports must not read runtime SQLite files or runtime config directly.
+- Reports must not expose remote-command sender identities, lockout risk details,
+  secrets, provider credentials, MQTT URLs, or filesystem paths.
+- Degraded posture is surfaced as report warnings so Gemini/reporting providers
+  can explain reliability risk in plain language.
+
+Rationale:
+
+The weekly report is a product-facing proxy for site health. It should explain
+operational risk that affects customer trust, but it must preserve the runtime
+boundary and avoid leaking security-sensitive implementation details.

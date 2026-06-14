@@ -46,11 +46,36 @@ func newGenerator(t *testing.T, runtime *runtimeclient.FakeClient, provider *fak
 func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 	runtime := &runtimeclient.FakeClient{
 		HealthSnapshot: runtimeclient.HealthSnapshot{
-			DeviceID:          "edge-1",
-			Status:            "healthy",
-			GatewaySeen:       true,
-			LastReadingMS:     1_799_999_000_000,
-			PolicyStatus:      "active",
+			DeviceID:      "edge-1",
+			Status:        "healthy",
+			GatewaySeen:   true,
+			LastReadingMS: 1_799_999_000_000,
+			PolicyStatus:  "active",
+			GatewayBrokerPosture: &runtimeclient.GatewayBrokerPosture{
+				Available:             true,
+				GatewayEnabled:        true,
+				DeploymentCheck:       "required",
+				AnonymousAccess:       "disabled",
+				ACLPolicy:             "per_device_required",
+				RequireCredentials:    true,
+				CredentialsConfigured: true,
+				RequiresACLHardening:  true,
+			},
+			StateStoreEncryption: &runtimeclient.StateStoreEncryptionPosture{
+				Available:            true,
+				Mode:                 "filesystem_required",
+				Satisfied:            false,
+				MarkerConfigured:     true,
+				PathPrefixConfigured: false,
+			},
+			AlertOutbox: &runtimeclient.AlertOutboxPosture{
+				Available:                     true,
+				BacklogCount:                  2,
+				OldestQueuedAgeMS:             900_000,
+				RetryIntervalMinutes:          30,
+				TierDCriticalWarningThreshold: 2,
+				BatchSize:                     10,
+			},
 			LockoutRiskLevels: map[string]runtimeclient.LockoutRiskState{"sms:+2348012345678": {RiskLevel: "critical"}},
 		},
 		SensorHistoryRows: []runtimeclient.SensorAggregate{{
@@ -153,12 +178,27 @@ func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 	if input.Health.LastReadingMS != 1_799_999_000_000 || input.Health.PolicyStatus != "active" {
 		t.Fatalf("safe health summary not attached: %#v", input.Health)
 	}
+	if input.Health.GatewayBrokerPosture == nil || !input.Health.GatewayBrokerPosture.RequiresACLHardening {
+		t.Fatalf("broker posture not attached: %#v", input.Health.GatewayBrokerPosture)
+	}
+	if input.Health.StateStoreEncryption == nil || input.Health.StateStoreEncryption.Satisfied {
+		t.Fatalf("state encryption posture not attached: %#v", input.Health.StateStoreEncryption)
+	}
+	if input.Health.AlertOutbox == nil || input.Health.AlertOutbox.BacklogCount != 2 {
+		t.Fatalf("alert outbox posture not attached: %#v", input.Health.AlertOutbox)
+	}
+	if len(input.Warnings) != 3 {
+		t.Fatalf("posture warnings not attached: %#v", input.Warnings)
+	}
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(inputJSON), "+2348012345678") || strings.Contains(string(inputJSON), "critical") {
 		t.Fatalf("provider input leaked remote-command lockout details: %s", inputJSON)
+	}
+	if !strings.Contains(string(inputJSON), "RequiresACLHardening") || !strings.Contains(string(inputJSON), "BacklogCount") {
+		t.Fatalf("provider input omitted safe posture fields: %s", inputJSON)
 	}
 }
 
@@ -247,6 +287,44 @@ func TestWeeklyReportHealthFailureReturnsError(t *testing.T) {
 	}
 }
 
+func TestWeeklyReportSurfacesHealthPostureWarnings(t *testing.T) {
+	runtime := &runtimeclient.FakeClient{
+		HealthSnapshot: runtimeclient.HealthSnapshot{
+			DeviceID: "edge-1",
+			GatewayBrokerPosture: &runtimeclient.GatewayBrokerPosture{
+				GatewayEnabled:        true,
+				RequireCredentials:    true,
+				CredentialsConfigured: false,
+				RequiresACLHardening:  true,
+			},
+			StateStoreEncryption: &runtimeclient.StateStoreEncryptionPosture{Available: true, Mode: "filesystem_required", Satisfied: false},
+			AlertOutbox: &runtimeclient.AlertOutboxPosture{
+				Available:                     true,
+				BacklogCount:                  1,
+				TierDCriticalWarningThreshold: 1,
+			},
+		},
+	}
+	provider := &fakeProvider{report: ProviderReport{Text: "report"}}
+	generator := newGenerator(t, runtime, provider)
+
+	artifact, err := generator.Generate(context.Background(), WeeklyReportRequest{
+		DeviceID:  "edge-1",
+		SensorIDs: []string{"current-main"},
+		SinceMS:   1,
+		UntilMS:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifact.Warnings) != 4 {
+		t.Fatalf("expected posture warnings, got %#v", artifact.Warnings)
+	}
+	if strings.Contains(strings.Join(artifact.Warnings, " "), "+234") {
+		t.Fatalf("warnings leaked sender details: %#v", artifact.Warnings)
+	}
+}
+
 func TestWeeklyReportSurfacesTruncationWarnings(t *testing.T) {
 	actions := make([]runtimeclient.ActionLogEntry, runtimeclient.MaxLimit)
 	decisions := make([]runtimeclient.TierCDecisionEntry, runtimeclient.MaxLimit)
@@ -306,5 +384,105 @@ func TestNewWeeklyReportGeneratorValidation(t *testing.T) {
 	}
 	if _, err := NewWeeklyReportGenerator(&runtimeclient.FakeClient{}, nil); err == nil {
 		t.Fatal("expected nil provider to fail")
+	}
+}
+
+func TestWeeklyReportSanitizesReportFacingHealthPostureEnums(t *testing.T) {
+	health := summarizeHealth(runtimeclient.HealthSnapshot{
+		GatewayBrokerPosture: &runtimeclient.GatewayBrokerPosture{
+			DeploymentCheck: "mqtt://broker.internal:1883",
+			AnonymousAccess: "/devices/+2348012345678/acl",
+			ACLPolicy:       "../../etc/mosquitto/passwd",
+		},
+		StateStoreEncryption: &runtimeclient.StateStoreEncryptionPosture{Mode: "/mnt/customer-secrets"},
+	})
+
+	if health.GatewayBrokerPosture == nil {
+		t.Fatal("broker posture missing")
+	}
+	if health.GatewayBrokerPosture.DeploymentCheck != "unknown" || health.GatewayBrokerPosture.AnonymousAccess != "unknown" || health.GatewayBrokerPosture.ACLPolicy != "unknown" {
+		t.Fatalf("unsafe broker posture strings were not sanitized: %#v", health.GatewayBrokerPosture)
+	}
+	if health.StateStoreEncryption == nil || health.StateStoreEncryption.Mode != "unknown" {
+		t.Fatalf("unsafe encryption mode was not sanitized: %#v", health.StateStoreEncryption)
+	}
+}
+
+func TestWeeklyReportCredentialWarningRequiresCredentialPolicy(t *testing.T) {
+	warnings := healthPostureWarnings(CustomerHealthSummary{
+		GatewayBrokerPosture: &CustomerGatewayBrokerPosture{
+			GatewayEnabled:        true,
+			RequireCredentials:    false,
+			CredentialsConfigured: false,
+		},
+	})
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warning without credential requirement: %#v", warnings)
+	}
+
+	warnings = healthPostureWarnings(CustomerHealthSummary{
+		GatewayBrokerPosture: &CustomerGatewayBrokerPosture{
+			GatewayEnabled:        true,
+			RequireCredentials:    true,
+			CredentialsConfigured: false,
+		},
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "credentials") {
+		t.Fatalf("expected credential warning, got %#v", warnings)
+	}
+}
+
+func TestWeeklyReportStateEncryptionWarningRequiresFilesystemMode(t *testing.T) {
+	warnings := healthPostureWarnings(CustomerHealthSummary{
+		StateStoreEncryption: &CustomerStateStoreEncryptionPosture{Available: true, Mode: "none", Satisfied: false},
+	})
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warning for mode none: %#v", warnings)
+	}
+
+	warnings = healthPostureWarnings(CustomerHealthSummary{
+		StateStoreEncryption: &CustomerStateStoreEncryptionPosture{Available: true, Mode: "filesystem_required", Satisfied: false},
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "encryption") {
+		t.Fatalf("expected encryption warning, got %#v", warnings)
+	}
+}
+
+func TestWeeklyReportAlertOutboxWarningRequiresThresholdOrAge(t *testing.T) {
+	warnings := healthPostureWarnings(CustomerHealthSummary{
+		AlertOutbox: &CustomerAlertOutboxPosture{
+			Available:                     true,
+			BacklogCount:                  1,
+			TierDCriticalWarningThreshold: 3,
+			RetryIntervalMinutes:          30,
+			OldestQueuedAgeMS:             int64(5 * time.Minute / time.Millisecond),
+		},
+	})
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected transient outbox warning: %#v", warnings)
+	}
+
+	warnings = healthPostureWarnings(CustomerHealthSummary{
+		AlertOutbox: &CustomerAlertOutboxPosture{
+			Available:                     true,
+			BacklogCount:                  3,
+			TierDCriticalWarningThreshold: 3,
+			RetryIntervalMinutes:          30,
+		},
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "outbox") {
+		t.Fatalf("expected threshold outbox warning, got %#v", warnings)
+	}
+
+	warnings = healthPostureWarnings(CustomerHealthSummary{
+		AlertOutbox: &CustomerAlertOutboxPosture{
+			Available:            true,
+			BacklogCount:         1,
+			RetryIntervalMinutes: 30,
+			OldestQueuedAgeMS:    int64(30 * time.Minute / time.Millisecond),
+		},
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "outbox") {
+		t.Fatalf("expected aged outbox warning, got %#v", warnings)
 	}
 }
