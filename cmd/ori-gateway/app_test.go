@@ -256,10 +256,11 @@ func (r *fakeWeeklyReportRunner) Run(ctx context.Context) error {
 }
 
 type fakeHeartbeat struct {
-	started   chan struct{}
-	once      sync.Once
-	err       error
-	returnNil bool
+	started              chan struct{}
+	once                 sync.Once
+	err                  error
+	returnNil            bool
+	returnNilAfterCancel bool
 }
 
 type fakeWebhookBridge struct {
@@ -286,6 +287,9 @@ func (h *fakeHeartbeat) Run(ctx context.Context) error {
 		return nil
 	}
 	<-ctx.Done()
+	if h.returnNilAfterCancel {
+		return nil
+	}
 	return ctx.Err()
 }
 
@@ -1500,7 +1504,7 @@ func TestGatewayCleanShutdownWhenHeartbeatReturnsNilAfterCancel(t *testing.T) {
 	cfg := validConfig()
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
-	hb := &fakeHeartbeat{started: make(chan struct{}), returnNil: true}
+	hb := &fakeHeartbeat{started: make(chan struct{}), returnNilAfterCancel: true}
 	deps := baseDeps(t, cfg, fb, fp, hb)
 
 	ctx, cancel := context.WithCancel(context.Background())
