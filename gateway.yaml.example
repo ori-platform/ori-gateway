@@ -27,11 +27,16 @@ reporting:
   gemini:
     api_key_env: "GEMINI_API_KEY"
     model: "gemini-2.5-flash"
+    base_url: "" # optional override; blank uses the Gemini default endpoint
   weekly_report:
     enabled: false
     day: monday
     time: "08:00"
     timezone: Africa/Lagos
+    device_id: "ori-runtime-dev-01"
+    sensor_ids: ["current-main"]
+    customer_name: ""
+    site_name: ""
   tier_c_enrichment:
     enabled: false
 

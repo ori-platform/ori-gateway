@@ -54,13 +54,14 @@ Implemented in this repository:
 - Runtime export client contracts and MQTT runtime export client with HMAC auth and sensitive export decryption
 - Runtime health posture mapping for broker hardening, state-store encryption, and alert outbox backlog
 - SMS webhook signing bridge for providers that cannot sign raw webhook bodies
-- Weekly report generation against runtime export interfaces
+- Scheduled weekly report generation against runtime export interfaces, with Gemini as the first reporting provider
 - Tier C enrichment contracts
 - SIM and fleet optional-module stubs with disabled-path safety guarantees
 - CI, repository invariants, and contribution guardrails
 
 Deferred implementation:
 
+- Weekly report delivery/persistence to product surfaces or ori-cloud
 - Full SIM modem integration for shared outbound SMS
 - Fleet forwarding and control-plane integration through `ori-cloud`
 - Runtime-side Tier 3 gateway reasoning client and deterministic escalation policy

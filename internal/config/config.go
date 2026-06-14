@@ -98,13 +98,18 @@ type ReportingConfig struct {
 type ReportingGeminiConfig struct {
 	APIKeyEnv string `yaml:"api_key_env"`
 	Model     string `yaml:"model"`
+	BaseURL   string `yaml:"base_url"`
 }
 
 type WeeklyReportConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Day      string `yaml:"day"`
-	Time     string `yaml:"time"`
-	Timezone string `yaml:"timezone"`
+	Enabled      bool     `yaml:"enabled"`
+	Day          string   `yaml:"day"`
+	Time         string   `yaml:"time"`
+	Timezone     string   `yaml:"timezone"`
+	DeviceID     string   `yaml:"device_id"`
+	SensorIDs    []string `yaml:"sensor_ids"`
+	CustomerName string   `yaml:"customer_name"`
+	SiteName     string   `yaml:"site_name"`
 }
 
 type TierCEnrichmentConfig struct {
@@ -506,9 +511,16 @@ func normalizeReportingStrings(reporting ReportingConfig) ReportingConfig {
 	reporting.Provider = strings.TrimSpace(reporting.Provider)
 	reporting.Gemini.APIKeyEnv = strings.TrimSpace(reporting.Gemini.APIKeyEnv)
 	reporting.Gemini.Model = strings.TrimSpace(reporting.Gemini.Model)
+	reporting.Gemini.BaseURL = strings.TrimSpace(reporting.Gemini.BaseURL)
 	reporting.WeeklyReport.Day = strings.TrimSpace(reporting.WeeklyReport.Day)
 	reporting.WeeklyReport.Time = strings.TrimSpace(reporting.WeeklyReport.Time)
 	reporting.WeeklyReport.Timezone = strings.TrimSpace(reporting.WeeklyReport.Timezone)
+	reporting.WeeklyReport.DeviceID = strings.TrimSpace(reporting.WeeklyReport.DeviceID)
+	reporting.WeeklyReport.CustomerName = strings.TrimSpace(reporting.WeeklyReport.CustomerName)
+	reporting.WeeklyReport.SiteName = strings.TrimSpace(reporting.WeeklyReport.SiteName)
+	for i := range reporting.WeeklyReport.SensorIDs {
+		reporting.WeeklyReport.SensorIDs[i] = strings.TrimSpace(reporting.WeeklyReport.SensorIDs[i])
+	}
 	return reporting
 }
 
@@ -558,6 +570,20 @@ func validateReporting(reporting ReportingConfig) error {
 		}
 		if _, err := time.LoadLocation(reporting.WeeklyReport.Timezone); err != nil {
 			return fmt.Errorf("reporting.weekly_report.timezone %q is invalid: %w", reporting.WeeklyReport.Timezone, err)
+		}
+		if reporting.WeeklyReport.DeviceID == "" {
+			return fmt.Errorf("reporting.weekly_report.device_id must not be empty")
+		}
+		if strings.ContainsAny(reporting.WeeklyReport.DeviceID, "/+#") {
+			return fmt.Errorf("reporting.weekly_report.device_id must not contain MQTT topic separators or wildcards")
+		}
+		if len(reporting.WeeklyReport.SensorIDs) == 0 {
+			return fmt.Errorf("reporting.weekly_report.sensor_ids must not be empty")
+		}
+		for _, sensorID := range reporting.WeeklyReport.SensorIDs {
+			if sensorID == "" {
+				return fmt.Errorf("reporting.weekly_report.sensor_ids must not contain empty values")
+			}
 		}
 	}
 

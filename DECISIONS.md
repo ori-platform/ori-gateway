@@ -238,3 +238,32 @@ The runtime production posture can require authenticated gateway MQTT and
 encrypted sensitive exports. Gateway reporting and future cloud sync must work
 through that same contract instead of requiring operators to weaken runtime
 security for product features.
+
+---
+
+## 2026-06-14 — Scheduled Weekly Reports Use Runtime Export Contracts
+
+Status: Accepted
+
+The gateway owns single-site weekly report generation. A scheduled weekly report
+uses an explicit `reporting.weekly_report` scope (`device_id`, `sensor_ids`,
+customer/site labels, local weekday/time/timezone), fetches bounded runtime
+exports through `runtimeclient.Client`, and delegates language generation to the
+configured reporting provider. Gemini is the first concrete reporting provider.
+
+Rules:
+
+- Gateway weekly reports must never read runtime SQLite directly.
+- Gateway weekly reports must never mutate runtime state or action authority.
+- Runtime export MQTT auth/encryption posture applies to report data access.
+- Report generation failures are logged and retried on the next schedule; they
+  must not stop Tier 3 reasoning, heartbeat, runtime-node liveness, or webhook
+  bridge handling.
+- Delivery and persistence of generated report text belong to product/cloud
+  surfaces and are intentionally not implemented in this gateway slice.
+
+Rationale:
+
+The weekly report is a product feature, not a safety or action path. Keeping it
+on the gateway lets a site generate useful customer-facing intelligence from
+local runtime data while preserving runtime ownership of state and actuation.

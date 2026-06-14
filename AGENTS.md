@@ -76,9 +76,16 @@ Verified by `TestReportingProviderDoesNotAffectReasoningProvider`.
 11. `GW-11` Gateway reporting and enrichment never change action authority.
 Customer-facing weekly reports and Tier C explanation enrichment are advisory.
 They must not promote, downgrade, approve, reject, bypass, or execute runtime
-action tiers. Runtime remains the physical action authority.
-Verified by `TestTierCEnrichmentCannotChangeActionAuthority` and
+action tiers. Runtime remains the physical action authority. Tier C enrichment
+is verified by `TestTierCEnrichmentCannotChangeActionAuthority` and
 `TestTierCEnrichmentDropsInjectedAuthorityFields`.
+Weekly report generation must consume bounded runtime exports through
+`runtimeclient.Client` and must not read runtime SQLite directly. Report output
+may be delivered or persisted by product/cloud layers, not by mutating runtime
+state. Weekly report boundaries are verified by
+`TestWeeklyReportBuildsInputFromRuntimeExports`,
+`TestGatewayConstructsSecureRuntimeClientForWeeklyReports`, and
+`TestWeeklyReportRunnerLogsFailureAndContinues`.
 
 12. `GW-12` Reporting provider credentials stay out of runtime config.
 Gemini/API keys and equivalent product-provider credentials belong in gateway

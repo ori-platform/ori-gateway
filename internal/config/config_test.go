@@ -458,10 +458,24 @@ reporting:
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	path = writeConfig(t, base+`  provider: gemini
+	path = writeConfig(t, `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+reporting:
+  provider: gemini
   gemini:
     api_key_env: GEMINI_API_KEY
     model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "08:00"
+    timezone: Africa/Lagos
+    device_id: dev-01
+    sensor_ids: [current-main]
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -535,6 +549,8 @@ reporting:
     day: monday
     time: "08:00"
     timezone: Africa/Lagos
+    device_id: dev-01
+    sensor_ids: [current-main]
 `)
 
 	cfg, err := Load(path)
@@ -546,6 +562,52 @@ reporting:
 	}
 	if cfg.Reporting.Provider != ReportingProviderGemini {
 		t.Fatalf("reporting provider not loaded: %q", cfg.Reporting.Provider)
+	}
+}
+
+func TestWeeklyReportRequiresReportScope(t *testing.T) {
+	base := `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+reporting:
+  provider: gemini
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+  weekly_report:
+    enabled: true
+    day: monday
+    time: "08:00"
+    timezone: Africa/Lagos
+`
+
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "missing device", content: base + `    sensor_ids: [current-main]
+`, want: "device_id"},
+		{name: "invalid device", content: base + `    device_id: dev/01
+    sensor_ids: [current-main]
+`, want: "device_id"},
+		{name: "missing sensors", content: base + `    device_id: dev-01
+`, want: "sensor_ids"},
+		{name: "blank sensor", content: base + `    device_id: dev-01
+    sensor_ids: [""]
+`, want: "sensor_ids"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.content)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want error containing %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -886,6 +948,8 @@ reporting:
     day: monday
     time: "08:00"
     timezone: Africa/Lagos
+    device_id: dev-01
+    sensor_ids: [current-main]
 `)
 
 	cfg, err := Load(path)
