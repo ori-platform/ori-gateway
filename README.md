@@ -53,6 +53,7 @@ Implemented in this repository:
 - Gateway process wiring: config, provider, broker, heartbeat, dispatcher, and graceful shutdown
 - Runtime export client contracts and MQTT runtime export client
 - Runtime health posture mapping for broker hardening, state-store encryption, and alert outbox backlog
+- SMS webhook signing bridge for providers that cannot sign raw webhook bodies
 - Weekly report generation against runtime export interfaces
 - Tier C enrichment contracts
 - SIM and fleet optional-module stubs with disabled-path safety guarantees
@@ -61,7 +62,6 @@ Implemented in this repository:
 Deferred implementation:
 
 - Full SIM modem integration for shared outbound SMS
-- SMS webhook signing bridge for provider ingress before forwarding to runtime localhost webhooks
 - Fleet forwarding and control-plane integration through `ori-cloud`
 - Runtime-side Tier 3 gateway reasoning client and deterministic escalation policy
 - Runtime-side consumption of gateway heartbeat capability posture

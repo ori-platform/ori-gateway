@@ -5,6 +5,9 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +19,11 @@ const (
 	DefaultHeartbeatIntervalS   = 30
 	DefaultProviderTimeoutMS    = 10000
 	DefaultGatewayAuthSecretEnv = "GATEWAY_SHARED_SECRET"
+
+	DefaultWebhookBridgeListenAddr       = "127.0.0.1:8090"
+	DefaultWebhookBridgePath             = "/webhooks/sms/africastalking"
+	DefaultWebhookBridgeRequestTimeoutMS = 3000
+	DefaultWebhookBridgeMaxBodyBytes     = 65536
 
 	ProviderEcho     = "echo"
 	ProviderLlamaCpp = "llama_cpp"
@@ -32,11 +40,12 @@ const (
 
 // Config is the root gateway configuration loaded from gateway.yaml.
 type Config struct {
-	Gateway   GatewayConfig   `yaml:"gateway"`
-	Provider  ProviderConfig  `yaml:"provider"`
-	Reporting ReportingConfig `yaml:"reporting"`
-	SIM       SIMConfig       `yaml:"sim"`
-	Fleet     FleetConfig     `yaml:"fleet"`
+	Gateway       GatewayConfig       `yaml:"gateway"`
+	Provider      ProviderConfig      `yaml:"provider"`
+	Reporting     ReportingConfig     `yaml:"reporting"`
+	WebhookBridge WebhookBridgeConfig `yaml:"webhook_bridge"`
+	SIM           SIMConfig           `yaml:"sim"`
+	Fleet         FleetConfig         `yaml:"fleet"`
 }
 
 type GatewayConfig struct {
@@ -106,12 +115,27 @@ type FleetConfig struct {
 	CloudURL string `yaml:"cloud_url"`
 }
 
+// WebhookBridgeConfig configures the optional provider-ingress signing bridge.
+// Secret values are resolved from environment variables at runtime.
+type WebhookBridgeConfig struct {
+	Enabled             bool     `yaml:"enabled"`
+	ListenAddr          string   `yaml:"listen_addr"`
+	Path                string   `yaml:"path"`
+	TargetURL           string   `yaml:"target_url"`
+	ProviderSourceCIDRs []string `yaml:"provider_source_cidrs"`
+	RuntimeTokenEnv     string   `yaml:"runtime_token_env"`
+	HMACSecretEnv       string   `yaml:"hmac_secret_env"`
+	RequestTimeoutMS    int      `yaml:"request_timeout_ms"`
+	MaxBodyBytes        int64    `yaml:"max_body_bytes"`
+}
+
 type fileConfig struct {
-	Gateway   fileGatewayConfig  `yaml:"gateway"`
-	Provider  fileProviderConfig `yaml:"provider"`
-	Reporting ReportingConfig    `yaml:"reporting"`
-	SIM       SIMConfig          `yaml:"sim"`
-	Fleet     FleetConfig        `yaml:"fleet"`
+	Gateway       fileGatewayConfig       `yaml:"gateway"`
+	Provider      fileProviderConfig      `yaml:"provider"`
+	Reporting     ReportingConfig         `yaml:"reporting"`
+	WebhookBridge fileWebhookBridgeConfig `yaml:"webhook_bridge"`
+	SIM           SIMConfig               `yaml:"sim"`
+	Fleet         FleetConfig             `yaml:"fleet"`
 }
 
 type fileGatewayConfig struct {
@@ -126,6 +150,18 @@ type fileProviderConfig struct {
 	TimeoutMS *int           `yaml:"timeout_ms"`
 	LlamaCpp  LlamaCppConfig `yaml:"llama_cpp"`
 	CloudLLM  CloudLLMConfig `yaml:"cloud_llm"`
+}
+
+type fileWebhookBridgeConfig struct {
+	Enabled             bool     `yaml:"enabled"`
+	ListenAddr          string   `yaml:"listen_addr"`
+	Path                string   `yaml:"path"`
+	TargetURL           string   `yaml:"target_url"`
+	ProviderSourceCIDRs []string `yaml:"provider_source_cidrs"`
+	RuntimeTokenEnv     string   `yaml:"runtime_token_env"`
+	HMACSecretEnv       string   `yaml:"hmac_secret_env"`
+	RequestTimeoutMS    *int     `yaml:"request_timeout_ms"`
+	MaxBodyBytes        *int64   `yaml:"max_body_bytes"`
 }
 
 // Load reads and validates gateway configuration from path.
@@ -163,9 +199,10 @@ func (f *fileConfig) normalize() (Config, error) {
 			LlamaCpp: f.Provider.LlamaCpp,
 			CloudLLM: f.Provider.CloudLLM,
 		}),
-		Reporting: normalizeReportingStrings(f.Reporting),
-		SIM:       f.SIM,
-		Fleet:     f.Fleet,
+		Reporting:     normalizeReportingStrings(f.Reporting),
+		WebhookBridge: normalizeWebhookBridge(f.WebhookBridge),
+		SIM:           f.SIM,
+		Fleet:         f.Fleet,
 	}
 
 	if cfg.Gateway.BrokerURL == "" {
@@ -217,6 +254,10 @@ func (f *fileConfig) normalize() (Config, error) {
 	}
 
 	if err := validateReporting(cfg.Reporting); err != nil {
+		return Config{}, err
+	}
+
+	if err := validateWebhookBridge(cfg.WebhookBridge); err != nil {
 		return Config{}, err
 	}
 
@@ -275,6 +316,130 @@ func normalizeProviderStrings(provider ProviderConfig) ProviderConfig {
 	provider.CloudLLM.Model = strings.TrimSpace(provider.CloudLLM.Model)
 	provider.CloudLLM.BaseURL = strings.TrimSpace(provider.CloudLLM.BaseURL)
 	return provider
+}
+
+func normalizeWebhookBridge(raw fileWebhookBridgeConfig) WebhookBridgeConfig {
+	requestTimeoutMS := DefaultWebhookBridgeRequestTimeoutMS
+	if raw.RequestTimeoutMS != nil {
+		requestTimeoutMS = *raw.RequestTimeoutMS
+	}
+	maxBodyBytes := int64(DefaultWebhookBridgeMaxBodyBytes)
+	if raw.MaxBodyBytes != nil {
+		maxBodyBytes = *raw.MaxBodyBytes
+	}
+	cidrs := make([]string, 0, len(raw.ProviderSourceCIDRs))
+	for _, cidr := range raw.ProviderSourceCIDRs {
+		trimmed := strings.TrimSpace(cidr)
+		if trimmed != "" {
+			cidrs = append(cidrs, trimmed)
+		}
+	}
+	return WebhookBridgeConfig{
+		Enabled:             raw.Enabled,
+		ListenAddr:          defaultIfBlank(raw.ListenAddr, DefaultWebhookBridgeListenAddr),
+		Path:                defaultIfBlank(raw.Path, DefaultWebhookBridgePath),
+		TargetURL:           strings.TrimSpace(raw.TargetURL),
+		ProviderSourceCIDRs: cidrs,
+		RuntimeTokenEnv:     strings.TrimSpace(raw.RuntimeTokenEnv),
+		HMACSecretEnv:       strings.TrimSpace(raw.HMACSecretEnv),
+		RequestTimeoutMS:    requestTimeoutMS,
+		MaxBodyBytes:        maxBodyBytes,
+	}
+}
+
+func defaultIfBlank(value string, fallback string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fallback
+	}
+	return trimmed
+}
+
+func validateWebhookBridge(cfg WebhookBridgeConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(cfg.ListenAddr); err != nil {
+		return fmt.Errorf("webhook_bridge.listen_addr must be host:port: %w", err)
+	}
+	if !strings.HasPrefix(cfg.Path, "/") {
+		return fmt.Errorf("webhook_bridge.path must start with /")
+	}
+	if cfg.TargetURL == "" {
+		return fmt.Errorf("webhook_bridge.target_url must not be empty when webhook_bridge.enabled is true")
+	}
+	target, err := url.Parse(cfg.TargetURL)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		return fmt.Errorf("webhook_bridge.target_url must be an absolute http(s) URL")
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return fmt.Errorf("webhook_bridge.target_url must use http or https")
+	}
+	if err := validateEnvVarName("webhook_bridge.runtime_token_env", cfg.RuntimeTokenEnv); err != nil {
+		return err
+	}
+	if err := validateEnvVarName("webhook_bridge.hmac_secret_env", cfg.HMACSecretEnv); err != nil {
+		return err
+	}
+	if cfg.RequestTimeoutMS <= 0 {
+		return fmt.Errorf("webhook_bridge.request_timeout_ms must be positive")
+	}
+	if cfg.MaxBodyBytes <= 0 || cfg.MaxBodyBytes > 1<<20 {
+		return fmt.Errorf("webhook_bridge.max_body_bytes must be between 1 and 1048576")
+	}
+	for _, cidr := range cfg.ProviderSourceCIDRs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return fmt.Errorf("webhook_bridge.provider_source_cidrs contains invalid CIDR %q: %w", cidr, err)
+		}
+		if err := validateProviderCIDR(prefix, cidr); err != nil {
+			return err
+		}
+	}
+	if !listenAddrIsLoopback(cfg.ListenAddr) && len(cfg.ProviderSourceCIDRs) == 0 {
+		return fmt.Errorf("webhook_bridge.provider_source_cidrs must not be empty for non-loopback listen_addr")
+	}
+	return nil
+}
+
+func validateProviderCIDR(prefix netip.Prefix, raw string) error {
+	bits := prefix.Bits()
+	addr := prefix.Addr()
+	if bits == 0 {
+		return fmt.Errorf("webhook_bridge.provider_source_cidrs must not contain catch-all CIDR %q", raw)
+	}
+	if addr.Is4() && bits < 8 {
+		return fmt.Errorf("webhook_bridge.provider_source_cidrs CIDR %q is too broad; IPv4 prefixes must be /8 or narrower", raw)
+	}
+	if addr.Is6() && bits < 32 {
+		return fmt.Errorf("webhook_bridge.provider_source_cidrs CIDR %q is too broad; IPv6 prefixes must be /32 or narrower", raw)
+	}
+	return nil
+}
+
+func validateEnvVarName(field string, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s must be an environment variable name", field)
+	}
+	if strings.ContainsAny(value, " \t\r\n=") {
+		return fmt.Errorf("%s must be an environment variable name", field)
+	}
+	return nil
+}
+
+func listenAddrIsLoopback(listenAddr string) bool {
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.IsLoopback()
 }
 
 func validateProvider(provider ProviderConfig) error {

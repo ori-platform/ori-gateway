@@ -176,3 +176,34 @@ Non-goals:
   has access to broker files/admin APIs.
 - This does not implement the SMS webhook signing bridge. That remains a
   gateway/deployment ingress feature.
+
+---
+
+## 2026-06-14 — SMS Webhook Signing Bridge Owns Provider Ingress
+
+**Status:** Accepted
+
+The runtime requires raw-body HMAC verification for public SMS webhook ingress,
+but providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
+therefore owns an optional webhook signing bridge for production provider
+ingress.
+
+Rules:
+
+- The bridge validates provider source CIDRs before reading or forwarding the
+  request body.
+- The bridge preserves the provider raw body exactly, signs that raw body using
+  the runtime webhook HMAC contract, and forwards it to the runtime localhost
+  webhook with `X-Ori-Webhook-*` headers.
+- Bridge token and HMAC secret values come from environment variables only.
+- The bridge caps request bodies and maps runtime rejection to provider-facing
+  failure without exposing runtime internals.
+- The bridge must not log SMS body content, phone numbers, bearer tokens, or
+  HMAC secrets.
+
+Rationale:
+
+This keeps the runtime webhook security model strict without requiring every
+third-party SMS provider to support Ori-specific signatures. It also preserves
+the runtime boundary: the gateway adapts provider ingress, while the runtime
+continues to verify the same replay-resistant raw-body signature contract.
