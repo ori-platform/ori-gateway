@@ -43,6 +43,18 @@ func TestHealthHandlerGETReturnsJSON(t *testing.T) {
 	}
 }
 
+func TestHealthHandlerUnknownPathReturns404(t *testing.T) {
+	h := newTestHandler(t, SiteStatusHealthy)
+	for _, path := range []string{"/", "/metrics", "/health/deep", "/HEALTH"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("path %q: expected 404, got %d", path, rec.Code)
+		}
+	}
+}
+
 func TestHealthHandlerMethodNotAllowed(t *testing.T) {
 	h := newTestHandler(t, SiteStatusHealthy)
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {

@@ -30,8 +30,12 @@ func NewHealthHandler(viewer Viewer, gatewayView func() GatewayView, listenAddr 
 }
 
 // ServeHTTP responds to GET /health with the current SiteHealth projection as JSON.
-// All other methods receive 405 Method Not Allowed.
+// Requests for any other path receive 404; all non-GET methods receive 405.
 func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/health" {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -54,7 +58,11 @@ func (h *HealthHandler) Run(ctx context.Context) error {
 func (h *HealthHandler) runOnListener(ctx context.Context, l net.Listener) error {
 	mux := http.NewServeMux()
 	mux.Handle("/health", h)
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
