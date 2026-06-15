@@ -254,6 +254,92 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 	}
 }
 
+func readContractFixture(t *testing.T, path string) []byte {
+	t.Helper()
+	fixture, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fixture
+}
+
+func assertFixtureRoundTrip(t *testing.T, path string, dest any) {
+	t.Helper()
+	fixture := readContractFixture(t, path)
+	if err := json.Unmarshal(fixture, dest); err != nil {
+		t.Fatalf("%s did not unmarshal: %v", path, err)
+	}
+	encoded, err := json.Marshal(dest)
+	if err != nil {
+		t.Fatalf("%s did not marshal: %v", path, err)
+	}
+	want := strings.TrimSpace(string(fixture))
+	if string(encoded) != want {
+		t.Fatalf("%s round-trip drifted:\nwant %s\n got %s", path, want, encoded)
+	}
+}
+
+func TestReasoningRequestFixtureRoundTrip(t *testing.T) {
+	var req ReasoningRequest
+	assertFixtureRoundTrip(t, "testdata/reasoning_request.json", &req)
+	if req.RequestID == "" || req.DeviceID != "site-a" || req.ActionTierHint != ActionTierD {
+		t.Fatalf("unexpected request fixture: %#v", req)
+	}
+	if len(req.Context.History) != 1 || req.Context.History[0].Value != 8.1 {
+		t.Fatalf("unexpected request history fixture: %#v", req.Context.History)
+	}
+}
+
+func TestReasoningResponseFixtureRoundTrip(t *testing.T) {
+	var resp ReasoningResponse
+	assertFixtureRoundTrip(t, "testdata/reasoning_response.json", &resp)
+	if resp.RequestID == "" || resp.ActionTier != ActionTierD || resp.Error != nil {
+		t.Fatalf("unexpected response fixture: %#v", resp)
+	}
+}
+
+func TestReasoningErrorResponseFixtureIncludesError(t *testing.T) {
+	var resp ReasoningResponse
+	assertFixtureRoundTrip(t, "testdata/reasoning_error_response.json", &resp)
+	if resp.RequestID != "7d4bd5ee-7f7e-4f11-bdab-a4b3fb3ca7a3" {
+		t.Fatalf("error response request_id drifted: %q", resp.RequestID)
+	}
+	if resp.Error == nil || *resp.Error == "" {
+		t.Fatalf("error response fixture must include error: %#v", resp)
+	}
+}
+
+func TestHeartbeatFixtureRoundTrip(t *testing.T) {
+	var hb Heartbeat
+	fixture := readContractFixture(t, "testdata/heartbeat.json")
+	assertFixtureRoundTrip(t, "testdata/heartbeat.json", &hb)
+	if hb.UptimeS != 12.5 {
+		t.Fatalf("heartbeat uptime_s = %v, want 12.5", hb.UptimeS)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(fixture, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["uptime_s"] != 12.5 {
+		t.Fatalf("heartbeat fixture must use float uptime_s=12.5, got %#v", raw["uptime_s"])
+	}
+}
+
+func TestRuntimeNodeHeartbeatFixtureRoundTrip(t *testing.T) {
+	var hb RuntimeNodeHeartbeat
+	assertFixtureRoundTrip(t, "testdata/runtime_node_heartbeat.json", &hb)
+	if hb.DeviceID != "dev-01" || hb.ActiveTriggers == nil {
+		t.Fatalf("unexpected runtime heartbeat fixture: %#v", hb)
+	}
+}
+
+func TestSDKFixtureAlignmentDocumented(t *testing.T) {
+	doc := string(readContractFixture(t, "testdata/README.md"))
+	if !strings.Contains(doc, "ori-sdk") || !strings.Contains(doc, "canonical gateway fixture source") {
+		t.Fatalf("fixture README must document SDK alignment, got: %s", doc)
+	}
+}
+
 func TestHeartbeatWebhookBridgePostureJSON(t *testing.T) {
 	beat := Heartbeat{
 		Status:        "healthy",
