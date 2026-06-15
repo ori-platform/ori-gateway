@@ -45,9 +45,9 @@ type Config struct {
 	Provider      ProviderConfig      `yaml:"provider"`
 	Reporting     ReportingConfig     `yaml:"reporting"`
 	WebhookBridge WebhookBridgeConfig `yaml:"webhook_bridge"`
-	SIM        SIMConfig        `yaml:"sim"`
-	Fleet      FleetConfig      `yaml:"fleet"`
-	SiteHealth SiteHealthConfig `yaml:"site_health"`
+	SIM           SIMConfig           `yaml:"sim"`
+	Fleet         FleetConfig         `yaml:"fleet"`
+	SiteHealth    SiteHealthConfig    `yaml:"site_health"`
 }
 
 type GatewayConfig struct {
@@ -153,9 +153,9 @@ type fileConfig struct {
 	Provider      fileProviderConfig      `yaml:"provider"`
 	Reporting     ReportingConfig         `yaml:"reporting"`
 	WebhookBridge fileWebhookBridgeConfig `yaml:"webhook_bridge"`
-	SIM        SIMConfig        `yaml:"sim"`
-	Fleet      FleetConfig      `yaml:"fleet"`
-	SiteHealth SiteHealthConfig `yaml:"site_health"`
+	SIM           SIMConfig               `yaml:"sim"`
+	Fleet         FleetConfig             `yaml:"fleet"`
+	SiteHealth    SiteHealthConfig        `yaml:"site_health"`
 }
 
 type fileGatewayConfig struct {
@@ -224,9 +224,9 @@ func (f *fileConfig) normalize() (Config, error) {
 		}),
 		Reporting:     normalizeReportingStrings(f.Reporting),
 		WebhookBridge: normalizeWebhookBridge(f.WebhookBridge),
-		SIM:        f.SIM,
-		Fleet:      f.Fleet,
-		SiteHealth: normalizeSiteHealth(f.SiteHealth),
+		SIM:           f.SIM,
+		Fleet:         f.Fleet,
+		SiteHealth:    normalizeSiteHealth(f.SiteHealth),
 	}
 
 	if cfg.Gateway.BrokerURL == "" {
