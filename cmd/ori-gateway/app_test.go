@@ -1751,6 +1751,94 @@ func TestGatewayWeeklyReportOnlyLogDelivererWhenNoOutputDir(t *testing.T) {
 	}
 }
 
+func TestGatewayWeeklyReportWiresCloudDelivererWhenEnabled(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	t.Setenv("ORI_CLOUD_API_KEY", "cloud-key")
+
+	// Stand up a real HTTPS server to receive the deliverer constructor's validation.
+	// The deliverer itself is only constructed at startup, not invoked, so we just
+	// need the endpoint URL to be a valid https URL.
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider: config.ReportingProviderGemini,
+		Gemini:   config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{
+			Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos",
+			DeviceID: "site-a", SensorIDs: []string{"current-main"},
+			Delivery: config.WeeklyReportDeliveryConfig{
+				Cloud: config.WeeklyReportCloudDeliveryConfig{
+					Enabled:  true,
+					Endpoint: "https://cloud.example.com/reports",
+					AuthEnv:  "ORI_CLOUD_API_KEY",
+				},
+			},
+		},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	weeklyRunner := newFakeWeeklyReportRunner()
+	var capturedDeliverers []reporting.Deliverer
+	deps.newWeeklyReportRunner = func(_ *reporting.WeeklyReportGenerator, _ reporting.WeeklyReportRequest, _ reporting.Schedule, opts reporting.RunnerOptions) (weeklyReportRunner, error) {
+		capturedDeliverers = opts.Deliverers
+		return weeklyRunner, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("runGateway returned error: %v", err)
+	}
+
+	if len(capturedDeliverers) != 2 {
+		t.Fatalf("expected 2 deliverers (log + cloud), got %d", len(capturedDeliverers))
+	}
+	if _, ok := capturedDeliverers[0].(*reporting.LogDeliverer); !ok {
+		t.Errorf("expected first deliverer to be *reporting.LogDeliverer, got %T", capturedDeliverers[0])
+	}
+	if _, ok := capturedDeliverers[1].(*reporting.CloudDeliverer); !ok {
+		t.Errorf("expected second deliverer to be *reporting.CloudDeliverer, got %T", capturedDeliverers[1])
+	}
+}
+
+func TestGatewayWeeklyReportCloudDelivererMissingEnvVarStopsStartup(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	t.Setenv("ORI_CLOUD_API_KEY", "") // deliberately empty
+
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider: config.ReportingProviderGemini,
+		Gemini:   config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{
+			Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos",
+			DeviceID: "site-a", SensorIDs: []string{"current-main"},
+			Delivery: config.WeeklyReportDeliveryConfig{
+				Cloud: config.WeeklyReportCloudDeliveryConfig{
+					Enabled:  true,
+					Endpoint: "https://cloud.example.com/reports",
+					AuthEnv:  "ORI_CLOUD_API_KEY",
+				},
+			},
+		},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+
+	err := runGateway(context.Background(), "gateway.yaml", baseDeps(t, cfg, fb, fp, hb))
+	if err == nil || !strings.Contains(err.Error(), "ORI_CLOUD_API_KEY") {
+		t.Fatalf("expected missing env var error, got: %v", err)
+	}
+}
+
 func TestSupervisedRunnersReportsRunnerErrors(t *testing.T) {
 	runners := newSupervisedRunners(context.Background())
 	wantErr := errors.New("boom")

@@ -237,7 +237,16 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			deliverers = append(deliverers, fd)
 		}
 		if cfg.Reporting.WeeklyReport.Delivery.Cloud.Enabled {
-			return fmt.Errorf("weekly report cloud delivery is not yet implemented")
+			cloudCfg := cfg.Reporting.WeeklyReport.Delivery.Cloud
+			apiKey := strings.TrimSpace(os.Getenv(cloudCfg.AuthEnv))
+			if apiKey == "" {
+				return fmt.Errorf("weekly report cloud deliverer: env var %q is empty or not set", cloudCfg.AuthEnv)
+			}
+			cd, err := reporting.NewCloudDeliverer(cloudCfg.Endpoint, apiKey, reporting.CloudDelivererOptions{})
+			if err != nil {
+				return fmt.Errorf("weekly report cloud deliverer: %w", err)
+			}
+			deliverers = append(deliverers, cd)
 		}
 		weeklyReport, err = deps.newWeeklyReportRunner(
 			weeklyGenerator,

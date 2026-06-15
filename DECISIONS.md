@@ -422,9 +422,13 @@ Rules:
 - The same `weeklyReportFilePayload` DTO (excluding DeviceID and Metadata) is
   the canonical customer-safe payload shape for both file and cloud delivery.
 - `delivery.cloud.auth_env` holds only an environment variable name, never a
-  credential. The gateway resolves it at startup.
-- Cloud delivery returns "not yet implemented" at startup until the ori-cloud
-  ingest endpoint is built. The config shape and validation are already in place.
+  credential. The gateway resolves it at startup and rejects empty values.
+- `CloudDeliverer` POSTs the same `weeklyReportFilePayload` DTO as the file
+  channel to the configured https endpoint with `Authorization: Bearer <key>`.
+  The API key must never appear in errors or logs. Non-2xx responses are surfaced
+  as errors without reading or logging the response body.
+- The `HTTPClient` field on `CloudDelivererOptions` is the test-injection seam;
+  production always uses a 30-second-timeout default client.
 
 Rationale:
 
@@ -465,9 +469,9 @@ A gateway config typo in `customer_name` must not cause reports to be stored
 under the wrong customer in ori-cloud. Keying persistence on authenticated
 gateway identity (rather than human-readable names) prevents drift between
 what the operator typed and what ori-cloud has on record. This constraint must
-be respected when the cloud deliverer PR is designed.
+be respected when the ori-cloud ingest endpoint is designed.
 
-Deferred to cloud delivery PR:
+Deferred to ori-cloud integration:
 
 - Gateway registration / credential issuance model
 - Whether ori-cloud returns canonical display names at registration

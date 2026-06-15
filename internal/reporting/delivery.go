@@ -4,10 +4,13 @@
 package reporting
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,6 +157,73 @@ func toFilePayload(a WeeklyReportArtifact) weeklyReportFilePayload {
 		TierCDecisionCount: a.TierCDecisionCount,
 		Warnings:           warnings,
 	}
+}
+
+const defaultCloudDeliveryTimeout = 30 * time.Second
+
+// CloudDelivererOptions configures optional CloudDeliverer parameters.
+type CloudDelivererOptions struct {
+	// HTTPClient overrides the default HTTP client. Used in tests to inject a
+	// TLS-aware test server client.
+	HTTPClient *http.Client
+}
+
+// CloudDeliverer POSTs the customer-safe report payload to an ori-cloud ingest
+// endpoint via HTTPS. The API key is sent as a Bearer token and must never
+// appear in error messages or logs.
+type CloudDeliverer struct {
+	endpoint string
+	apiKey   string
+	client   *http.Client
+}
+
+// NewCloudDeliverer validates endpoint and apiKey and returns a CloudDeliverer.
+// endpoint must be an absolute https URL. apiKey must not be empty.
+func NewCloudDeliverer(endpoint, apiKey string, opts CloudDelivererOptions) (*CloudDeliverer, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || !u.IsAbs() || u.Scheme != "https" {
+		return nil, fmt.Errorf("reporting: cloud deliverer endpoint must be an absolute https URL")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("reporting: cloud deliverer endpoint must not contain credentials")
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("reporting: cloud deliverer endpoint must not contain a fragment")
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("reporting: cloud deliverer API key must not be empty")
+	}
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: defaultCloudDeliveryTimeout}
+	}
+	return &CloudDeliverer{endpoint: endpoint, apiKey: apiKey, client: client}, nil
+}
+
+// Deliver serialises the customer-safe payload and POSTs it to the configured
+// endpoint. The API key is never included in returned errors.
+func (d *CloudDeliverer) Deliver(ctx context.Context, artifact WeeklyReportArtifact) error {
+	data, err := json.Marshal(toFilePayload(artifact))
+	if err != nil {
+		return fmt.Errorf("reporting: marshal cloud report payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.endpoint, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("reporting: build cloud delivery request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+d.apiKey)
+	resp, err := d.client.Do(req)
+	if err != nil {
+		// net/http errors do not include request headers, so the API key
+		// cannot leak here. Wrap without adding detail that could aid exfiltration.
+		return fmt.Errorf("reporting: cloud delivery request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("reporting: cloud delivery returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // siteSlug converts a site name to a safe filename component.
