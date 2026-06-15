@@ -21,6 +21,7 @@ const (
 	DefaultGatewayAuthSecretEnv = "GATEWAY_SHARED_SECRET"
 
 	DefaultWebhookBridgeListenAddr       = "127.0.0.1:8090"
+	DefaultSiteHealthListenAddr          = "127.0.0.1:8765"
 	DefaultWebhookBridgePath             = "/webhooks/sms/africastalking"
 	DefaultWebhookBridgeRequestTimeoutMS = 3000
 	DefaultWebhookBridgeMaxBodyBytes     = 65536
@@ -44,8 +45,9 @@ type Config struct {
 	Provider      ProviderConfig      `yaml:"provider"`
 	Reporting     ReportingConfig     `yaml:"reporting"`
 	WebhookBridge WebhookBridgeConfig `yaml:"webhook_bridge"`
-	SIM           SIMConfig           `yaml:"sim"`
-	Fleet         FleetConfig         `yaml:"fleet"`
+	SIM        SIMConfig        `yaml:"sim"`
+	Fleet      FleetConfig      `yaml:"fleet"`
+	SiteHealth SiteHealthConfig `yaml:"site_health"`
 }
 
 type GatewayConfig struct {
@@ -126,6 +128,12 @@ type FleetConfig struct {
 	CloudURL string `yaml:"cloud_url"`
 }
 
+// SiteHealthConfig configures the optional site health HTTP export server.
+type SiteHealthConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenAddr string `yaml:"listen_addr"`
+}
+
 // WebhookBridgeConfig configures the optional provider-ingress signing bridge.
 // Secret values are resolved from environment variables at runtime.
 type WebhookBridgeConfig struct {
@@ -145,8 +153,9 @@ type fileConfig struct {
 	Provider      fileProviderConfig      `yaml:"provider"`
 	Reporting     ReportingConfig         `yaml:"reporting"`
 	WebhookBridge fileWebhookBridgeConfig `yaml:"webhook_bridge"`
-	SIM           SIMConfig               `yaml:"sim"`
-	Fleet         FleetConfig             `yaml:"fleet"`
+	SIM        SIMConfig        `yaml:"sim"`
+	Fleet      FleetConfig      `yaml:"fleet"`
+	SiteHealth SiteHealthConfig `yaml:"site_health"`
 }
 
 type fileGatewayConfig struct {
@@ -215,8 +224,9 @@ func (f *fileConfig) normalize() (Config, error) {
 		}),
 		Reporting:     normalizeReportingStrings(f.Reporting),
 		WebhookBridge: normalizeWebhookBridge(f.WebhookBridge),
-		SIM:           f.SIM,
-		Fleet:         f.Fleet,
+		SIM:        f.SIM,
+		Fleet:      f.Fleet,
+		SiteHealth: normalizeSiteHealth(f.SiteHealth),
 	}
 
 	if cfg.Gateway.BrokerURL == "" {
@@ -289,7 +299,31 @@ func (f *fileConfig) normalize() (Config, error) {
 		return Config{}, fmt.Errorf("fleet.cloud_url must not be empty when fleet.enabled is true")
 	}
 
+	if err := validateSiteHealth(cfg.SiteHealth); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+func normalizeSiteHealth(cfg SiteHealthConfig) SiteHealthConfig {
+	if !cfg.Enabled {
+		return cfg
+	}
+	return SiteHealthConfig{
+		Enabled:    true,
+		ListenAddr: defaultIfBlank(cfg.ListenAddr, DefaultSiteHealthListenAddr),
+	}
+}
+
+func validateSiteHealth(cfg SiteHealthConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(cfg.ListenAddr); err != nil {
+		return fmt.Errorf("site_health.listen_addr must be host:port: %w", err)
+	}
+	return nil
 }
 
 func normalizeGatewayDeviceIDs(deviceIDs []string) []string {

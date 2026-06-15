@@ -139,7 +139,6 @@ readiness and limit posture, but `ready` must reflect bridge-loop liveness rathe
 than static config. It must never expose target URLs, env var names, provider
 CIDR values, SMS body content, phone numbers, bearer tokens, or HMAC secrets.
 
-
 17. `GW-17` Runtime export clients must match runtime MQTT security posture.
 When `gateway.auth.enabled=true`, export requests must be HMAC-signed and
 export responses must be verified with current-or-previous gateway secrets.
@@ -157,13 +156,22 @@ are represented only as a count (`ActiveTriggerCount int`) to prevent trigger-na
 strings from leaking. `GatewayView` must not contain target URLs, MQTT URLs, env
 var names, bearer tokens, HMAC secrets, phone numbers, or filesystem paths.
 Consumers depend on the `site.Viewer` interface, not on MQTT or registry internals.
+The optional `site_health` HTTP server (`HealthHandler`) exposes `GET /health`
+on a loopback address (default `127.0.0.1:8765`) and must not appear in the
+JSON output. When `site_health.enabled=false`, no socket is opened and no goroutine
+is started.
 Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestProjectSiteHealthStaleNode`, `TestProjectSiteHealthMissingNode`,
 `TestProjectSiteHealthGatewayDegradedStatus`,
 `TestProjectSiteHealthDisabledWebhookBridgeIsInert`,
 `TestProjectSiteHealthActiveTriggerCountNotStrings`,
-`TestProjectSiteHealthNoSecretsOrURLsInJSON`, and
-`TestProjectSiteHealthFutureDatedNodeIsStale`.
+`TestProjectSiteHealthNoSecretsOrURLsInJSON`,
+`TestProjectSiteHealthFutureDatedNodeIsStale`,
+`TestHealthHandlerGETReturnsJSON`, `TestHealthHandlerMethodNotAllowed`,
+`TestHealthHandlerProjectionStatusInBody`, `TestHealthHandlerNoSecretsInResponse`,
+`TestHealthHandlerRunStartsAndStopsCleanly`, `TestHealthHandlerRunBindFailure`,
+`TestGatewaySiteHealthServerStartsWhenEnabled`, and
+`TestGatewaySiteHealthDisabledDoesNotStartServer`.
 
 ## Layout
 

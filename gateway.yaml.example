@@ -61,3 +61,7 @@ sim:
 fleet:
   enabled: false
   cloud_url: ""
+
+site_health:
+  enabled: false
+  listen_addr: "127.0.0.1:8765"

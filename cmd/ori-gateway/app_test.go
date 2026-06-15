@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -316,8 +318,9 @@ func validConfig() config.Config {
 			Name:      config.ProviderEcho,
 			TimeoutMS: 1000,
 		},
-		SIM:   config.SIMConfig{Enabled: false},
-		Fleet: config.FleetConfig{Enabled: false},
+		SIM:        config.SIMConfig{Enabled: false},
+		Fleet:      config.FleetConfig{Enabled: false},
+		SiteHealth: config.SiteHealthConfig{Enabled: false},
 	}
 }
 
@@ -1673,5 +1676,107 @@ func TestSupervisedRunnersDoneIsNilWhenNoRunners(t *testing.T) {
 	runners := newSupervisedRunners(context.Background())
 	if runners.done() != nil {
 		t.Fatal("empty runner group should not produce a selectable channel")
+	}
+}
+
+func TestGatewaySiteHealthServerStartsWhenEnabled(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close() // release so the gateway can bind it
+
+	cfg := validConfig()
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
+
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", baseDeps(t, cfg, fb, fp, hb)) }()
+
+	// wait for broker subscription then poll the health endpoint
+	select {
+	case <-fb.subscribed:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("gateway did not start")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Get("http://" + addr + "/health") //nolint:noctx
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		cancel()
+		t.Fatalf("site health server did not become ready: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var health map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		cancel()
+		t.Fatalf("invalid JSON from site health server: %v", err)
+	}
+	if _, ok := health["status"]; !ok {
+		cancel()
+		t.Fatal("site health response missing 'status' field")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not stop")
+	}
+}
+
+func TestGatewaySiteHealthDisabledDoesNotStartServer(t *testing.T) {
+	cfg := validConfig()
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: false}
+
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", baseDeps(t, cfg, fb, fp, hb)) }()
+
+	select {
+	case <-fb.subscribed:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("gateway did not start")
+	}
+
+	// default listen addr must not be in use
+	_, err := http.Get("http://" + config.DefaultSiteHealthListenAddr + "/health") //nolint:noctx
+	if err == nil {
+		cancel()
+		t.Fatal("site health server should not be listening when disabled")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not stop")
 	}
 }
