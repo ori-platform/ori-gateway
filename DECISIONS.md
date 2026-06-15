@@ -360,3 +360,116 @@ knowing which nodes are present, stale, or missing relative to a configured
 fleet — is a gateway responsibility. Keeping this projection in `internal/site`
 prevents it from being scattered across reporting, fleet, or heartbeat packages
 and makes the secrets boundary explicit and testable.
+
+---
+
+## 2026-06-15 — Weekly Report Delivery Architecture
+
+**Status:** Accepted
+
+Report delivery is separated from report generation via a narrow `Deliverer`
+interface so that new output channels can be added without touching generation
+or scheduling logic.
+
+Rules:
+
+- `Deliverer` has a single method: `Deliver(ctx, WeeklyReportArtifact) error`.
+  Implementations must not mutate the artifact.
+- `LogDeliverer` is always wired. It is the default when `RunnerOptions.Deliverers`
+  is empty and is explicitly prepended in `app.go` when wiring from config.
+- `FileDeliverer` is optional: it is added only when `output_dir` is a non-empty
+  absolute path in `reporting.weekly_report`. It never creates directories; the
+  operator must ensure the directory exists.
+- Delivery errors are advisory. The runner logs them at Warn level and continues
+  to the next schedule tick. A failed delivery must never stop the runner or
+  skip remaining deliverers in the same tick.
+- `WeeklyReportArtifact` is the only type exposed to `Deliverer` implementations.
+  It must not contain MQTT URLs, broker credentials, filesystem paths, phone
+  numbers, bearer tokens, HMAC secrets, or lockout risk details.
+- `output_dir` must be an absolute path with no `..` segments. Config validation
+  enforces this at load time. `FileDeliverer.Deliver` enforces the absolute-path
+  invariant again at call time as a defence-in-depth check.
+- The filename written by `FileDeliverer` is `weekly-{site_slug}-{YYYY-MM-DD}.json`
+  where the date is derived from `WindowEndMS` in UTC. The slug function lowercases
+  the site name and replaces non-alphanumeric characters with underscores,
+  collapsing consecutive underscores.
+
+Rationale:
+
+Separating generation from delivery keeps the `WeeklyReportRunner` testable
+without a filesystem and lets the file output channel be added or removed
+independently. Defaulting to `LogDeliverer` preserves existing behaviour for
+all callers that pre-date delivery config.
+
+---
+
+## 2026-06-15 — Weekly Report Delivery Config Shape
+
+**Status:** Accepted
+
+`reporting.weekly_report.delivery` is a nested block, not a flat field, because
+ori-cloud report persistence is the next backend and adding it later as a peer
+field (e.g. `output_dir` + `cloud_endpoint`) would produce an incoherent shape.
+
+Rules:
+
+- All delivery channels live under `weekly_report.delivery.*`.
+- `delivery.file` is the local operator artifact channel (disk write).
+- `delivery.cloud` is the ori-cloud persistence channel (HTTPS push).
+- `log` delivery is always active and requires no config.
+- Future channels (`email`, `webhook`) are added as sibling keys under
+  `delivery`, not as flat fields on `WeeklyReportConfig`.
+- The same `weeklyReportFilePayload` DTO (excluding DeviceID and Metadata) is
+  the canonical customer-safe payload shape for both file and cloud delivery.
+- `delivery.cloud.auth_env` holds only an environment variable name, never a
+  credential. The gateway resolves it at startup.
+- Cloud delivery returns "not yet implemented" at startup until the ori-cloud
+  ingest endpoint is built. The config shape and validation are already in place.
+
+Rationale:
+
+Establishing the nested shape before ori-cloud ships avoids a config migration
+later and makes the delivery model explicit: `log` is observability, `file` is
+a local debug artifact, `cloud` is the authoritative persistence path.
+
+---
+
+## 2026-06-15 — Site/Customer Identity is Provisional in Gateway Config
+
+**Status:** Accepted (provisional)
+
+`customer_name` and `site_name` in `reporting.weekly_report` are local display
+labels copied into the gateway config at install time. They are **not** the
+long-term identity authority and must not be used as persistence or routing keys.
+
+Rules:
+
+- `customer_name` and `site_name` are display labels only. They may appear in
+  report text and customer-facing file output. They must not be used as primary
+  keys for cloud storage, billing, or account lookup.
+- Ori-cloud is the authoritative fleet identity registry. It owns the canonical
+  mapping of gateway → site → customer → product/subscription.
+- When cloud delivery is wired, the gateway must authenticate to ori-cloud with
+  a gateway credential. Ori-cloud infers site and customer ownership from that
+  credential, not from the names in the report payload.
+- The `weeklyReportFilePayload` DTO may carry `customer_name` and `site_name`
+  as display labels in cloud-delivered payloads. They are advisory strings for
+  rendering, not authoritative identifiers.
+- The `fleet` module is the eventual channel for receiving canonical site profile
+  data from ori-cloud (site_id, customer_id, display names). Until that sync
+  exists, static config is acceptable for local/file delivery.
+
+Rationale:
+
+A gateway config typo in `customer_name` must not cause reports to be stored
+under the wrong customer in ori-cloud. Keying persistence on authenticated
+gateway identity (rather than human-readable names) prevents drift between
+what the operator typed and what ori-cloud has on record. This constraint must
+be respected when the cloud deliverer PR is designed.
+
+Deferred to cloud delivery PR:
+
+- Gateway registration / credential issuance model
+- Whether ori-cloud returns canonical display names at registration
+- Local cache of site profile for offline report generation
+- Cloud ingest endpoint contract and payload schema (site_id vs. auth-inferred)

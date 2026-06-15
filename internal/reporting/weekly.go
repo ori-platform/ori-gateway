@@ -81,8 +81,10 @@ type WeeklyReportRequest struct {
 }
 
 // WeeklyReportInput is the complete provider input built from runtime exports.
+// WeeklyReportInput is the customer-safe data bundle sent to the provider.
+// It deliberately excludes DeviceID and internal infrastructure identifiers;
+// customer context is conveyed through CustomerName and SiteName.
 type WeeklyReportInput struct {
-	DeviceID       string
 	CustomerName   string
 	SiteName       string
 	Timezone       string
@@ -96,9 +98,8 @@ type WeeklyReportInput struct {
 }
 
 // CustomerHealthSummary is the reporting-safe projection of runtime health.
-// It deliberately excludes operator identities and remote-command lockout details.
+// It deliberately excludes DeviceID, operator identities, and lockout details.
 type CustomerHealthSummary struct {
-	DeviceID             string
 	Status               string
 	LastReadingMS        int64
 	GatewaySeen          bool
@@ -220,7 +221,6 @@ func (g *WeeklyReportGenerator) Generate(ctx context.Context, req WeeklyReportRe
 	}
 
 	input := WeeklyReportInput{
-		DeviceID:       normalized.DeviceID,
 		CustomerName:   normalized.CustomerName,
 		SiteName:       normalized.SiteName,
 		Timezone:       normalized.Timezone,
@@ -315,7 +315,6 @@ func (g *WeeklyReportGenerator) normalizeRequest(req WeeklyReportRequest, now ti
 
 func summarizeHealth(health runtimeclient.HealthSnapshot) CustomerHealthSummary {
 	return CustomerHealthSummary{
-		DeviceID:             health.DeviceID,
 		Status:               health.Status,
 		LastReadingMS:        health.LastReadingMS,
 		GatewaySeen:          health.GatewaySeen,

@@ -38,19 +38,21 @@ func NewSchedule(day string, clock string, timezone string) (Schedule, error) {
 
 // RunnerOptions configures WeeklyReportRunner.
 type RunnerOptions struct {
-	Logger *slog.Logger
-	Now    func() time.Time
-	After  func(time.Duration) <-chan time.Time
+	Logger     *slog.Logger
+	Now        func() time.Time
+	After      func(time.Duration) <-chan time.Time
+	Deliverers []Deliverer
 }
 
 // WeeklyReportRunner supervises scheduled report generation.
 type WeeklyReportRunner struct {
-	generator *WeeklyReportGenerator
-	request   WeeklyReportRequest
-	schedule  Schedule
-	logger    *slog.Logger
-	now       func() time.Time
-	after     func(time.Duration) <-chan time.Time
+	generator  *WeeklyReportGenerator
+	request    WeeklyReportRequest
+	schedule   Schedule
+	logger     *slog.Logger
+	now        func() time.Time
+	after      func(time.Duration) <-chan time.Time
+	deliverers []Deliverer
 }
 
 // NewWeeklyReportRunner constructs a scheduled report runner.
@@ -73,7 +75,24 @@ func NewWeeklyReportRunner(generator *WeeklyReportGenerator, request WeeklyRepor
 	if after == nil {
 		after = time.After
 	}
-	return &WeeklyReportRunner{generator: generator, request: request, schedule: schedule, logger: logger, now: now, after: after}, nil
+	deliverers := opts.Deliverers
+	if len(deliverers) == 0 {
+		deliverers = []Deliverer{&LogDeliverer{Logger: logger}}
+	}
+	for i, d := range deliverers {
+		if d == nil {
+			return nil, fmt.Errorf("reporting: deliverer at index %d must not be nil", i)
+		}
+	}
+	return &WeeklyReportRunner{
+		generator:  generator,
+		request:    request,
+		schedule:   schedule,
+		logger:     logger,
+		now:        now,
+		after:      after,
+		deliverers: deliverers,
+	}, nil
 }
 
 // Run generates reports on the configured weekly schedule until ctx is canceled.
@@ -97,18 +116,11 @@ func (r *WeeklyReportRunner) Run(ctx context.Context) error {
 			r.logger.Warn("weekly report generation failed", "device_id", r.request.DeviceID, "error", err)
 			continue
 		}
-		r.logger.Info(
-			"weekly report generated",
-			"device_id", artifact.DeviceID,
-			"provider", artifact.Provider,
-			"model", artifact.Model,
-			"sensor_rows", artifact.SensorRowCount,
-			"actions", artifact.ActionCount,
-			"tier_c_decisions", artifact.TierCDecisionCount,
-			"tokens", artifact.Tokens,
-			"latency_ms", artifact.LatencyMS,
-			"warnings", len(artifact.Warnings),
-		)
+		for _, d := range r.deliverers {
+			if err := d.Deliver(ctx, artifact); err != nil {
+				r.logger.Warn("weekly report delivery failed", "device_id", artifact.DeviceID, "error", err)
+			}
+		}
 	}
 }
 

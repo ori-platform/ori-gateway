@@ -37,6 +37,17 @@ reporting:
     sensor_ids: ["current-main"]
     customer_name: ""
     site_name: ""
+    delivery:
+      file:
+        enabled: false
+        path: ""  # absolute path to write weekly-{slug}-{date}.json files
+      cloud:
+        # Reserved — cloud delivery is not yet implemented. Setting enabled: true
+        # will prevent the gateway from starting until the ori-cloud ingest
+        # endpoint is wired. Leave disabled until that release.
+        enabled: false
+        endpoint: ""  # https URL of the ori-cloud report ingest endpoint
+        auth_env: ""  # env var name holding the ori-cloud API key
   tier_c_enrichment:
     enabled: false
 

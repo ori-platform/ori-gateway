@@ -1629,6 +1629,128 @@ func TestGatewayWeeklyReportRuntimeClientFailureStopsStartup(t *testing.T) {
 	}
 }
 
+func TestGatewayWeeklyReportWiresFileDelivererWhenOutputDirSet(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	outputDir := t.TempDir()
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider: config.ReportingProviderGemini,
+		Gemini:   config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{
+			Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos",
+			DeviceID: "site-a", SensorIDs: []string{"current-main"},
+			Delivery: config.WeeklyReportDeliveryConfig{
+				File: config.WeeklyReportFileDeliveryConfig{Enabled: true, Path: outputDir},
+			},
+		},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	weeklyRunner := newFakeWeeklyReportRunner()
+	var capturedDeliverers []reporting.Deliverer
+	deps.newWeeklyReportRunner = func(_ *reporting.WeeklyReportGenerator, _ reporting.WeeklyReportRequest, _ reporting.Schedule, opts reporting.RunnerOptions) (weeklyReportRunner, error) {
+		capturedDeliverers = opts.Deliverers
+		return weeklyRunner, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("runGateway returned unexpected error: %v", err)
+	}
+
+	if len(capturedDeliverers) != 2 {
+		t.Fatalf("expected 2 deliverers (log + file), got %d", len(capturedDeliverers))
+	}
+	if _, ok := capturedDeliverers[0].(*reporting.LogDeliverer); !ok {
+		t.Errorf("expected first deliverer to be *reporting.LogDeliverer, got %T", capturedDeliverers[0])
+	}
+	fd, ok := capturedDeliverers[1].(*reporting.FileDeliverer)
+	if !ok {
+		t.Fatalf("expected second deliverer to be *reporting.FileDeliverer, got %T", capturedDeliverers[1])
+	}
+	if fd.Dir != outputDir {
+		t.Errorf("FileDeliverer.Dir = %q, want %q", fd.Dir, outputDir)
+	}
+}
+
+func TestGatewayWeeklyReportMissingOutputDirStopsStartup(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider: config.ReportingProviderGemini,
+		Gemini:   config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{
+			Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos",
+			DeviceID: "site-a", SensorIDs: []string{"current-main"},
+			Delivery: config.WeeklyReportDeliveryConfig{
+				File: config.WeeklyReportFileDeliveryConfig{Enabled: true, Path: "/nonexistent/path/that/does/not/exist"},
+			},
+		},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+
+	err := runGateway(context.Background(), "gateway.yaml", deps)
+	if err == nil || !strings.Contains(err.Error(), "weekly report file deliverer") {
+		t.Fatalf("expected file deliverer startup error, got: %v", err)
+	}
+}
+
+func TestGatewayWeeklyReportOnlyLogDelivererWhenNoOutputDir(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-key")
+	cfg := validConfig()
+	cfg.Reporting = config.ReportingConfig{
+		Provider: config.ReportingProviderGemini,
+		Gemini:   config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		WeeklyReport: config.WeeklyReportConfig{
+			Enabled: true, Day: "monday", Time: "08:00", Timezone: "Africa/Lagos",
+			DeviceID: "site-a", SensorIDs: []string{"current-main"},
+		},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	weeklyRunner := newFakeWeeklyReportRunner()
+	var capturedDeliverers []reporting.Deliverer
+	deps.newWeeklyReportRunner = func(_ *reporting.WeeklyReportGenerator, _ reporting.WeeklyReportRequest, _ reporting.Schedule, opts reporting.RunnerOptions) (weeklyReportRunner, error) {
+		capturedDeliverers = opts.Deliverers
+		return weeklyRunner, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("runGateway returned unexpected error: %v", err)
+	}
+
+	if len(capturedDeliverers) != 1 {
+		t.Fatalf("expected 1 deliverer (log only), got %d", len(capturedDeliverers))
+	}
+	if _, ok := capturedDeliverers[0].(*reporting.LogDeliverer); !ok {
+		t.Errorf("expected first deliverer to be *reporting.LogDeliverer, got %T", capturedDeliverers[0])
+	}
+}
+
 func TestSupervisedRunnersReportsRunnerErrors(t *testing.T) {
 	runners := newSupervisedRunners(context.Background())
 	wantErr := errors.New("boom")
