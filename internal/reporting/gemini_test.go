@@ -47,8 +47,8 @@ func TestGeminiProviderGeneratesWeeklyReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	report, err := provider.GenerateWeeklyReport(context.Background(), WeeklyReportInput{
-		DeviceID:     "edge-1",
 		CustomerName: "Customer",
+		SiteName:     "Site A",
 		SensorSeries: []SensorSeries{{SensorID: "current-main"}},
 	})
 	if err != nil {
@@ -60,7 +60,7 @@ func TestGeminiProviderGeneratesWeeklyReport(t *testing.T) {
 	if gotAPIKey != "secret-key" {
 		t.Fatal("API key header not sent")
 	}
-	if !strings.Contains(prompt, "Structured weekly input JSON") || !strings.Contains(prompt, "edge-1") {
+	if !strings.Contains(prompt, "Structured weekly input JSON") || !strings.Contains(prompt, "Site A") {
 		t.Fatalf("prompt missing structured input: %s", prompt)
 	}
 	if report.Text != "Weekly report text" || report.Provider != "gemini" || report.Model != "gemini-test" || report.Tokens != 15 {
@@ -80,7 +80,7 @@ func TestGeminiProviderHTTPErrorDoesNotLeakSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = provider.GenerateWeeklyReport(context.Background(), WeeklyReportInput{DeviceID: "edge-1"})
+	_, err = provider.GenerateWeeklyReport(context.Background(), WeeklyReportInput{SiteName: "Site A"})
 	if err == nil {
 		t.Fatal("expected HTTP error")
 	}

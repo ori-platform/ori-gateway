@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -104,14 +105,35 @@ type ReportingGeminiConfig struct {
 }
 
 type WeeklyReportConfig struct {
-	Enabled      bool     `yaml:"enabled"`
-	Day          string   `yaml:"day"`
-	Time         string   `yaml:"time"`
-	Timezone     string   `yaml:"timezone"`
-	DeviceID     string   `yaml:"device_id"`
-	SensorIDs    []string `yaml:"sensor_ids"`
-	CustomerName string   `yaml:"customer_name"`
-	SiteName     string   `yaml:"site_name"`
+	Enabled      bool                       `yaml:"enabled"`
+	Day          string                     `yaml:"day"`
+	Time         string                     `yaml:"time"`
+	Timezone     string                     `yaml:"timezone"`
+	DeviceID     string                     `yaml:"device_id"`
+	SensorIDs    []string                   `yaml:"sensor_ids"`
+	CustomerName string                     `yaml:"customer_name"`
+	SiteName     string                     `yaml:"site_name"`
+	Delivery     WeeklyReportDeliveryConfig `yaml:"delivery"`
+}
+
+// WeeklyReportDeliveryConfig configures the output channels for completed weekly reports.
+type WeeklyReportDeliveryConfig struct {
+	File  WeeklyReportFileDeliveryConfig  `yaml:"file"`
+	Cloud WeeklyReportCloudDeliveryConfig `yaml:"cloud"`
+}
+
+// WeeklyReportFileDeliveryConfig writes a customer-safe JSON artifact to a local directory.
+type WeeklyReportFileDeliveryConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
+}
+
+// WeeklyReportCloudDeliveryConfig pushes the customer-safe report payload to ori-cloud
+// for dashboard persistence. AuthEnv names the environment variable holding the API key.
+type WeeklyReportCloudDeliveryConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"`
+	AuthEnv  string `yaml:"auth_env"`
 }
 
 type TierCEnrichmentConfig struct {
@@ -552,6 +574,9 @@ func normalizeReportingStrings(reporting ReportingConfig) ReportingConfig {
 	reporting.WeeklyReport.DeviceID = strings.TrimSpace(reporting.WeeklyReport.DeviceID)
 	reporting.WeeklyReport.CustomerName = strings.TrimSpace(reporting.WeeklyReport.CustomerName)
 	reporting.WeeklyReport.SiteName = strings.TrimSpace(reporting.WeeklyReport.SiteName)
+	reporting.WeeklyReport.Delivery.File.Path = strings.TrimSpace(reporting.WeeklyReport.Delivery.File.Path)
+	reporting.WeeklyReport.Delivery.Cloud.Endpoint = strings.TrimSpace(reporting.WeeklyReport.Delivery.Cloud.Endpoint)
+	reporting.WeeklyReport.Delivery.Cloud.AuthEnv = strings.TrimSpace(reporting.WeeklyReport.Delivery.Cloud.AuthEnv)
 	for i := range reporting.WeeklyReport.SensorIDs {
 		reporting.WeeklyReport.SensorIDs[i] = strings.TrimSpace(reporting.WeeklyReport.SensorIDs[i])
 	}
@@ -617,6 +642,32 @@ func validateReporting(reporting ReportingConfig) error {
 		for _, sensorID := range reporting.WeeklyReport.SensorIDs {
 			if sensorID == "" {
 				return fmt.Errorf("reporting.weekly_report.sensor_ids must not contain empty values")
+			}
+		}
+		if reporting.WeeklyReport.Delivery.File.Enabled {
+			path := reporting.WeeklyReport.Delivery.File.Path
+			if path == "" {
+				return fmt.Errorf("reporting.weekly_report.delivery.file.path must not be empty when file delivery is enabled")
+			}
+			if !filepath.IsAbs(path) {
+				return fmt.Errorf("reporting.weekly_report.delivery.file.path must be an absolute path")
+			}
+			for _, segment := range strings.Split(path, "/") {
+				if segment == ".." {
+					return fmt.Errorf("reporting.weekly_report.delivery.file.path must not contain path traversal segments")
+				}
+			}
+		}
+		if reporting.WeeklyReport.Delivery.Cloud.Enabled {
+			if reporting.WeeklyReport.Delivery.Cloud.Endpoint == "" {
+				return fmt.Errorf("reporting.weekly_report.delivery.cloud.endpoint must not be empty when cloud delivery is enabled")
+			}
+			endpoint, err := url.Parse(reporting.WeeklyReport.Delivery.Cloud.Endpoint)
+			if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
+				return fmt.Errorf("reporting.weekly_report.delivery.cloud.endpoint must be an absolute https URL")
+			}
+			if err := validateEnvVarName("reporting.weekly_report.delivery.cloud.auth_env", reporting.WeeklyReport.Delivery.Cloud.AuthEnv); err != nil {
+				return err
 			}
 		}
 	}

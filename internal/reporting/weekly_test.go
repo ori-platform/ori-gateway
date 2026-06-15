@@ -166,7 +166,7 @@ func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 1", provider.calls)
 	}
 	input := provider.input
-	if input.DeviceID != "edge-1" || input.CustomerName != "Site A Ltd" || input.SiteName != "Site A" || input.Timezone != "Africa/Lagos" {
+	if input.CustomerName != "Site A Ltd" || input.SiteName != "Site A" || input.Timezone != "Africa/Lagos" {
 		t.Fatalf("unexpected provider input identity: %#v", input)
 	}
 	if len(input.SensorSeries) != 1 || input.SensorSeries[0].SensorID != "current-main" || input.SensorSeries[0].Rows[0].AvgValue != 4.2 {

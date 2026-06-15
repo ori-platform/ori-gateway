@@ -224,11 +224,22 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct weekly report schedule: %w", err)
 		}
+		deliverers := []reporting.Deliverer{&reporting.LogDeliverer{Logger: deps.logger}}
+		if cfg.Reporting.WeeklyReport.Delivery.File.Enabled {
+			fd, err := reporting.NewFileDeliverer(cfg.Reporting.WeeklyReport.Delivery.File.Path)
+			if err != nil {
+				return fmt.Errorf("weekly report file deliverer: %w", err)
+			}
+			deliverers = append(deliverers, fd)
+		}
+		if cfg.Reporting.WeeklyReport.Delivery.Cloud.Enabled {
+			return fmt.Errorf("weekly report cloud delivery is not yet implemented")
+		}
 		weeklyReport, err = deps.newWeeklyReportRunner(
 			weeklyGenerator,
 			weeklyReportRequestFromConfig(cfg.Reporting.WeeklyReport),
 			weeklySchedule,
-			reporting.RunnerOptions{Logger: deps.logger, Now: deps.now},
+			reporting.RunnerOptions{Logger: deps.logger, Now: deps.now, Deliverers: deliverers},
 		)
 		if err != nil {
 			return fmt.Errorf("construct weekly report runner: %w", err)
