@@ -160,6 +160,12 @@ The optional `site_health` HTTP server (`HealthHandler`) exposes `GET /health`
 on a loopback address (default `127.0.0.1:8765`) and must not appear in the
 JSON output. When `site_health.enabled=false`, no socket is opened and no goroutine
 is started.
+`internal/site` must never import `internal/runtimeclient`. Posture types are
+defined independently in `internal/site` (`SiteNodePosture`, `SiteNodeBrokerPosture`,
+`SiteNodeEncryptionPosture`, `SiteNodeAlertOutboxPosture`); mapping from
+`runtimeclient.HealthSnapshot` to `site.SiteNodePosture` is done exclusively in
+`cmd/ori-gateway/app.go` (`sitePostureFromHealth`). `LockoutRiskLevels` from the
+health snapshot is intentionally excluded — its map keys are phone numbers.
 Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestProjectSiteHealthStaleNode`, `TestProjectSiteHealthMissingNode`,
 `TestProjectSiteHealthGatewayDegradedStatus`,
@@ -167,11 +173,16 @@ Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestProjectSiteHealthActiveTriggerCountNotStrings`,
 `TestProjectSiteHealthNoSecretsOrURLsInJSON`,
 `TestProjectSiteHealthFutureDatedNodeIsStale`,
+`TestProjectSiteHealthNodePosturePassedThrough`,
+`TestProjectSiteHealthNodeWithNoPostureOmitsField`,
+`TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput`,
 `TestHealthHandlerGETReturnsJSON`, `TestHealthHandlerMethodNotAllowed`,
 `TestHealthHandlerProjectionStatusInBody`, `TestHealthHandlerNoSecretsInResponse`,
 `TestHealthHandlerRunStartsAndStopsCleanly`, `TestHealthHandlerRunBindFailure`,
-`TestGatewaySiteHealthServerStartsWhenEnabled`, and
-`TestGatewaySiteHealthDisabledDoesNotStartServer`.
+`TestGatewaySiteHealthServerStartsWhenEnabled`,
+`TestGatewaySiteHealthDisabledDoesNotStartServer`,
+`TestGatewaySiteHealthConstructsRuntimeClientForPosture`, and
+`TestGatewaySiteHealthPostureFetchedAfterHeartbeat`.
 
 ## Layout
 

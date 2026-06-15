@@ -473,3 +473,42 @@ Deferred to cloud delivery PR:
 - Whether ori-cloud returns canonical display names at registration
 - Local cache of site profile for offline report generation
 - Cloud ingest endpoint contract and payload schema (site_id vs. auth-inferred)
+
+---
+
+## 2026-06-15 — Site Node Runtime Posture Projection
+
+**Status:** Accepted
+
+`GET /health` exposes per-node runtime security posture (broker hardening,
+encryption-at-rest, alert outbox) fetched asynchronously after each accepted
+heartbeat.
+
+Rules:
+
+- `SiteNodePosture`, `SiteNodeBrokerPosture`, `SiteNodeEncryptionPosture`, and
+  `SiteNodeAlertOutboxPosture` are defined in `internal/site`, not imported from
+  `internal/runtimeclient`, to preserve the GW-18 zero-import invariant.
+- `LockoutRiskLevels` from `runtimeclient.HealthSnapshot` is intentionally
+  excluded. Its map keys are phone numbers (sender identities); they must never
+  appear in the projected output.
+- The mapping from `runtimeclient.HealthSnapshot` to `site.SiteNodePosture` is
+  done exclusively in `cmd/ori-gateway/app.go` (`sitePostureFromHealth`).
+- Posture is fetched in a fire-and-forget goroutine after the heartbeat handler
+  accepts a payload, provided no fetch for that device is already in flight
+  (per-device debounce via `postureDebouncer`). Posture is best-effort
+  enrichment — a failed health fetch only logs a warning and leaves the existing
+  posture unchanged.
+- `Registry.UpsertPosture` is a no-op for unregistered devices, preventing a
+  race where a health response arrives before the heartbeat that registers the node.
+- The runtime export client is constructed when either `site_health.enabled` or
+  `reporting.weekly_report.enabled` is true (hoisted from the weekly-report block).
+- `SiteNode.Posture` is `omitempty` — the field is absent from the JSON response
+  until the first successful health fetch for that node.
+
+Rationale:
+
+Posture data requires a separate runtime health call and must not block heartbeat
+handling or the site health response. The async pattern keeps the heartbeat path
+fast. Excluding `LockoutRiskLevels` structurally (not at serialization time)
+ensures it can never appear even through future refactors.

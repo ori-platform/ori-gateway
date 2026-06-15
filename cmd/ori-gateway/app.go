@@ -202,16 +202,20 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// includes fleet health fields.
 	_ = fleetClient
 
-	var weeklyReport weeklyReportRunner
-	if cfg.Reporting.WeeklyReport.Enabled {
+	var runtimeExportClient runtimeclient.Client
+	if cfg.Reporting.WeeklyReport.Enabled || cfg.SiteHealth.Enabled {
 		runtimeClientOptions, err := runtimeClientOptionsFromSecrets(cfg.Gateway.Encryption, gatewaySecrets, deps.now)
 		if err != nil {
 			return fmt.Errorf("construct runtime export client options: %w", err)
 		}
-		runtimeExportClient, err := deps.newRuntimeClient(client, runtimeClientOptions...)
+		runtimeExportClient, err = deps.newRuntimeClient(client, runtimeClientOptions...)
 		if err != nil {
 			return fmt.Errorf("construct runtime export client: %w", err)
 		}
+	}
+
+	var weeklyReport weeklyReportRunner
+	if cfg.Reporting.WeeklyReport.Enabled {
 		reportingProvider, err := deps.newReportingProvider(cfg.Reporting)
 		if err != nil {
 			return fmt.Errorf("construct reporting provider: %w", err)
@@ -336,6 +340,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return fmt.Errorf("subscribe reasoning requests: %w", err)
 	}
 
+	postureDebounce := newPostureDebouncer()
 	for _, deviceID := range cfg.Gateway.DeviceIDs {
 		topic, err := contracts.RuntimeNodeHeartbeatTopic(deviceID)
 		if err != nil {
@@ -345,6 +350,17 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err := client.Subscribe(runCtx, topic, broker.QoSHeartbeat, func(topic string, payload []byte) {
 			if err := runtimeHeartbeatHandler.Handle(topic, payload); err != nil {
 				deps.logger.Warn("runtime node heartbeat rejected", "topic", topic, "error", err)
+				return
+			}
+			if runtimeExportClient != nil {
+				if id, err := contracts.DeviceIDFromRuntimeNodeHeartbeatTopic(topic); err == nil {
+					if postureDebounce.tryStart(id) {
+						go func() {
+							defer postureDebounce.done(id)
+							fetchAndUpsertPosture(runCtx, runtimeExportClient, siteRegistry, id, deps.logger)
+						}()
+					}
+				}
 			}
 		}); err != nil {
 			shutdownRunners()
@@ -700,6 +716,87 @@ func (s staticProviderStatus) Healthy(ctx context.Context) bool {
 		return false
 	}
 	return s.healthy(ctx)
+}
+
+// postureDebouncer ensures at most one posture-fetch goroutine runs per device
+// at any time. Heartbeats that arrive while a fetch is already in flight are
+// skipped; the next heartbeat after the fetch completes will trigger a new one.
+type postureDebouncer struct {
+	mu       sync.Mutex
+	inflight map[string]bool
+}
+
+func newPostureDebouncer() *postureDebouncer {
+	return &postureDebouncer{inflight: make(map[string]bool)}
+}
+
+// tryStart marks deviceID as in-flight and returns true if no fetch was already
+// running. Returns false (and does nothing) if a fetch is already in flight.
+func (d *postureDebouncer) tryStart(deviceID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.inflight[deviceID] {
+		return false
+	}
+	d.inflight[deviceID] = true
+	return true
+}
+
+func (d *postureDebouncer) done(deviceID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.inflight, deviceID)
+}
+
+func fetchAndUpsertPosture(ctx context.Context, rc runtimeclient.Client, registry *site.Registry, deviceID string, logger *slog.Logger) {
+	snapshot, err := rc.Health(ctx, runtimeclient.HealthRequest{DeviceID: deviceID})
+	if err != nil {
+		logger.Warn("runtime health fetch failed for posture update", "device_id", deviceID, "error", err)
+		return
+	}
+	registry.UpsertPosture(deviceID, sitePostureFromHealth(snapshot))
+}
+
+func sitePostureFromHealth(h runtimeclient.HealthSnapshot) site.SiteNodePosture {
+	var posture site.SiteNodePosture
+	if h.GatewayBrokerPosture != nil {
+		b := h.GatewayBrokerPosture
+		posture.BrokerHardening = &site.SiteNodeBrokerPosture{
+			Available:             b.Available,
+			GatewayEnabled:        b.GatewayEnabled,
+			DeploymentCheck:       b.DeploymentCheck,
+			AnonymousAccess:       b.AnonymousAccess,
+			ACLPolicy:             b.ACLPolicy,
+			RequireCredentials:    b.RequireCredentials,
+			CredentialsConfigured: b.CredentialsConfigured,
+			RequiresACLHardening:  b.RequiresACLHardening,
+		}
+	}
+	if h.StateStoreEncryption != nil {
+		e := h.StateStoreEncryption
+		posture.Encryption = &site.SiteNodeEncryptionPosture{
+			Available:            e.Available,
+			Mode:                 e.Mode,
+			Satisfied:            e.Satisfied,
+			MarkerConfigured:     e.MarkerConfigured,
+			PathPrefixConfigured: e.PathPrefixConfigured,
+		}
+	}
+	if h.AlertOutbox != nil {
+		a := h.AlertOutbox
+		posture.AlertOutbox = &site.SiteNodeAlertOutboxPosture{
+			Available:                     a.Available,
+			BacklogCount:                  a.BacklogCount,
+			OldestQueuedOriginalMS:        a.OldestQueuedOriginalMS,
+			OldestQueuedAgeMS:             a.OldestQueuedAgeMS,
+			RetryIntervalMinutes:          a.RetryIntervalMinutes,
+			MaxNonTierDAttempts:           a.MaxNonTierDAttempts,
+			TierDCriticalWarningThreshold: a.TierDCriticalWarningThreshold,
+			BatchSize:                     a.BatchSize,
+		}
+	}
+	// h.LockoutRiskLevels intentionally excluded — keys are phone numbers.
+	return posture
 }
 
 func providerStatusFromProvider(reasoningProvider provider.Provider) heartbeat.ProviderStatus {
