@@ -142,6 +142,7 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 
 func runGateway(ctx context.Context, configPath string, deps appDependencies) error {
 	deps = normalizeDependencies(deps)
+	startedAt := deps.now()
 
 	cfg, err := deps.loadConfig(configPath)
 	if err != nil {
@@ -366,6 +367,29 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				return fmt.Errorf("subscribe tier c enrichment requests: %w", err)
 			}
 		}
+	}
+
+	if cfg.SiteHealth.Enabled {
+		siteProjector := site.NewProjector(siteRegistry, site.ProjectOptions{
+			ExpectedDeviceIDs: cfg.Gateway.DeviceIDs,
+			NodeTTLMS:         (3 * time.Duration(cfg.Gateway.HeartbeatIntervalS) * time.Second).Milliseconds(),
+		})
+		gatewayViewFn := func() site.GatewayView {
+			status := site.SiteStatusHealthy
+			if !providerStatus.Healthy(runCtx) {
+				status = site.SiteStatusDegraded
+			}
+			return site.GatewayView{
+				Status:               status,
+				ProviderName:         providerStatus.Name(),
+				UptimeS:              deps.now().Sub(startedAt).Seconds(),
+				WebhookBridgeEnabled: cfg.WebhookBridge.Enabled,
+				WebhookBridgeReady:   webhookBridgeReady.Load(),
+			}
+		}
+		runners.start("site health server", site.NewHealthHandler(
+			siteProjector, gatewayViewFn, cfg.SiteHealth.ListenAddr, deps.now,
+		).Run)
 	}
 
 	select {
