@@ -1902,3 +1902,296 @@ func TestGatewaySiteHealthDisabledDoesNotStartServer(t *testing.T) {
 		t.Fatal("gateway did not stop")
 	}
 }
+
+func TestGatewaySiteHealthConstructsRuntimeClientForPosture(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	cfg := validConfig()
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
+
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+
+	runtimeClientCalled := false
+	fakeRC := &runtimeclient.FakeClient{
+		HealthSnapshot: runtimeclient.HealthSnapshot{DeviceID: "dev-01"},
+	}
+	deps.newRuntimeClient = func(_ brokerClient, _ ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		runtimeClientCalled = true
+		return fakeRC, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("gateway did not subscribe")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	if !runtimeClientCalled {
+		t.Fatal("site health enabled: expected runtime client to be constructed")
+	}
+}
+
+func TestGatewaySiteHealthPostureFetchedAfterHeartbeat(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	cfg := validConfig()
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
+
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	registry := site.NewRegistry()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newSiteRegistry = func() *site.Registry { return registry }
+	deps.newRuntimeClient = func(_ brokerClient, _ ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		return &runtimeclient.FakeClient{
+			HealthSnapshot: runtimeclient.HealthSnapshot{
+				DeviceID: "dev-01",
+				GatewayBrokerPosture: &runtimeclient.GatewayBrokerPosture{
+					Available:            true,
+					RequiresACLHardening: true,
+				},
+				StateStoreEncryption: &runtimeclient.StateStoreEncryptionPosture{
+					Available: true,
+					Satisfied: true,
+				},
+			},
+		}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+
+	select {
+	case <-fb.subscribed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		handler = fb.handlerFor("ori/dev-01/runtime/heartbeat")
+		if handler != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing runtime heartbeat handler, got topics %v", fb.subscribeTopics)
+	}
+
+	payload, err := json.Marshal(contracts.RuntimeNodeHeartbeat{
+		DeviceID:       "dev-01",
+		Status:         site.NodeStatusHealthy,
+		LastSeenMS:     1_700_000_000_000,
+		ActiveTriggers: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler("ori/dev-01/runtime/heartbeat", payload)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := registry.Snapshot()
+		if len(snapshot) == 1 && snapshot[0].Posture != nil {
+			p := snapshot[0].Posture
+			if p.BrokerHardening == nil || !p.BrokerHardening.Available || !p.BrokerHardening.RequiresACLHardening {
+				t.Fatalf("broker hardening posture wrong: %#v", p.BrokerHardening)
+			}
+			if p.Encryption == nil || !p.Encryption.Available || !p.Encryption.Satisfied {
+				t.Fatalf("encryption posture wrong: %#v", p.Encryption)
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("runGateway returned error: %v", err)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("posture not set after heartbeat; registry: %#v", registry.Snapshot())
+}
+
+func TestPostureDebouncer(t *testing.T) {
+	d := newPostureDebouncer()
+
+	if !d.tryStart("dev-1") {
+		t.Fatal("first tryStart should succeed")
+	}
+	if d.tryStart("dev-1") {
+		t.Fatal("second tryStart while in-flight should be rejected")
+	}
+	// Independent device is unaffected.
+	if !d.tryStart("dev-2") {
+		t.Fatal("tryStart for a different device should succeed")
+	}
+
+	d.done("dev-1")
+	if !d.tryStart("dev-1") {
+		t.Fatal("tryStart after done should succeed")
+	}
+}
+
+func TestPostureDebouncerLimitsToOneGoroutinePerDevice(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	cfg := validConfig()
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
+
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	registry := site.NewRegistry()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newSiteRegistry = func() *site.Registry { return registry }
+
+	// Controlled fake: Health() blocks until unblocked, counting concurrent calls.
+	var (
+		healthMu      sync.Mutex
+		concurrentMax int
+		concurrent    int
+		unblock       = make(chan struct{})
+	)
+	deps.newRuntimeClient = func(_ brokerClient, _ ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		return &blockingHealthClient{
+			onHealth: func() {
+				healthMu.Lock()
+				concurrent++
+				if concurrent > concurrentMax {
+					concurrentMax = concurrent
+				}
+				healthMu.Unlock()
+				<-unblock
+				healthMu.Lock()
+				concurrent--
+				healthMu.Unlock()
+			},
+			snapshot: runtimeclient.HealthSnapshot{DeviceID: "dev-01"},
+		}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+
+	select {
+	case <-fb.subscribed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		handler = fb.handlerFor("ori/dev-01/runtime/heartbeat")
+		if handler != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing heartbeat handler")
+	}
+
+	payload, err := json.Marshal(contracts.RuntimeNodeHeartbeat{
+		DeviceID: "dev-01", Status: site.NodeStatusHealthy,
+		LastSeenMS: 1_700_000_000_000, ActiveTriggers: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire three heartbeats before the first health fetch can complete.
+	handler("ori/dev-01/runtime/heartbeat", payload)
+	handler("ori/dev-01/runtime/heartbeat", payload)
+	handler("ori/dev-01/runtime/heartbeat", payload)
+
+	// Give the goroutine(s) time to start and call Health().
+	time.Sleep(50 * time.Millisecond)
+
+	// Unblock all in-flight fetches and let them finish.
+	close(unblock)
+	time.Sleep(50 * time.Millisecond)
+
+	healthMu.Lock()
+	max := concurrentMax
+	healthMu.Unlock()
+
+	if max > 1 {
+		t.Errorf("debouncer allowed %d concurrent posture fetches for the same device, want 1", max)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not stop")
+	}
+}
+
+// blockingHealthClient is a runtimeclient.Client whose Health call invokes onHealth
+// (which may block) then returns the configured snapshot.
+type blockingHealthClient struct {
+	onHealth func()
+	snapshot runtimeclient.HealthSnapshot
+}
+
+func (c *blockingHealthClient) Health(_ context.Context, req runtimeclient.HealthRequest) (runtimeclient.HealthSnapshot, error) {
+	if _, err := runtimeclient.NormalizeHealthRequest(req); err != nil {
+		return runtimeclient.HealthSnapshot{}, err
+	}
+	if c.onHealth != nil {
+		c.onHealth()
+	}
+	return c.snapshot, nil
+}
+
+func (c *blockingHealthClient) SensorHistory(_ context.Context, _ runtimeclient.SensorHistoryRequest) ([]runtimeclient.SensorAggregate, error) {
+	return nil, nil
+}
+func (c *blockingHealthClient) ActionLog(_ context.Context, _ runtimeclient.ActionLogRequest) ([]runtimeclient.ActionLogEntry, error) {
+	return nil, nil
+}
+func (c *blockingHealthClient) TierCDecisionLog(_ context.Context, _ runtimeclient.TierCDecisionLogRequest) ([]runtimeclient.TierCDecisionEntry, error) {
+	return nil, nil
+}
+func (c *blockingHealthClient) ReasoningLog(_ context.Context, _ runtimeclient.ReasoningLogRequest) ([]runtimeclient.ReasoningLogEntry, error) {
+	return nil, nil
+}

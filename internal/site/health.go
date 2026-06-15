@@ -23,12 +23,56 @@ type SiteHealth struct {
 
 // SiteNode is a safe projection of one runtime node's observed registry state.
 type SiteNode struct {
-	DeviceID           string `json:"device_id"`
-	Status             string `json:"status"`
-	LastSeenMS         int64  `json:"last_seen_ms"`
-	GatewayObserved    bool   `json:"gateway_observed"`
-	Stale              bool   `json:"stale"`
-	ActiveTriggerCount int    `json:"active_trigger_count"`
+	DeviceID           string           `json:"device_id"`
+	Status             string           `json:"status"`
+	LastSeenMS         int64            `json:"last_seen_ms"`
+	GatewayObserved    bool             `json:"gateway_observed"`
+	Stale              bool             `json:"stale"`
+	ActiveTriggerCount int              `json:"active_trigger_count"`
+	Posture            *SiteNodePosture `json:"posture,omitempty"`
+}
+
+// SiteNodePosture carries the runtime security posture for a projected site node.
+// Defined independently of runtimeclient posture types to preserve the GW-18
+// zero-import invariant. LockoutRiskLevels is intentionally excluded — its keys
+// are phone numbers (sender identities) and must never appear in projected output.
+type SiteNodePosture struct {
+	BrokerHardening *SiteNodeBrokerPosture      `json:"broker_hardening,omitempty"`
+	Encryption      *SiteNodeEncryptionPosture  `json:"encryption,omitempty"`
+	AlertOutbox     *SiteNodeAlertOutboxPosture `json:"alert_outbox,omitempty"`
+}
+
+// SiteNodeBrokerPosture mirrors runtimeclient.GatewayBrokerPosture for the site projection.
+type SiteNodeBrokerPosture struct {
+	Available             bool   `json:"available"`
+	GatewayEnabled        bool   `json:"gateway_enabled"`
+	DeploymentCheck       string `json:"deployment_check"`
+	AnonymousAccess       string `json:"anonymous_access"`
+	ACLPolicy             string `json:"acl_policy"`
+	RequireCredentials    bool   `json:"require_credentials"`
+	CredentialsConfigured bool   `json:"credentials_configured"`
+	RequiresACLHardening  bool   `json:"requires_acl_hardening"`
+}
+
+// SiteNodeEncryptionPosture mirrors runtimeclient.StateStoreEncryptionPosture.
+type SiteNodeEncryptionPosture struct {
+	Available            bool   `json:"available"`
+	Mode                 string `json:"mode"`
+	Satisfied            bool   `json:"satisfied"`
+	MarkerConfigured     bool   `json:"marker_configured"`
+	PathPrefixConfigured bool   `json:"path_prefix_configured"`
+}
+
+// SiteNodeAlertOutboxPosture mirrors runtimeclient.AlertOutboxPosture.
+type SiteNodeAlertOutboxPosture struct {
+	Available                     bool    `json:"available"`
+	BacklogCount                  int     `json:"backlog_count"`
+	OldestQueuedOriginalMS        int64   `json:"oldest_queued_original_ts"`
+	OldestQueuedAgeMS             int64   `json:"oldest_queued_age_ms"`
+	RetryIntervalMinutes          float64 `json:"retry_interval_minutes"`
+	MaxNonTierDAttempts           int     `json:"max_non_tier_d_attempts"`
+	TierDCriticalWarningThreshold int     `json:"tier_d_critical_warning_threshold"`
+	BatchSize                     int     `json:"batch_size"`
 }
 
 // GatewayView carries the gateway's operational state contributed to a site health
@@ -101,6 +145,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			GatewayObserved:    true,
 			Stale:              stale,
 			ActiveTriggerCount: len(n.ActiveTriggers),
+			Posture:            n.Posture,
 		})
 	}
 

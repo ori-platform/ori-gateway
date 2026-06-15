@@ -164,6 +164,85 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+func TestUpsertPostureUpdatesExistingNode(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-1", Status: "ok", LastSeenMS: 100})
+
+	posture := SiteNodePosture{
+		BrokerHardening: &SiteNodeBrokerPosture{Available: true, RequiresACLHardening: true},
+	}
+	reg.UpsertPosture("node-1", posture)
+
+	snapshot := reg.Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("expected one node, got %d", len(snapshot))
+	}
+	if snapshot[0].Posture == nil {
+		t.Fatal("expected posture to be set")
+	}
+	if !snapshot[0].Posture.BrokerHardening.Available {
+		t.Error("broker hardening available should be true")
+	}
+	if !snapshot[0].Posture.BrokerHardening.RequiresACLHardening {
+		t.Error("requires_acl_hardening should be true")
+	}
+}
+
+func TestUpsertPostureIsNoOpForUnregisteredDevice(t *testing.T) {
+	reg := NewRegistry()
+	reg.UpsertPosture("ghost", SiteNodePosture{
+		BrokerHardening: &SiteNodeBrokerPosture{Available: true},
+	})
+	if snapshot := reg.Snapshot(); len(snapshot) != 0 {
+		t.Fatalf("UpsertPosture for unregistered device should not insert, got %d nodes", len(snapshot))
+	}
+}
+
+func TestUpsertPostureDoesNotClearOtherFields(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{
+		DeviceID:       "node-1",
+		Status:         "healthy",
+		LastSeenMS:     999,
+		ActiveTriggers: []string{"grid_low"},
+	})
+	reg.UpsertPosture("node-1", SiteNodePosture{
+		Encryption: &SiteNodeEncryptionPosture{Satisfied: true},
+	})
+
+	snapshot := reg.Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("expected one node, got %d", len(snapshot))
+	}
+	n := snapshot[0]
+	if n.Status != "healthy" || n.LastSeenMS != 999 || len(n.ActiveTriggers) != 1 {
+		t.Fatalf("UpsertPosture must not clear other fields: %#v", n)
+	}
+	if n.Posture == nil || n.Posture.Encryption == nil || !n.Posture.Encryption.Satisfied {
+		t.Fatalf("posture encryption not set: %#v", n.Posture)
+	}
+}
+
+func TestSnapshotPostureIsDeepCopied(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-1", Status: "ok", LastSeenMS: 100})
+	reg.UpsertPosture("node-1", SiteNodePosture{
+		BrokerHardening: &SiteNodeBrokerPosture{Available: true},
+	})
+
+	snap := reg.Snapshot()
+	if snap[0].Posture == nil || snap[0].Posture.BrokerHardening == nil {
+		t.Fatal("expected posture in snapshot")
+	}
+	// Mutate through the snapshot pointer — must not change registry state.
+	snap[0].Posture.BrokerHardening.Available = false
+
+	snap2 := reg.Snapshot()
+	if !snap2[0].Posture.BrokerHardening.Available {
+		t.Error("snapshot mutation leaked into registry: registry posture was changed")
+	}
+}
+
 func TestEvictStaleRemovesFutureDatedNode(t *testing.T) {
 	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{

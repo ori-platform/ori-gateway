@@ -310,6 +310,81 @@ func TestProjectSiteHealthNoExpectedNodes(t *testing.T) {
 	}
 }
 
+func TestProjectSiteHealthNodePosturePassedThrough(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
+	reg.UpsertPosture("node-a", SiteNodePosture{
+		BrokerHardening: &SiteNodeBrokerPosture{Available: true, RequiresACLHardening: true},
+		Encryption:      &SiteNodeEncryptionPosture{Available: true, Satisfied: true},
+	})
+
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000})
+	h := p.Project(time.UnixMilli(10000), healthyGateway())
+
+	if len(h.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(h.Nodes))
+	}
+	n := h.Nodes[0]
+	if n.Posture == nil {
+		t.Fatal("expected posture to be present in projected node")
+	}
+	if !n.Posture.BrokerHardening.Available || !n.Posture.BrokerHardening.RequiresACLHardening {
+		t.Errorf("broker hardening posture not projected correctly: %#v", n.Posture.BrokerHardening)
+	}
+	if !n.Posture.Encryption.Satisfied {
+		t.Errorf("encryption posture not projected correctly: %#v", n.Posture.Encryption)
+	}
+	if n.Posture.AlertOutbox != nil {
+		t.Errorf("alert outbox should be nil when not set: %#v", n.Posture.AlertOutbox)
+	}
+}
+
+func TestProjectSiteHealthNodeWithNoPostureOmitsField(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
+
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000})
+	h := p.Project(time.UnixMilli(10000), healthyGateway())
+
+	if len(h.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(h.Nodes))
+	}
+	if h.Nodes[0].Posture != nil {
+		t.Errorf("expected nil posture when not set, got %#v", h.Nodes[0].Posture)
+	}
+
+	encoded, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), `"posture"`) {
+		t.Errorf("posture field should be omitted from JSON when nil: %s", encoded)
+	}
+}
+
+func TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
+	reg.UpsertPosture("node-a", SiteNodePosture{
+		BrokerHardening: &SiteNodeBrokerPosture{Available: true},
+	})
+
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000})
+	h := p.Project(time.UnixMilli(10000), healthyGateway())
+
+	encoded, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// LockoutRiskLevels keys are phone numbers — must never appear.
+	forbidden := []string{"lockout_risk", "risk_level", "locked_out"}
+	for _, pattern := range forbidden {
+		if strings.Contains(strings.ToLower(string(encoded)), pattern) {
+			t.Errorf("SiteHealth JSON must not contain %q (lockout risk data): %s", pattern, encoded)
+		}
+	}
+}
+
 func TestSiteHealthViewerInterface(t *testing.T) {
 	reg := NewRegistry()
 	// Projector must satisfy the Viewer interface.
