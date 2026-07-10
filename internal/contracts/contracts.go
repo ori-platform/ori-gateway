@@ -91,12 +91,23 @@ type WebhookBridgePosture struct {
 
 // RuntimeNodeHeartbeat is published by each runtime on ori/{device_id}/runtime/heartbeat.
 type RuntimeNodeHeartbeat struct {
-	DeviceID       string         `json:"device_id"`
-	Status         string         `json:"status"`
-	LastSeenMS     int64          `json:"last_seen_ms"`
-	GatewaySeenMS  int64          `json:"gateway_seen_ms"`
-	ActiveTriggers []string       `json:"active_triggers"`
-	Auth           *HeartbeatAuth `json:"auth,omitempty"`
+	DeviceID       string                        `json:"device_id"`
+	Status         string                        `json:"status"`
+	LastSeenMS     int64                         `json:"last_seen_ms"`
+	GatewaySeenMS  int64                         `json:"gateway_seen_ms"`
+	ActiveTriggers []string                      `json:"active_triggers"`
+	Evidence       *RuntimeNodeHeartbeatEvidence `json:"evidence,omitempty"`
+	Auth           *HeartbeatAuth                `json:"auth,omitempty"`
+}
+
+// RuntimeNodeHeartbeatEvidence is the evidence-chain truncation signal a
+// runtime includes in its node heartbeat when evidence signing is enabled.
+// The heartbeat is a signal, not the archive: the locally persisted chain
+// on the device remains the evidence object.
+type RuntimeNodeHeartbeatEvidence struct {
+	ChainHeadHash       string `json:"chain_head_hash"`
+	AttestationGapCount int    `json:"attestation_gap_count"`
+	Available           bool   `json:"available"`
 }
 
 func RequestTopic(deviceID string) (string, error) {

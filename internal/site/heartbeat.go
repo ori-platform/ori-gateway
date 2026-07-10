@@ -82,12 +82,21 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 	if err := h.validate(deviceID, beat); err != nil {
 		return err
 	}
+	var evidence *NodeEvidence
+	if beat.Evidence != nil {
+		evidence = &NodeEvidence{
+			ChainHeadHash:       beat.Evidence.ChainHeadHash,
+			AttestationGapCount: beat.Evidence.AttestationGapCount,
+			Available:           beat.Evidence.Available,
+		}
+	}
 	h.registry.Upsert(NodeHeartbeat{
 		DeviceID:       beat.DeviceID,
 		Status:         beat.Status,
 		LastSeenMS:     beat.LastSeenMS,
 		GatewaySeen:    h.now().UnixMilli(),
 		ActiveTriggers: append([]string(nil), beat.ActiveTriggers...),
+		Evidence:       evidence,
 	})
 	return nil
 }
@@ -135,6 +144,31 @@ func (h *RuntimeHeartbeatHandler) validate(topicDeviceID string, beat contracts.
 		if len(trigger) > maxActiveTriggerLength {
 			return fmt.Errorf("runtime heartbeat active trigger name exceeds %d bytes", maxActiveTriggerLength)
 		}
+	}
+	if beat.Evidence != nil {
+		if err := validateEvidenceSignal(*beat.Evidence); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateEvidenceSignal bounds the evidence block: the chain head is either
+// empty (no events yet / chain unavailable) or a 64-char lowercase SHA-256
+// hex digest, and the gap count is non-negative.
+func validateEvidenceSignal(e contracts.RuntimeNodeHeartbeatEvidence) error {
+	if e.ChainHeadHash != "" {
+		if len(e.ChainHeadHash) != 64 {
+			return fmt.Errorf("runtime heartbeat evidence chain_head_hash must be 64 hex chars or empty")
+		}
+		for _, c := range e.ChainHeadHash {
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				return fmt.Errorf("runtime heartbeat evidence chain_head_hash must be lowercase hex")
+			}
+		}
+	}
+	if e.AttestationGapCount < 0 {
+		return fmt.Errorf("runtime heartbeat evidence attestation_gap_count must be >= 0")
 	}
 	return nil
 }
