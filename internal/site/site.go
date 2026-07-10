@@ -12,15 +12,22 @@ type NodeHeartbeat struct {
 	GatewaySeen    int64            `json:"gateway_seen_ms"`
 	ActiveTriggers []string         `json:"active_triggers"`
 	Posture        *SiteNodePosture `json:"posture,omitempty"`
+	Evidence       *NodeEvidence    `json:"evidence,omitempty"`
 }
 
 type Registry struct {
 	mu    sync.Mutex
 	nodes map[string]NodeHeartbeat
+	// evidence outlives individual heartbeats: it remembers recent chain
+	// heads per device so truncation/rollback stays detectable and sticky.
+	evidence map[string]*evidenceTrack
 }
 
 func NewRegistry() *Registry {
-	return &Registry{nodes: map[string]NodeHeartbeat{}}
+	return &Registry{
+		nodes:    map[string]NodeHeartbeat{},
+		evidence: map[string]*evidenceTrack{},
+	}
 }
 
 func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
@@ -29,6 +36,21 @@ func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if heartbeat.Evidence != nil {
+		track, ok := r.evidence[heartbeat.DeviceID]
+		if !ok {
+			track = &evidenceTrack{}
+			r.evidence[heartbeat.DeviceID] = track
+		}
+		enriched := track.observe(*heartbeat.Evidence)
+		heartbeat.Evidence = &enriched
+	} else if track, ok := r.evidence[heartbeat.DeviceID]; ok {
+		// Evidence omitted by a device with evidence history: keep the
+		// evidence surface with Available=false so the projection degrades
+		// instead of silently forgetting the chain.
+		missing := track.observeMissing()
+		heartbeat.Evidence = &missing
+	}
 	r.nodes[heartbeat.DeviceID] = heartbeat
 }
 
@@ -38,6 +60,10 @@ func (r *Registry) Snapshot() []NodeHeartbeat {
 	out := make([]NodeHeartbeat, 0, len(r.nodes))
 	for _, hb := range r.nodes {
 		hb.Posture = cloneSiteNodePosture(hb.Posture)
+		if hb.Evidence != nil {
+			e := *hb.Evidence
+			hb.Evidence = &e
+		}
 		out = append(out, hb)
 	}
 	return out
@@ -88,6 +114,7 @@ func (r *Registry) EvictStale(nowMS, ttlMS int64) []NodeHeartbeat {
 		if heartbeat.LastSeenMS > nowMS || nowMS-heartbeat.LastSeenMS > ttlMS {
 			evicted = append(evicted, heartbeat)
 			delete(r.nodes, deviceID)
+			delete(r.evidence, deviceID)
 		}
 	}
 	return evicted

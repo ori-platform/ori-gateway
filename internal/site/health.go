@@ -30,6 +30,10 @@ type SiteNode struct {
 	Stale              bool             `json:"stale"`
 	ActiveTriggerCount int              `json:"active_trigger_count"`
 	Posture            *SiteNodePosture `json:"posture,omitempty"`
+	// Evidence carries the node's chain signal plus gateway-side integrity
+	// observations. A chain head hash is not a secret; no device paths or
+	// key material appear here.
+	Evidence *NodeEvidence `json:"evidence,omitempty"`
 }
 
 // SiteNodePosture carries the runtime security posture for a projected site node.
@@ -138,6 +142,15 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 		if stale || n.Status == NodeStatusDegraded {
 			status = SiteStatusDegraded
 		}
+		// An evidence-integrity problem degrades the node: a truncated or
+		// rolled-back chain, or signing reported unavailable while evidence
+		// is enabled, means Tier C/D actions are accumulating without
+		// verifiable attestation. Gap count alone stays informational —
+		// transient signing failures repair via runtime reconciliation.
+		if n.Evidence != nil &&
+			(n.Evidence.TruncationSuspected || n.Evidence.HeadRegressed || !n.Evidence.Available) {
+			status = SiteStatusDegraded
+		}
 		nodes = append(nodes, SiteNode{
 			DeviceID:           deviceID,
 			Status:             status,
@@ -146,6 +159,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			Stale:              stale,
 			ActiveTriggerCount: len(n.ActiveTriggers),
 			Posture:            n.Posture,
+			Evidence:           n.Evidence,
 		})
 	}
 

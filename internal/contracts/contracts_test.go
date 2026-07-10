@@ -230,6 +230,7 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 		{"testdata/reasoning_error_response.json", &ReasoningResponse{}},
 		{"testdata/heartbeat.json", &Heartbeat{}},
 		{"testdata/runtime_node_heartbeat.json", &RuntimeNodeHeartbeat{}},
+		{"testdata/runtime_node_heartbeat_evidence.json", &RuntimeNodeHeartbeat{}},
 		{"testdata/tier_c_enrichment_request.json", &TierCEnrichmentRequest{}},
 		{"testdata/tier_c_enrichment_response.json", &TierCEnrichmentResponse{}},
 		{"testdata/tier_c_enrichment_error_response.json", &TierCEnrichmentResponse{}},
