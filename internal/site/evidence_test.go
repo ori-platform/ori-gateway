@@ -129,6 +129,9 @@ func TestRegistryEvidenceOmissionAfterHistoryMarksUnavailable(t *testing.T) {
 	if got.Available {
 		t.Fatalf("omitted evidence must report Available=false: %#v", got)
 	}
+	if got.ActionEventType != "" {
+		t.Fatalf("omitted evidence must not advertise a vocabulary: %#v", got)
+	}
 	if got.ChainHeadHash != headHash(1) {
 		t.Fatalf("last known head must be preserved: %#v", got)
 	}
@@ -181,6 +184,7 @@ func TestRuntimeHeartbeatHandlerAcceptsAndValidatesEvidence(t *testing.T) {
 			ChainHeadHash:       headHash(1),
 			AttestationGapCount: 2,
 			Available:           true,
+			ActionEventType:     "SAFETY_ACTION_EXECUTED",
 		},
 	})
 	if err := handler.Handle("ori/dev-01/runtime/heartbeat", valid); err != nil {
@@ -190,11 +194,32 @@ func TestRuntimeHeartbeatHandlerAcceptsAndValidatesEvidence(t *testing.T) {
 	if got == nil || got.ChainHeadHash != headHash(1) || got.AttestationGapCount != 2 || !got.Available {
 		t.Fatalf("evidence not propagated: %#v", got)
 	}
+	if got.ActionEventType != "SAFETY_ACTION_EXECUTED" {
+		t.Fatalf("action_event_type not propagated: %#v", got)
+	}
+
+	// The vocabulary may grow without a gateway release: any bounded
+	// SCREAMING_SNAKE_CASE name is accepted, known or not.
+	future := runtimeHeartbeatPayload(t, contracts.RuntimeNodeHeartbeat{
+		DeviceID:   "dev-01",
+		Status:     NodeStatusHealthy,
+		LastSeenMS: 1234567890000,
+		Evidence: &contracts.RuntimeNodeHeartbeatEvidence{
+			ChainHeadHash:   headHash(2),
+			Available:       true,
+			ActionEventType: "FUTURE_VOCABULARY_TYPE",
+		},
+	})
+	if err := handler.Handle("ori/dev-01/runtime/heartbeat", future); err != nil {
+		t.Fatalf("unknown well-formed vocabulary must be accepted: %v", err)
+	}
 
 	for name, evidence := range map[string]contracts.RuntimeNodeHeartbeatEvidence{
-		"short hash":    {ChainHeadHash: "abc123"},
-		"uppercase hex": {ChainHeadHash: strings.ToUpper(headHash(1))},
-		"negative gaps": {ChainHeadHash: headHash(1), AttestationGapCount: -1},
+		"short hash":     {ChainHeadHash: "abc123"},
+		"uppercase hex":  {ChainHeadHash: strings.ToUpper(headHash(1))},
+		"negative gaps":  {ChainHeadHash: headHash(1), AttestationGapCount: -1},
+		"lowercase type": {ActionEventType: "safety_action_executed"},
+		"oversized type": {ActionEventType: strings.Repeat("A", 65)},
 	} {
 		payload := runtimeHeartbeatPayload(t, contracts.RuntimeNodeHeartbeat{
 			DeviceID:   "dev-01",

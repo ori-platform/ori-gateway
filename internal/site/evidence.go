@@ -22,6 +22,10 @@ type NodeEvidence struct {
 	ChainHeadHash       string `json:"chain_head_hash"`
 	AttestationGapCount int    `json:"attestation_gap_count"`
 	Available           bool   `json:"available"`
+	// ActionEventType is the emission vocabulary the device reported for
+	// new Tier C/D attestations ("" while signing is unavailable).
+	// Informational: it never affects degradation.
+	ActionEventType     string `json:"action_event_type"`
 	TruncationSuspected bool   `json:"truncation_suspected"`
 	HeadRegressed       bool   `json:"head_regressed"`
 }

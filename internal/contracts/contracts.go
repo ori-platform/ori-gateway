@@ -108,6 +108,11 @@ type RuntimeNodeHeartbeatEvidence struct {
 	ChainHeadHash       string `json:"chain_head_hash"`
 	AttestationGapCount int    `json:"attestation_gap_count"`
 	Available           bool   `json:"available"`
+	// ActionEventType is the chain event type the device emits for new
+	// Tier C/D attestations ("" while signing is unavailable). Lets a
+	// mixed-fleet vocabulary rollout be confirmed per device before the
+	// first Tier C/D action fires.
+	ActionEventType string `json:"action_event_type"`
 }
 
 func RequestTopic(deviceID string) (string, error) {

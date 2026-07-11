@@ -20,6 +20,7 @@ const (
 
 	defaultMaxActiveTriggers = 64
 	maxActiveTriggerLength   = 128
+	maxActionEventTypeLength = 64
 	defaultMaxFutureSkew     = 5 * time.Minute
 )
 
@@ -88,6 +89,7 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 			ChainHeadHash:       beat.Evidence.ChainHeadHash,
 			AttestationGapCount: beat.Evidence.AttestationGapCount,
 			Available:           beat.Evidence.Available,
+			ActionEventType:     beat.Evidence.ActionEventType,
 		}
 	}
 	h.registry.Upsert(NodeHeartbeat{
@@ -169,6 +171,23 @@ func validateEvidenceSignal(e contracts.RuntimeNodeHeartbeatEvidence) error {
 	}
 	if e.AttestationGapCount < 0 {
 		return fmt.Errorf("runtime heartbeat evidence attestation_gap_count must be >= 0")
+	}
+	// The emission vocabulary is a chain event type wire name: empty
+	// (signing unavailable) or bounded SCREAMING_SNAKE_CASE. Unknown
+	// names are accepted — the vocabulary is allowed to grow without a
+	// gateway release — but arbitrary payloads are not.
+	if len(e.ActionEventType) > maxActionEventTypeLength {
+		return fmt.Errorf(
+			"runtime heartbeat evidence action_event_type exceeds %d bytes",
+			maxActionEventTypeLength,
+		)
+	}
+	for _, c := range e.ActionEventType {
+		if (c < 'A' || c > 'Z') && c != '_' {
+			return fmt.Errorf(
+				"runtime heartbeat evidence action_event_type must be empty or SCREAMING_SNAKE_CASE",
+			)
+		}
 	}
 	return nil
 }
