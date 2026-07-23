@@ -205,9 +205,13 @@ func TestFakeRuntimeDataClient(t *testing.T) {
 }
 
 func TestFakeRuntimeDataClientReturnsCopies(t *testing.T) {
+	attestationSeq := int64(42)
 	client := &FakeClient{
 		SensorHistoryRows: []SensorAggregate{{Metadata: map[string]any{"phase": "a"}}},
-		ActionLogRows:     []ActionLogEntry{{Result: map[string]any{"sent": true}}},
+		ActionLogRows: []ActionLogEntry{{
+			AttestationSeq: &attestationSeq,
+			Result:         map[string]any{"sent": true},
+		}},
 		TierCDecisionLogRows: []TierCDecisionEntry{{
 			HistoryWindow:     []HistorySample{{SensorID: "current-main", Value: 4.2}},
 			FinalActionResult: map[string]any{"relay": "open"},
@@ -232,6 +236,10 @@ func TestFakeRuntimeDataClientReturnsCopies(t *testing.T) {
 	actions[0].Result["sent"] = false
 	if got := client.ActionLogRows[0].Result["sent"]; got != true {
 		t.Fatalf("action result aliased into fake storage: %v", got)
+	}
+	*actions[0].AttestationSeq = 99
+	if got := *client.ActionLogRows[0].AttestationSeq; got != 42 {
+		t.Fatalf("action attestation sequence aliased into fake storage: %v", got)
 	}
 
 	decisions, err := client.TierCDecisionLog(context.Background(), TierCDecisionLogRequest{BoundedWindow: validWindow()})

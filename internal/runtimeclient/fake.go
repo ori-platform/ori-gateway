@@ -157,6 +157,10 @@ func copySensorAggregates(rows []SensorAggregate) []SensorAggregate {
 func copyActionLogEntries(rows []ActionLogEntry) []ActionLogEntry {
 	out := append([]ActionLogEntry(nil), rows...)
 	for i := range out {
+		if out[i].AttestationSeq != nil {
+			seq := *out[i].AttestationSeq
+			out[i].AttestationSeq = &seq
+		}
 		out[i].Result = copyMap(out[i].Result)
 	}
 	return out

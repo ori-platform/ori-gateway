@@ -85,11 +85,15 @@ func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 			Samples:  12,
 		}},
 		ActionLogRows: []runtimeclient.ActionLogEntry{{
-			DeviceID:    "edge-1",
-			CreatedAtMS: 1_799_900_000_000,
-			ActionName:  "alert_whatsapp",
-			Tier:        "A",
-			Success:     true,
+			DeviceID:              "edge-1",
+			CreatedAtMS:           1_799_900_000_000,
+			ActionName:            "alert_whatsapp",
+			Tier:                  "A",
+			Success:               true,
+			AttestationStatus:     "signed",
+			AttestationSeq:        int64Pointer(42),
+			InputAttestationGrade: "attested",
+			InputPosture:          "hardware_key",
 		}},
 		TierCDecisionLogRows: []runtimeclient.TierCDecisionEntry{{
 			DeviceID:         "edge-1",
@@ -175,6 +179,13 @@ func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 	if len(input.Actions) != 1 || len(input.TierCDecisions) != 1 || input.Health.Status != "healthy" {
 		t.Fatalf("runtime exports not attached: %#v", input)
 	}
+	action := input.Actions[0]
+	if action.AttestationStatus != "signed" || action.AttestationSeq == nil || *action.AttestationSeq != 42 {
+		t.Fatalf("action attestation fields not preserved for reporting: %#v", action)
+	}
+	if action.InputAttestationGrade != "attested" || action.InputPosture != "hardware_key" {
+		t.Fatalf("action input evidence fields not preserved for reporting: %#v", action)
+	}
 	if input.Health.LastReadingMS != 1_799_999_000_000 || input.Health.PolicyStatus != "active" {
 		t.Fatalf("safe health summary not attached: %#v", input.Health)
 	}
@@ -200,6 +211,10 @@ func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 	if !strings.Contains(string(inputJSON), "RequiresACLHardening") || !strings.Contains(string(inputJSON), "BacklogCount") {
 		t.Fatalf("provider input omitted safe posture fields: %s", inputJSON)
 	}
+}
+
+func int64Pointer(value int64) *int64 {
+	return &value
 }
 
 func TestWeeklyReportCallsReportingProvider(t *testing.T) {

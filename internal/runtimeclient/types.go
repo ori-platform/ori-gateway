@@ -129,16 +129,20 @@ type ActionLogRequest struct {
 
 // ActionLogEntry is a runtime action log row shaped for gateway reporting.
 type ActionLogEntry struct {
-	DeviceID        string
-	CreatedAtMS     int64
-	ActionName      string
-	Tier            string
-	SkillName       string
-	TriggerName     string
-	SensorType      string
-	SafeDefaultUsed bool
-	Success         bool
-	Result          map[string]any
+	DeviceID              string
+	CreatedAtMS           int64
+	ActionName            string
+	Tier                  string
+	SkillName             string
+	TriggerName           string
+	SensorType            string
+	SafeDefaultUsed       bool
+	Success               bool
+	AttestationStatus     string
+	AttestationSeq        *int64
+	InputAttestationGrade string
+	InputPosture          string
+	Result                map[string]any
 }
 
 // TierCDecisionLogRequest asks runtime for bounded Tier C approval history.

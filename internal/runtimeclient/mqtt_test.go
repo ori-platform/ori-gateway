@@ -334,14 +334,18 @@ func TestMQTTRuntimeClientActionLog(t *testing.T) {
 			"export_type": "action_log",
 			"complete":    true,
 			"items": []any{map[string]any{
-				"device_id":         "edge-1",
-				"timestamp":         float64(3000),
-				"action_name":       "alert_whatsapp",
-				"tier":              "A",
-				"trigger_name":      "overcurrent",
-				"sensor_type":       "current_clamp",
-				"safe_default_used": false,
-				"executed":          true,
+				"device_id":               "edge-1",
+				"timestamp":               float64(3000),
+				"action_name":             "alert_whatsapp",
+				"tier":                    "A",
+				"trigger_name":            "overcurrent",
+				"sensor_type":             "current_clamp",
+				"safe_default_used":       false,
+				"executed":                true,
+				"attestation_status":      "signed",
+				"attestation_seq":         float64(42),
+				"input_attestation_grade": "attested",
+				"input_posture":           "hardware_key",
 			}},
 		})
 	}
@@ -352,6 +356,43 @@ func TestMQTTRuntimeClientActionLog(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ActionName != "alert_whatsapp" || !rows[0].Success {
 		t.Fatalf("unexpected action rows: %#v", rows)
+	}
+	if rows[0].AttestationStatus != "signed" || rows[0].AttestationSeq == nil || *rows[0].AttestationSeq != 42 {
+		t.Fatalf("action attestation fields not mapped: %#v", rows[0])
+	}
+	if rows[0].InputAttestationGrade != "attested" || rows[0].InputPosture != "hardware_key" {
+		t.Fatalf("action input evidence fields not mapped: %#v", rows[0])
+	}
+}
+
+func TestMQTTRuntimeClientActionLogPreservesNullAttestationSequence(t *testing.T) {
+	b := newFakeBroker()
+	client := newTestMQTTClient(t, b, "actions-pending")
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Fatal(err)
+		}
+		b.respond(req.DeviceID, req.RequestID, map[string]any{
+			"export_type": "action_log",
+			"complete":    true,
+			"items": []any{map[string]any{
+				"device_id":          "edge-1",
+				"timestamp":          float64(3000),
+				"action_name":        "open_relay",
+				"tier":               "C",
+				"attestation_status": "pending",
+				"attestation_seq":    nil,
+			}},
+		})
+	}
+
+	rows, err := client.ActionLog(context.Background(), ActionLogRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, Limit: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].AttestationStatus != "pending" || rows[0].AttestationSeq != nil {
+		t.Fatalf("null attestation sequence not preserved: %#v", rows)
 	}
 }
 
