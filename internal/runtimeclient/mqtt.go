@@ -661,16 +661,20 @@ func mapSensorAggregate(item map[string]any, fallbackDeviceID string, fallbackSe
 
 func mapActionLogEntry(item map[string]any, fallbackDeviceID string) ActionLogEntry {
 	return ActionLogEntry{
-		DeviceID:        stringValue(item, "device_id", fallbackDeviceID),
-		CreatedAtMS:     int64Value(item, "timestamp"),
-		ActionName:      stringValue(item, "action_name", ""),
-		Tier:            stringValue(item, "tier", ""),
-		SkillName:       stringValue(item, "skill_name", ""),
-		TriggerName:     stringValue(item, "trigger_name", ""),
-		SensorType:      stringValue(item, "sensor_type", ""),
-		SafeDefaultUsed: boolValue(item, "safe_default_used"),
-		Success:         boolValue(item, "executed"),
-		Result:          mapValue(item, "result"),
+		DeviceID:              stringValue(item, "device_id", fallbackDeviceID),
+		CreatedAtMS:           int64Value(item, "timestamp"),
+		ActionName:            stringValue(item, "action_name", ""),
+		Tier:                  stringValue(item, "tier", ""),
+		SkillName:             stringValue(item, "skill_name", ""),
+		TriggerName:           stringValue(item, "trigger_name", ""),
+		SensorType:            stringValue(item, "sensor_type", ""),
+		SafeDefaultUsed:       boolValue(item, "safe_default_used"),
+		Success:               boolValue(item, "executed"),
+		AttestationStatus:     stringValue(item, "attestation_status", ""),
+		AttestationSeq:        optionalInt64Value(item, "attestation_seq"),
+		InputAttestationGrade: stringValue(item, "input_attestation_grade", ""),
+		InputPosture:          stringValue(item, "input_posture", ""),
+		Result:                mapValue(item, "result"),
 	}
 }
 
@@ -862,6 +866,15 @@ func int64Value(m map[string]any, key string, fallback ...int64) int64 {
 		}
 	}
 	return def
+}
+
+func optionalInt64Value(m map[string]any, key string) *int64 {
+	value, ok := m[key]
+	if !ok || value == nil {
+		return nil
+	}
+	parsed := int64Value(m, key)
+	return &parsed
 }
 
 func floatValue(m map[string]any, key string) float64 {
