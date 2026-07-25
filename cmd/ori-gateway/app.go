@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,8 +125,13 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	flags := flag.NewFlagSet("ori-gateway", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", defaultConfigPath, "path to gateway.yaml")
+	showVersion := flags.Bool("version", false, "print version and build provenance, then exit")
 	if err := flags.Parse(args); err != nil {
 		return 2
+	}
+	if *showVersion {
+		writeVersion(stdout, gatewayProvenance(debug.ReadBuildInfo()))
+		return 0
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -55,17 +55,24 @@ Implemented in this repository:
 - Runtime health posture mapping for broker hardening, state-store encryption, and alert outbox backlog
 - SMS webhook signing bridge for providers that cannot sign raw webhook bodies
 - Scheduled weekly report generation against runtime export interfaces, with Gemini as the first reporting provider
+- Weekly report delivery via log, file, and HTTPS cloud deliverers
 - Tier C enrichment contracts
 - SIM and fleet optional-module stubs with disabled-path safety guarantees
 - CI, repository invariants, and contribution guardrails
 
+Consumed by `ori-runtime` (implemented there):
+
+- The runtime Tier 3 gateway reasoning client and deterministic escalation policy.
+- Runtime consumption of the gateway heartbeat capability posture (via the
+  `gateway_heartbeat_ttl_seconds` reachability window).
+
 Deferred implementation:
 
-- Weekly report delivery/persistence to product surfaces or ori-cloud
 - Full SIM modem integration for shared outbound SMS
 - Fleet forwarding and control-plane integration through `ori-cloud`
-- Runtime-side Tier 3 gateway reasoning client and deterministic escalation policy
-- Runtime-side consumption of gateway heartbeat capability posture
+- Production integration of weekly report delivery with the live `ori-cloud`
+  report service — the log, file, and HTTPS cloud deliverers exist; wiring to
+  the production service is pending
 
 ## Invariant
 
@@ -82,6 +89,31 @@ interfaces.
 pre-commit install
 go test ./...
 go vet ./...
+```
+
+## Versioning and releases
+
+The gateway is independently deployable, so it carries its own
+[SemVer](https://semver.org) line rather than tracking another repository's
+version. A tag is a distribution label, not a correctness anchor: the first tag
+should mark a supported deployment, not administrative symmetry with the other
+repositories.
+
+`ori-gateway --version` reports build provenance. An ordinary build already
+embeds the source commit and dirty state through Go's module VCS metadata:
+
+```bash
+go build ./cmd/ori-gateway && ./ori-gateway --version
+```
+
+Release builds inject explicit values without changing that fallback:
+
+```bash
+go build -ldflags "\
+  -X main.version=v2.1.0 \
+  -X main.commit=$(git rev-parse HEAD) \
+  -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  ./cmd/ori-gateway
 ```
 
 ## License
