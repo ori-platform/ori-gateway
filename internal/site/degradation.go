@@ -232,14 +232,3 @@ func rawStatusString(raw json.RawMessage) string {
 	}
 	return status
 }
-
-// cloneDegradationReasons returns a copy, preserving the absent/present-empty
-// distinction: a nil input stays nil rather than becoming an empty slice.
-func cloneDegradationReasons(in []string) []string {
-	if in == nil {
-		return nil
-	}
-	out := make([]string, len(in))
-	copy(out, in)
-	return out
-}

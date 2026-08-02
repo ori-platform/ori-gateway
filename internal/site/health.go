@@ -163,7 +163,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			GatewayObserved:    true,
 			Stale:              stale,
 			ActiveTriggerCount: len(n.ActiveTriggers),
-			DegradationReasons: cloneDegradationReasons(n.DegradationReasons),
+			DegradationReasons: cloneStrings(n.DegradationReasons),
 			Posture:            n.Posture,
 			Evidence:           n.Evidence,
 		})
