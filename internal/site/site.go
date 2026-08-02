@@ -6,13 +6,17 @@ package site
 import "sync"
 
 type NodeHeartbeat struct {
-	DeviceID       string           `json:"device_id"`
-	Status         string           `json:"status"`
-	LastSeenMS     int64            `json:"last_seen_ms"`
-	GatewaySeen    int64            `json:"gateway_seen_ms"`
-	ActiveTriggers []string         `json:"active_triggers"`
-	Posture        *SiteNodePosture `json:"posture,omitempty"`
-	Evidence       *NodeEvidence    `json:"evidence,omitempty"`
+	DeviceID       string   `json:"device_id"`
+	Status         string   `json:"status"`
+	LastSeenMS     int64    `json:"last_seen_ms"`
+	GatewaySeen    int64    `json:"gateway_seen_ms"`
+	ActiveTriggers []string `json:"active_triggers"`
+	// DegradationReasons is nil when the heartbeat omitted the field. It is
+	// never normalised to an empty slice: absent and present-empty are
+	// different states, and the latter is malformed.
+	DegradationReasons []string         `json:"degradation_reasons,omitempty"`
+	Posture            *SiteNodePosture `json:"posture,omitempty"`
+	Evidence           *NodeEvidence    `json:"evidence,omitempty"`
 }
 
 type Registry struct {
@@ -60,6 +64,7 @@ func (r *Registry) Snapshot() []NodeHeartbeat {
 	out := make([]NodeHeartbeat, 0, len(r.nodes))
 	for _, hb := range r.nodes {
 		hb.Posture = cloneSiteNodePosture(hb.Posture)
+		hb.DegradationReasons = cloneDegradationReasons(hb.DegradationReasons)
 		if hb.Evidence != nil {
 			e := *hb.Evidence
 			hb.Evidence = &e

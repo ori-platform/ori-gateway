@@ -75,6 +75,25 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	// degradation_reasons is classified on its RAW value BEFORE the typed
+	// decode, which is where gateway-api/v1 places it. Running it afterwards
+	// would let an unrelated typed failure — an invalid status, say — pre-empt
+	// an overlapping degradation defect and deny it the verdict the contract
+	// requires. A []string field would also reject a non-array or non-string
+	// element with a generic unmarshal error, making two verdicts unreachable,
+	// and would blur absent against present-empty.
+	var wire runtimeHeartbeatWire
+	if err := json.Unmarshal(unsignedPayload, &wire); err != nil {
+		return fmt.Errorf("decode runtime node heartbeat wire fields: %w", err)
+	}
+	degradationReasons, err := validateDegradationReasons(
+		wire.DegradationReasons,
+		rawStatusString(wire.Status),
+	)
+	if err != nil {
+		return err
+	}
+
 	var beat contracts.RuntimeNodeHeartbeat
 	dec := json.NewDecoder(bytes.NewReader(unsignedPayload))
 	if err := dec.Decode(&beat); err != nil {
@@ -93,14 +112,26 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 		}
 	}
 	h.registry.Upsert(NodeHeartbeat{
-		DeviceID:       beat.DeviceID,
-		Status:         beat.Status,
-		LastSeenMS:     beat.LastSeenMS,
-		GatewaySeen:    h.now().UnixMilli(),
-		ActiveTriggers: append([]string(nil), beat.ActiveTriggers...),
-		Evidence:       evidence,
+		DeviceID:           beat.DeviceID,
+		Status:             beat.Status,
+		LastSeenMS:         beat.LastSeenMS,
+		GatewaySeen:        h.now().UnixMilli(),
+		ActiveTriggers:     append([]string(nil), beat.ActiveTriggers...),
+		DegradationReasons: degradationReasons,
+		Evidence:           evidence,
 	})
 	return nil
+}
+
+// runtimeHeartbeatWire carries the fields this package must inspect before
+// typed decoding. It is intentionally private and separate from
+// contracts.RuntimeNodeHeartbeat: raw-JSON semantics belong at the ingress
+// boundary, not in the shared typed model other packages consume.
+type runtimeHeartbeatWire struct {
+	// Status is raw because the degradation classifier runs before the typed
+	// decode and needs the status for its final check.
+	Status             json.RawMessage `json:"status"`
+	DegradationReasons json.RawMessage `json:"degradation_reasons"`
 }
 
 func (h *RuntimeHeartbeatHandler) unsignedPayload(deviceID string, payload []byte) ([]byte, error) {

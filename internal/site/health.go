@@ -23,12 +23,17 @@ type SiteHealth struct {
 
 // SiteNode is a safe projection of one runtime node's observed registry state.
 type SiteNode struct {
-	DeviceID           string           `json:"device_id"`
-	Status             string           `json:"status"`
-	LastSeenMS         int64            `json:"last_seen_ms"`
-	GatewayObserved    bool             `json:"gateway_observed"`
-	Stale              bool             `json:"stale"`
-	ActiveTriggerCount int              `json:"active_trigger_count"`
+	DeviceID           string `json:"device_id"`
+	Status             string `json:"status"`
+	LastSeenMS         int64  `json:"last_seen_ms"`
+	GatewayObserved    bool   `json:"gateway_observed"`
+	Stale              bool   `json:"stale"`
+	ActiveTriggerCount int    `json:"active_trigger_count"`
+	// DegradationReasons names which runtime subsystems are degraded. Safe to
+	// project in full, unlike trigger names: these tokens are contract-owned
+	// and non-sensitive, carry no subordinate device identity, and are
+	// validated against a closed vocabulary before reaching here.
+	DegradationReasons []string         `json:"degradation_reasons,omitempty"`
 	Posture            *SiteNodePosture `json:"posture,omitempty"`
 	// Evidence carries the node's chain signal plus gateway-side integrity
 	// observations. A chain head hash is not a secret; no device paths or
@@ -158,6 +163,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			GatewayObserved:    true,
 			Stale:              stale,
 			ActiveTriggerCount: len(n.ActiveTriggers),
+			DegradationReasons: cloneDegradationReasons(n.DegradationReasons),
 			Posture:            n.Posture,
 			Evidence:           n.Evidence,
 		})
