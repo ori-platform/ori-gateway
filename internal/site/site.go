@@ -63,14 +63,32 @@ func (r *Registry) Snapshot() []NodeHeartbeat {
 	defer r.mu.Unlock()
 	out := make([]NodeHeartbeat, 0, len(r.nodes))
 	for _, hb := range r.nodes {
+		// Every reference-type field must be copied here, not just the
+		// pointers. A NodeHeartbeat value copy duplicates a slice header
+		// and shares its backing array, so a caller mutating what it
+		// received would reach back into registry state.
+		hb.ActiveTriggers = cloneStrings(hb.ActiveTriggers)
+		hb.DegradationReasons = cloneStrings(hb.DegradationReasons)
 		hb.Posture = cloneSiteNodePosture(hb.Posture)
-		hb.DegradationReasons = cloneDegradationReasons(hb.DegradationReasons)
 		if hb.Evidence != nil {
 			e := *hb.Evidence
 			hb.Evidence = &e
 		}
 		out = append(out, hb)
 	}
+	return out
+}
+
+// cloneStrings copies a string slice, preserving nil. The nil/empty
+// distinction is load-bearing for DegradationReasons — absent and
+// present-empty are different states on the wire — and harmless for
+// ActiveTriggers, which Upsert normalises to empty anyway.
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
 	return out
 }
 
