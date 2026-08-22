@@ -1,7 +1,7 @@
 // Copyright 2026 Ori Nexus Systems LTD
 // SPDX-License-Identifier: Apache-2.0
 
-package mqttauth
+package canonicaljson
 
 import (
 	"encoding/json"
@@ -12,25 +12,34 @@ import (
 	"unicode/utf8"
 )
 
-// Ori canonical JSON is the shared signing preimage format for runtime-gateway
-// envelopes. The runtime produces it with Python's
-// json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False), so this
-// package must reproduce those bytes exactly or HMACs will not agree.
+// Package canonicaljson writes the canonical JSON form shared by the Ori
+// contracts that sign or authenticate JSON payloads.
 //
-// encoding/json cannot be configured to do so. json.Marshal escapes '<', '>' and
-// '&', and both Marshal and Encoder escape U+2028 and U+2029 unconditionally --
-// SetEscapeHTML(false) suppresses only the first three. Any message carrying one
-// of those characters in a string or a key would be rejected as unauthenticated,
-// including LLM prose in reasoning_log exports. Hence a hand-written writer.
+// Two contracts use it. gateway-mqtt-canonical-json/v1 covers runtime-gateway
+// MQTT envelopes, and evidence-exchange/v1 covers evidence artifacts. They agree
+// on key ordering, separators and string escaping, which is what lives here.
+// They deliberately disagree on numbers: the MQTT transport preserves the
+// spelling received on the wire because it carries operational telemetry whose
+// range is broad, while evidence artifacts must satisfy the D-011 agreement
+// zone. Numeric policy therefore belongs to the caller, and this package accepts
+// only json.Number so a caller cannot leak a Go float's formatting into a
+// preimage by accident.
+//
+// encoding/json cannot be configured to produce these bytes. json.Marshal
+// escapes '<', '>' and '&', and both Marshal and Encoder escape U+2028 and
+// U+2029 unconditionally -- SetEscapeHTML(false) suppresses only the first
+// three. Any message carrying one of those characters in a string or a key would
+// be rejected as unauthenticated. Hence a hand-written writer.
 //
 // Escaping rule: emit only '"', '\\' and C0 controls as escapes, with the short
 // forms Python uses for \b \f \n \r \t and lowercase \u00xx for the rest. Every
-// other code point is written literally, including '<', '>', '&', U+2028, U+2029,
-// DEL and all non-ASCII.
+// other code point is written literally, including '<', '>', '&', U+2028,
+// U+2029, DEL and all non-ASCII. Keys sort by Unicode scalar value, not UTF-16
+// code unit; the two disagree across the BMP/astral boundary.
 const hexDigits = "0123456789abcdef"
 
 // writeCanonicalString appends s to b as a canonical JSON string, quotes included.
-func writeCanonicalString(b *strings.Builder, s string) {
+func writeString(b *strings.Builder, s string) {
 	b.WriteByte('"')
 	for _, r := range s {
 		switch r {
@@ -65,14 +74,14 @@ func writeCanonicalString(b *strings.Builder, s string) {
 // with UseNumber, which yields only these six types; anything else is a
 // programming error and fails closed rather than serialising to something the
 // runtime would not reproduce.
-func writeCanonicalValue(b *strings.Builder, v any) error {
+func writeValue(b *strings.Builder, v any) error {
 	switch t := v.(type) {
 	case nil:
 		b.WriteString("null")
 	case bool:
 		b.WriteString(strconv.FormatBool(t))
 	case string:
-		writeCanonicalString(b, t)
+		writeString(b, t)
 	case json.Number:
 		// Preserve the spelling received on the wire. The producer already emitted
 		// its own canonical form, so reproducing that text reproduces the preimage
@@ -92,9 +101,9 @@ func writeCanonicalValue(b *strings.Builder, v any) error {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			writeCanonicalString(b, k)
+			writeString(b, k)
 			b.WriteByte(':')
-			if err := writeCanonicalValue(b, t[k]); err != nil {
+			if err := writeValue(b, t[k]); err != nil {
 				return err
 			}
 		}
@@ -105,21 +114,21 @@ func writeCanonicalValue(b *strings.Builder, v any) error {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			if err := writeCanonicalValue(b, e); err != nil {
+			if err := writeValue(b, e); err != nil {
 				return err
 			}
 		}
 		b.WriteByte(']')
 	default:
-		return fmt.Errorf("mqtt auth: cannot canonicalise value of type %T", v)
+		return fmt.Errorf("canonicaljson: cannot canonicalise value of type %T", v)
 	}
 	return nil
 }
 
-// CanonicalJSON returns the canonical JSON encoding of a decoded payload.
-func CanonicalJSON(payload map[string]any) ([]byte, error) {
+// Marshal returns the canonical JSON encoding of a decoded payload.
+func Marshal(payload map[string]any) ([]byte, error) {
 	var b strings.Builder
-	if err := writeCanonicalValue(&b, payload); err != nil {
+	if err := writeValue(&b, payload); err != nil {
 		return nil, err
 	}
 	return []byte(b.String()), nil
@@ -132,7 +141,7 @@ func CanonicalJSON(payload map[string]any) ([]byte, error) {
 // canonicalise different text. Only refusal keeps them equivalent.
 func ValidateWireUnicode(raw []byte) error {
 	if !utf8.Valid(raw) {
-		return fmt.Errorf("mqtt auth: payload is not valid UTF-8")
+		return fmt.Errorf("canonicaljson: payload is not valid UTF-8")
 	}
 	for i := 0; i+1 < len(raw); i++ {
 		if raw[i] != '\\' {
@@ -148,20 +157,20 @@ func ValidateWireUnicode(raw []byte) error {
 		}
 		high, ok := parseHex4(raw, i+2)
 		if !ok {
-			return fmt.Errorf("mqtt auth: malformed \\u escape")
+			return fmt.Errorf("canonicaljson: malformed \\u escape")
 		}
 		if high < 0xD800 || high > 0xDFFF {
 			continue
 		}
 		if high > 0xDBFF {
-			return fmt.Errorf("mqtt auth: unpaired low surrogate U+%04X", high)
+			return fmt.Errorf("canonicaljson: unpaired low surrogate U+%04X", high)
 		}
 		if i+12 > len(raw) || raw[i+6] != '\\' || raw[i+7] != 'u' {
-			return fmt.Errorf("mqtt auth: unpaired high surrogate U+%04X", high)
+			return fmt.Errorf("canonicaljson: unpaired high surrogate U+%04X", high)
 		}
 		low, ok := parseHex4(raw, i+8)
 		if !ok || low < 0xDC00 || low > 0xDFFF {
-			return fmt.Errorf("mqtt auth: high surrogate U+%04X is not followed by a low surrogate", high)
+			return fmt.Errorf("canonicaljson: high surrogate U+%04X is not followed by a low surrogate", high)
 		}
 		i += 11
 	}

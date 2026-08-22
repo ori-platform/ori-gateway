@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/ori-platform/ori-gateway/internal/canonicaljson"
 	"os"
 	"strings"
 	"testing"
@@ -138,7 +139,7 @@ func TestStdlibJSONWouldFailTheseVectors(t *testing.T) {
 // TestCanonicalJSONRejectsUnsupportedType fails closed rather than emitting bytes
 // the runtime would not reproduce.
 func TestCanonicalJSONRejectsUnsupportedType(t *testing.T) {
-	if _, err := CanonicalJSON(map[string]any{"x": float64(1.5)}); err == nil {
+	if _, err := canonicaljson.Marshal(map[string]any{"x": float64(1.5)}); err == nil {
 		t.Error("expected an error for a non-json.Number numeric value")
 	}
 }
@@ -151,7 +152,7 @@ func TestCanonicalJSONRefusesOutOfContractVectors(t *testing.T) {
 	for _, v := range set.Refused {
 		t.Run(v.ID, func(t *testing.T) {
 			wire := []byte(v.Wire)
-			if err := ValidateWireUnicode(wire); err != nil {
+			if err := canonicaljson.ValidateWireUnicode(wire); err != nil {
 				return // refused before decoding, which is correct
 			}
 			var payload map[string]any
@@ -160,7 +161,7 @@ func TestCanonicalJSONRefusesOutOfContractVectors(t *testing.T) {
 			if err := dec.Decode(&payload); err != nil {
 				return // refused by the parser, which is correct
 			}
-			got, err := CanonicalJSON(payload)
+			got, err := canonicaljson.Marshal(payload)
 			if err == nil {
 				t.Errorf("accepted a vector the contract refuses (%s): emitted %q\nreason: %s",
 					v.RefusalBasis, got, v.Reason)
@@ -231,7 +232,7 @@ func TestVerifierPreservesWireNumberSpelling(t *testing.T) {
 		if err := dec.Decode(&payload); err != nil {
 			t.Fatalf("decode %s: %v", wire, err)
 		}
-		got, err := CanonicalJSON(payload)
+		got, err := canonicaljson.Marshal(payload)
 		if err != nil {
 			t.Fatalf("canonicalise %s: %v", wire, err)
 		}
