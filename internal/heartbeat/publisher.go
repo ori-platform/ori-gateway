@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -203,7 +204,12 @@ func (p *Publisher) recordFailure(failures *int, err error) bool {
 func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 	now := p.now()
 	status := p.status(ctx)
-	uptimeS := now.Sub(p.startedAt).Seconds()
+	// Rounded to milliseconds so the emitted value is either exactly 0 or at least
+	// 0.001. Go and CPython choose different notation for a non-zero magnitude below
+	// 1e-4 -- Go writes 0.000035 where CPython writes 3.5e-05 -- and the runtime
+	// verifies by re-serialising, so an unrounded value would fail authentication.
+	// Run publishes immediately at startup, which is exactly when uptime is smallest.
+	uptimeS := math.Round(now.Sub(p.startedAt).Seconds()*1000) / 1000
 
 	p.mu.Lock()
 	timestampMS := now.UnixMilli()

@@ -1,0 +1,9 @@
+{
+  "source_repository": "ori-platform/ori-specs",
+  "source_path": "gateway-mqtt-canonical-json/vectors",
+  "source_commit": "3cc78ec9236a38b77bc7311f1cbb841bb991aade",
+  "note": "Vendored copies of the normative vectors. The gateway must produce and accept the bytes they describe, so they are its conformance fixtures. Digests detect a local edit; the source commit is the provenance trail.",
+  "files": {
+    "canonical-json-vectors.json": "e5bfd59eab2ac21abfbfcbf6253d922b46a83fba607ec09c4dbe14b5314a51c6"
+  }
+}

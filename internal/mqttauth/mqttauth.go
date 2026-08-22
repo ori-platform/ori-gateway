@@ -102,6 +102,9 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	if v == nil {
 		return nil, fmt.Errorf("mqtt auth verifier is nil")
 	}
+	if err := ValidateWireUnicode(payload); err != nil {
+		return nil, err
+	}
 	var envelope map[string]any
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
@@ -134,7 +137,7 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	}
 
 	unsigned := cloneWithoutAuth(envelope)
-	canonical, err := json.Marshal(unsigned)
+	canonical, err := CanonicalJSON(unsigned)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize mqtt auth payload: %w", err)
 	}
@@ -160,7 +163,7 @@ func CanonicalJSONWithoutAuth(value any) ([]byte, error) {
 		return nil, err
 	}
 	delete(payload, "auth")
-	return json.Marshal(payload)
+	return CanonicalJSON(payload)
 }
 
 // SigningInput returns the newline-delimited runtime-compatible signing string.

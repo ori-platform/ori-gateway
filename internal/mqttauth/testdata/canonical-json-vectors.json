@@ -1,0 +1,429 @@
+{
+  "vector_set": "gateway-mqtt-canonical-json/v1",
+  "scope": "Runtime-gateway MQTT envelope authentication (HMAC preimage and AES-GCM AAD). This is NOT evidence/v2. Evidence artifacts control their numeric domain and impose the D-011 agreement zone; gateway MQTT transports operational sensor and reasoning data whose numeric range is broader, so D-011 MUST NOT be enforced here.",
+  "purpose": "Cross-language agreement between the Python runtime and the Go gateway. An implementation passes when serialising `value` yields exactly `canonical_utf8_hex`, and when every entry under `refused` is rejected.",
+  "rules": {
+    "key_order": "lexicographic by Unicode scalar value (code point) at every nesting level, applied recursively. NOT UTF-16 code unit order: the two disagree across the BMP/astral boundary, see key_order_astral_vs_bmp.",
+    "separators": "',' and ':' with no whitespace outside string values",
+    "escaping": "RFC 8259. Escape only '\"' and '\\\\' plus C0 controls; short escapes \\b \\f \\n \\r \\t; other C0 as \\u00xx lowercase. Every other scalar is emitted literally, including < > & U+2028 U+2029 DEL and all non-ASCII.",
+    "numbers": "A verifier preserves the number spelling received on the wire. The producer already emitted its own canonical form, so reproducing that text reproduces the preimage. A verifier MUST NOT re-format numbers: that would diverge from the producer and would impose an evidence-storage constraint on operational telemetry. Producers MUST NOT emit NaN or Infinity, which are not valid JSON.",
+    "unicode": "Payload bytes must be valid UTF-8 and must not contain unpaired surrogate escapes.",
+    "refusal_basis": "'divergence': the two stock serialisers produce different bytes, so accepting the value would break signature agreement. 'invalid_json': rejected by any conforming parser."
+  },
+  "accepted": [
+    {
+      "id": "html_amp",
+      "class": "html",
+      "value": {
+        "reason": "grid & inverter fault"
+      },
+      "canonical_utf8_hex": "7b22726561736f6e223a2267726964202620696e766572746572206661756c74227d"
+    },
+    {
+      "id": "html_lt_gt",
+      "class": "html",
+      "value": {
+        "reason": "temp <5 and >90"
+      },
+      "canonical_utf8_hex": "7b22726561736f6e223a2274656d70203c3520616e64203e3930227d"
+    },
+    {
+      "id": "html_all",
+      "class": "html",
+      "value": {
+        "reason": "a<b&c>d"
+      },
+      "canonical_utf8_hex": "7b22726561736f6e223a22613c6226633e64227d"
+    },
+    {
+      "id": "u2028",
+      "class": "sep",
+      "value": {
+        "note": "line sep"
+      },
+      "canonical_utf8_hex": "7b226e6f7465223a226c696e65e280a8736570227d"
+    },
+    {
+      "id": "u2029",
+      "class": "sep",
+      "value": {
+        "note": "para sep"
+      },
+      "canonical_utf8_hex": "7b226e6f7465223a2270617261e280a9736570227d"
+    },
+    {
+      "id": "latin1",
+      "class": "nonascii",
+      "value": {
+        "site": "Café Ikeja"
+      },
+      "canonical_utf8_hex": "7b2273697465223a22436166c3a920496b656a61227d"
+    },
+    {
+      "id": "cjk",
+      "class": "nonascii",
+      "value": {
+        "site": "東京"
+      },
+      "canonical_utf8_hex": "7b2273697465223a22e69db1e4baac227d"
+    },
+    {
+      "id": "emoji_bmp",
+      "class": "nonascii",
+      "value": {
+        "note": "warn ⚠"
+      },
+      "canonical_utf8_hex": "7b226e6f7465223a227761726e20e29aa0227d"
+    },
+    {
+      "id": "emoji_astral",
+      "class": "nonascii",
+      "value": {
+        "note": "fire 🔥"
+      },
+      "canonical_utf8_hex": "7b226e6f7465223a226669726520f09f94a5227d"
+    },
+    {
+      "id": "yoruba",
+      "class": "nonascii",
+      "value": {
+        "site": "Ìbàdàn"
+      },
+      "canonical_utf8_hex": "7b2273697465223a22c38c62c3a064c3a06e227d"
+    },
+    {
+      "id": "ctrl_backspace",
+      "class": "ctrl",
+      "value": {
+        "x": "a\bb"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c6262227d"
+    },
+    {
+      "id": "ctrl_formfeed",
+      "class": "ctrl",
+      "value": {
+        "x": "a\fb"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c6662227d"
+    },
+    {
+      "id": "ctrl_newline",
+      "class": "ctrl",
+      "value": {
+        "x": "a\nb"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c6e62227d"
+    },
+    {
+      "id": "ctrl_tab",
+      "class": "ctrl",
+      "value": {
+        "x": "a\tb"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c7462227d"
+    },
+    {
+      "id": "ctrl_cr",
+      "class": "ctrl",
+      "value": {
+        "x": "a\rb"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c7262227d"
+    },
+    {
+      "id": "ctrl_nul",
+      "class": "ctrl",
+      "value": {
+        "x": "a\u0000b"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c753030303062227d"
+    },
+    {
+      "id": "ctrl_0x1f",
+      "class": "ctrl",
+      "value": {
+        "x": "a\u001fb"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c753030316662227d"
+    },
+    {
+      "id": "ctrl_del",
+      "class": "ctrl",
+      "value": {
+        "x": "ab"
+      },
+      "canonical_utf8_hex": "7b2278223a22617f62227d"
+    },
+    {
+      "id": "quote",
+      "class": "ctrl",
+      "value": {
+        "x": "say \"hi\""
+      },
+      "canonical_utf8_hex": "7b2278223a22736179205c2268695c22227d"
+    },
+    {
+      "id": "backslash",
+      "class": "ctrl",
+      "value": {
+        "x": "a\\b"
+      },
+      "canonical_utf8_hex": "7b2278223a22615c5c62227d"
+    },
+    {
+      "id": "nested_obj",
+      "class": "nest",
+      "value": {
+        "a": {
+          "z": 1,
+          "b": {
+            "c": "x&y"
+          }
+        }
+      },
+      "canonical_utf8_hex": "7b2261223a7b2262223a7b2263223a22782679227d2c227a223a317d7d"
+    },
+    {
+      "id": "nested_arr",
+      "class": "nest",
+      "value": {
+        "a": [
+          1,
+          {
+            "b": "<t>"
+          },
+          [
+            "c&d"
+          ]
+        ]
+      },
+      "canonical_utf8_hex": "7b2261223a5b312c7b2262223a223c743e227d2c5b22632664225d5d7d"
+    },
+    {
+      "id": "key_ordering",
+      "class": "nest",
+      "value": {
+        "b": 1,
+        "a": 2,
+        "C": 3,
+        "_": 4,
+        "0": 5
+      },
+      "canonical_utf8_hex": "7b2230223a352c2243223a332c225f223a342c2261223a322c2262223a317d"
+    },
+    {
+      "id": "key_special",
+      "class": "nest",
+      "value": {
+        "a&b": 1,
+        "a<b": 2
+      },
+      "canonical_utf8_hex": "7b22612662223a312c22613c62223a327d"
+    },
+    {
+      "id": "int_max_safe",
+      "class": "num",
+      "value": {
+        "n": 9007199254740991
+      },
+      "canonical_utf8_hex": "7b226e223a393030373139393235343734303939317d"
+    },
+    {
+      "id": "int_zero",
+      "class": "num",
+      "value": {
+        "n": 0
+      },
+      "canonical_utf8_hex": "7b226e223a307d"
+    },
+    {
+      "id": "int_neg",
+      "class": "num",
+      "value": {
+        "n": -42
+      },
+      "canonical_utf8_hex": "7b226e223a2d34327d"
+    },
+    {
+      "id": "float_zero",
+      "class": "num",
+      "value": {
+        "n": 0.0
+      },
+      "canonical_utf8_hex": "7b226e223a302e307d"
+    },
+    {
+      "id": "float_low_edge",
+      "class": "num",
+      "value": {
+        "n": 0.0001
+      },
+      "canonical_utf8_hex": "7b226e223a302e303030317d"
+    },
+    {
+      "id": "float_high_edge",
+      "class": "num",
+      "value": {
+        "n": 9999999999999998.0
+      },
+      "canonical_utf8_hex": "7b226e223a393939393939393939393939393939382e307d"
+    },
+    {
+      "id": "float_mid",
+      "class": "num",
+      "value": {
+        "n": 1.5
+      },
+      "canonical_utf8_hex": "7b226e223a312e357d"
+    },
+    {
+      "id": "float_repeating",
+      "class": "num",
+      "value": {
+        "n": 0.1
+      },
+      "canonical_utf8_hex": "7b226e223a302e317d"
+    },
+    {
+      "id": "bool_null",
+      "class": "num",
+      "value": {
+        "t": true,
+        "f": false,
+        "z": null
+      },
+      "canonical_utf8_hex": "7b2266223a66616c73652c2274223a747275652c227a223a6e756c6c7d"
+    },
+    {
+      "id": "literal_u2028_text",
+      "class": "sep",
+      "value": {
+        "x": "backslash-u-2028 literal: \\u2028"
+      },
+      "canonical_utf8_hex": "7b2278223a226261636b736c6173682d752d32303238206c69746572616c3a205c5c7532303238227d"
+    },
+    {
+      "id": "mixed_sep_html",
+      "class": "sep",
+      "value": {
+        "x": "a&b c<d"
+      },
+      "canonical_utf8_hex": "7b2278223a22612662e280a8633c64227d"
+    },
+    {
+      "id": "key_order_astral_vs_bmp",
+      "class": "nest",
+      "value": {
+        "🔥": 1,
+        "�": 2
+      },
+      "canonical_utf8_hex": "7b22efbfbd223a322c22f09f94a5223a317d",
+      "note": "U+FFFD sorts before U+1F525 by Unicode scalar value; UTF-16 code unit order would reverse them"
+    },
+    {
+      "id": "unicode_paired_surrogate_escape",
+      "class": "unicode",
+      "value": {
+        "x": "🔥"
+      },
+      "canonical_utf8_hex": "7b2278223a22f09f94a5227d",
+      "note": "a correctly paired surrogate escape decodes to one scalar and is emitted literally"
+    },
+    {
+      "id": "telemetry_small_reading",
+      "class": "telemetry",
+      "value": {
+        "sensor_id": "leak-current",
+        "unit": "ampere",
+        "value": 5e-05
+      },
+      "canonical_utf8_hex": "7b2273656e736f725f6964223a226c65616b2d63757272656e74222c22756e6974223a22616d70657265222c2276616c7565223a35652d30357d",
+      "note": "a small leakage-current reading; refusing this would turn valid telemetry into an auth failure"
+    },
+    {
+      "id": "telemetry_below_zone",
+      "class": "telemetry",
+      "value": {
+        "sensor_id": "leak-current",
+        "unit": "ampere",
+        "value": 1e-05
+      },
+      "canonical_utf8_hex": "7b2273656e736f725f6964223a226c65616b2d63757272656e74222c22756e6974223a22616d70657265222c2276616c7565223a31652d30357d",
+      "note": "below D-011's 1e-4 floor and legitimate here"
+    },
+    {
+      "id": "telemetry_large_value",
+      "class": "telemetry",
+      "value": {
+        "sensor_id": "leak-current",
+        "unit": "ampere",
+        "value": 1e+300
+      },
+      "canonical_utf8_hex": "7b2273656e736f725f6964223a226c65616b2d63757272656e74222c22756e6974223a22616d70657265222c2276616c7565223a31652b3330307d",
+      "note": "far above D-011's 1e16 ceiling and legitimate here"
+    },
+    {
+      "id": "telemetry_high_precision",
+      "class": "telemetry",
+      "value": {
+        "sensor_id": "leak-current",
+        "unit": "ampere",
+        "value": 0.1234567890123
+      },
+      "canonical_utf8_hex": "7b2273656e736f725f6964223a226c65616b2d63757272656e74222c22756e6974223a22616d70657265222c2276616c7565223a302e313233343536373839303132337d",
+      "note": "full double precision"
+    }
+  ],
+  "refused": [
+    {
+      "id": "num_nan",
+      "class": "num",
+      "wire": "{\"n\":NaN}",
+      "reason": "NaN is not valid JSON; the runtime must not emit it (allow_nan=False)",
+      "refusal_basis": "invalid_json"
+    },
+    {
+      "id": "num_infinity",
+      "class": "num",
+      "wire": "{\"n\":Infinity}",
+      "reason": "Infinity is not valid JSON",
+      "refusal_basis": "invalid_json"
+    },
+    {
+      "id": "num_negative_infinity",
+      "class": "num",
+      "wire": "{\"n\":-Infinity}",
+      "reason": "-Infinity is not valid JSON",
+      "refusal_basis": "invalid_json"
+    },
+    {
+      "id": "num_leading_plus",
+      "class": "num",
+      "wire": "{\"n\":+1}",
+      "reason": "a leading plus is not valid JSON",
+      "refusal_basis": "invalid_json"
+    },
+    {
+      "id": "unicode_lone_high_surrogate",
+      "class": "unicode",
+      "wire": "{\"x\":\"\\ud800\"}",
+      "reason": "Go substitutes U+FFFD, Python surfaces the surrogate and then fails to encode it",
+      "refusal_basis": "divergence"
+    },
+    {
+      "id": "unicode_lone_low_surrogate",
+      "class": "unicode",
+      "wire": "{\"x\":\"\\udc00\"}",
+      "reason": "unpaired low surrogate",
+      "refusal_basis": "divergence"
+    },
+    {
+      "id": "unicode_high_without_low",
+      "class": "unicode",
+      "wire": "{\"x\":\"\\ud83dX\"}",
+      "reason": "high surrogate not followed by a low surrogate",
+      "refusal_basis": "divergence"
+    }
+  ]
+}
