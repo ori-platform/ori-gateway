@@ -64,7 +64,11 @@ func (e *Encryptor) Encrypt(value any, messageType string, nonce []byte) (map[st
 	if err != nil {
 		return nil, err
 	}
-	ciphertext := gcm.Seal(nil, nonce, canonical, encryptionAAD(metadata, messageType))
+	aad, err := encryptionAAD(metadata, messageType)
+	if err != nil {
+		return nil, fmt.Errorf("build encryption aad: %w", err)
+	}
+	ciphertext := gcm.Seal(nil, nonce, canonical, aad)
 	return map[string]any{
 		"request_id":  metadata["request_id"],
 		"device_id":   metadata["device_id"],
@@ -121,7 +125,11 @@ func (e *Encryptor) Decrypt(payload map[string]any, messageType string, expected
 	if err != nil {
 		return nil, err
 	}
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, encryptionAAD(metadata, messageType))
+	aad, err := encryptionAAD(metadata, messageType)
+	if err != nil {
+		return nil, fmt.Errorf("build encryption aad: %w", err)
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt payload: %w", err)
 	}
@@ -170,15 +178,18 @@ func encryptionMetadata(payload map[string]any) (map[string]string, error) {
 	return metadata, nil
 }
 
-func encryptionAAD(metadata map[string]string, messageType string) []byte {
-	payload := map[string]string{
+// encryptionAAD builds the additional authenticated data bound to a sealed
+// envelope. It must match the runtime's _encryption_aad byte for byte, so it uses
+// the shared canonical writer rather than json.Marshal, which would HTML-escape
+// any '<', '>' or '&' appearing in an identifier.
+func encryptionAAD(metadata map[string]string, messageType string) ([]byte, error) {
+	payload := map[string]any{
 		"message_type": messageType,
 		"request_id":   metadata["request_id"],
 		"device_id":    metadata["device_id"],
 		"export_type":  metadata["export_type"],
 	}
-	encoded, _ := json.Marshal(payload)
-	return encoded
+	return CanonicalJSON(payload)
 }
 
 func stringFromAny(value any) string {

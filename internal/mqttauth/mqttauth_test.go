@@ -205,10 +205,28 @@ func TestEncryptorRejectsTamperedMetadata(t *testing.T) {
 
 func TestEncryptionAADMatchesRuntimeCanonicalJSON(t *testing.T) {
 	metadata := map[string]string{"message_type": "export_response", "request_id": "req-1", "device_id": "dev-01", "export_type": "sensor_history"}
-	got := string(encryptionAAD(metadata, contracts.ExportResponseMessageType))
+	aad, err := encryptionAAD(metadata, contracts.ExportResponseMessageType)
+	if err != nil {
+		t.Fatalf("build aad: %v", err)
+	}
+	got := string(aad)
 	want := `{"device_id":"dev-01","export_type":"sensor_history","message_type":"export_response","request_id":"req-1"}`
 	if got != want {
 		t.Fatalf("AAD mismatch:\nwant %s\n got %s", want, got)
+	}
+
+	// Plain identifiers cannot distinguish canonical JSON from json.Marshal. A
+	// device_id carrying an ampersand can: json.Marshal would emit \u0026 and the
+	// runtime, which uses ensure_ascii=False, would fail to open the envelope.
+	special := map[string]string{"request_id": "req-1", "device_id": "dev&01", "export_type": "sensor_history"}
+	aad, err = encryptionAAD(special, contracts.ExportResponseMessageType)
+	if err != nil {
+		t.Fatalf("build aad: %v", err)
+	}
+	got = string(aad)
+	want = `{"device_id":"dev&01","export_type":"sensor_history","message_type":"export_response","request_id":"req-1"}`
+	if got != want {
+		t.Fatalf("AAD mismatch for special characters:\nwant %s\n got %s", want, got)
 	}
 }
 
