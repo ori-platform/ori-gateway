@@ -46,6 +46,9 @@ const (
 	// IEEE-754 double, so a consumer parsing into f64 would read a different
 	// number than the one that was authenticated.
 	maxSafeInteger = int64(9007199254740991)
+
+	// sha256HexLen is the hex length of a SHA-256 digest.
+	sha256HexLen = 64
 )
 
 // CustodyAcknowledgement is the artifact defined by evidence-exchange/v1. Field
@@ -108,11 +111,14 @@ func (s *CustodySigner) Acknowledge(deviceID string, localSeq int64, envelopeDig
 	if strings.TrimSpace(deviceID) == "" {
 		return CustodyAcknowledgement{}, nil, fmt.Errorf("evidence: custody device_id must not be empty")
 	}
-	if !strings.HasPrefix(envelopeDigest, "sha256:") {
-		return CustodyAcknowledgement{}, nil, fmt.Errorf("evidence: envelope_digest must carry its algorithm prefix")
+	if err := validateSHA256Digest(envelopeDigest); err != nil {
+		return CustodyAcknowledgement{}, nil, err
 	}
-	if localSeq < 0 {
-		return CustodyAcknowledgement{}, nil, fmt.Errorf("evidence: local_seq must not be negative")
+	// Delivery sequencing starts at 1. Zero is the checkpoint's "before any
+	// envelope" state, so custody of envelope zero claims custody of something
+	// that does not exist.
+	if localSeq <= 0 {
+		return CustodyAcknowledgement{}, nil, fmt.Errorf("evidence: local_seq must be positive; delivery sequencing starts at 1")
 	}
 	if custodyAtMS <= 0 {
 		return CustodyAcknowledgement{}, nil, fmt.Errorf("evidence: custody_at_ms must be positive")
@@ -182,4 +188,30 @@ func d011Integer(n int64, field string) (json.Number, error) {
 		return "", fmt.Errorf("evidence: %s is outside the D-011 integer zone", field)
 	}
 	return json.Number(strconv.FormatInt(n, 10)), nil
+}
+
+// validateSHA256Digest requires the exact form the contract specifies: the
+// algorithm prefix followed by 64 lowercase hexadecimal characters.
+//
+// Checking only the prefix would let a truncated, uppercase, or non-hex value be
+// authenticated into an artifact that looks well-formed. The gateway cannot
+// recompute the digest -- it never opens the envelope -- so this is the only
+// point at which a malformed one can be caught before it is signed.
+func validateSHA256Digest(digest string) error {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(digest, prefix) {
+		return fmt.Errorf("evidence: envelope_digest must carry its algorithm prefix")
+	}
+	body := digest[len(prefix):]
+	if len(body) != sha256HexLen {
+		return fmt.Errorf("evidence: envelope_digest must be %d hex characters, got %d", sha256HexLen, len(body))
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			continue
+		}
+		return fmt.Errorf("evidence: envelope_digest must be lowercase hexadecimal")
+	}
+	return nil
 }

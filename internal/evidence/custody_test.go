@@ -138,16 +138,31 @@ func TestCustodySignerRefusesIncompleteInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	validDigest := "sha256:" + strings.Repeat("ab", 32)
 	for _, tc := range []struct {
 		name                string
 		deviceID, digest    string
 		localSeq, custodyAt int64
 	}{
-		{"empty device", "", "sha256:abc", 1, 1787000000900},
-		{"digest without prefix", "dev-01", "abc", 1, 1787000000900},
-		{"negative local_seq", "dev-01", "sha256:abc", -1, 1787000000900},
-		{"zero custody_at_ms", "dev-01", "sha256:abc", 1, 0},
-		{"local_seq beyond D-011", "dev-01", "sha256:abc", 9007199254740992, 1787000000900},
+		{"empty device", "", validDigest, 1, 1787000000900},
+		{"zero custody_at_ms", "dev-01", validDigest, 1, 0},
+		{"local_seq beyond D-011", "dev-01", validDigest, 9007199254740992, 1787000000900},
+
+		// Delivery sequencing starts at 1. Zero is the checkpoint's "before any
+		// envelope" state, so custody of envelope zero claims something that does
+		// not exist.
+		{"zero local_seq", "dev-01", validDigest, 0, 1787000000900},
+		{"negative local_seq", "dev-01", validDigest, -1, 1787000000900},
+
+		// The gateway never opens the envelope, so it cannot recompute the digest.
+		// Signing is the last point a malformed one can be caught.
+		{"digest without prefix", "dev-01", strings.Repeat("a", 64), 1, 1787000000900},
+		{"digest too short", "dev-01", "sha256:abc", 1, 1787000000900},
+		{"digest one char short", "dev-01", "sha256:" + strings.Repeat("a", 63), 1, 1787000000900},
+		{"digest one char long", "dev-01", "sha256:" + strings.Repeat("a", 65), 1, 1787000000900},
+		{"digest uppercase hex", "dev-01", "sha256:" + strings.Repeat("A", 64), 1, 1787000000900},
+		{"digest non-hex", "dev-01", "sha256:" + strings.Repeat("z", 64), 1, 1787000000900},
+		{"digest empty body", "dev-01", "sha256:", 1, 1787000000900},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, _, err := signer.Acknowledge(tc.deviceID, tc.localSeq, tc.digest, tc.custodyAt); err == nil {
@@ -167,7 +182,7 @@ func TestCustodySignerRefusesIncompleteInput(t *testing.T) {
 // artifact never authenticates its own authenticator.
 func TestCustodyPreimageExcludesTheAuthenticator(t *testing.T) {
 	signer, _ := NewCustodySigner("gw-secret-1", "secret")
-	ack, signed, err := signer.Acknowledge("dev-01", 7, "sha256:abc", 1787000000900)
+	ack, signed, err := signer.Acknowledge("dev-01", 7, "sha256:"+strings.Repeat("ab", 32), 1787000000900)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,5 +228,27 @@ func TestVendoredCustodyVectorsMatchManifest(t *testing.T) {
 			t.Errorf("%s has been edited locally; re-vendor from %s@%s instead",
 				name, m.SourceRepository, m.SourceCommit)
 		}
+	}
+}
+
+// TestCustodyAcceptsAWellFormedDigest is the positive half of the digest rule,
+// so the validator cannot regress into refusing everything and still pass.
+func TestCustodyAcceptsAWellFormedDigest(t *testing.T) {
+	signer, err := NewCustodySigner("gw-secret-1", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, digest := range []string{
+		"sha256:" + strings.Repeat("0", 64),
+		"sha256:" + strings.Repeat("f", 64),
+		"sha256:405837b420ee850d8e0503cc81e0d6a3f2b1c4e59a7d8306b2c1f4e5a6d7b8c9",
+	} {
+		if _, _, err := signer.Acknowledge("dev-01", 1, digest, 1787000000900); err != nil {
+			t.Errorf("well-formed digest refused: %s: %v", digest, err)
+		}
+	}
+	// The lowest sequence a real envelope can carry must be accepted.
+	if _, _, err := signer.Acknowledge("dev-01", 1, "sha256:"+strings.Repeat("ab", 32), 1787000000900); err != nil {
+		t.Errorf("local_seq 1 refused: %v", err)
 	}
 }
