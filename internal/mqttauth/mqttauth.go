@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ori-platform/ori-gateway/internal/canonicaljson"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 )
 
@@ -102,7 +103,7 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	if v == nil {
 		return nil, fmt.Errorf("mqtt auth verifier is nil")
 	}
-	if err := ValidateWireUnicode(payload); err != nil {
+	if err := canonicaljson.ValidateWireUnicode(payload); err != nil {
 		return nil, err
 	}
 	var envelope map[string]any
@@ -137,7 +138,7 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	}
 
 	unsigned := cloneWithoutAuth(envelope)
-	canonical, err := CanonicalJSON(unsigned)
+	canonical, err := canonicaljson.Marshal(unsigned)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize mqtt auth payload: %w", err)
 	}
@@ -163,7 +164,7 @@ func CanonicalJSONWithoutAuth(value any) ([]byte, error) {
 		return nil, err
 	}
 	delete(payload, "auth")
-	return CanonicalJSON(payload)
+	return canonicaljson.Marshal(payload)
 }
 
 // SigningInput returns the newline-delimited runtime-compatible signing string.

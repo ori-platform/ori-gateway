@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/ori-platform/ori-gateway/internal/canonicaljson"
 	"strings"
 )
 
@@ -189,7 +190,7 @@ func encryptionAAD(metadata map[string]string, messageType string) ([]byte, erro
 		"device_id":    metadata["device_id"],
 		"export_type":  metadata["export_type"],
 	}
-	return CanonicalJSON(payload)
+	return canonicaljson.Marshal(payload)
 }
 
 func stringFromAny(value any) string {
