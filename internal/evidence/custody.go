@@ -9,13 +9,18 @@
 // are handed back unmodified.
 //
 // The custody acknowledgement is the single exception, and it is not a
-// signature. It is an HMAC under the runtime-gateway shared secret, asserting
-// only that the courier holds an envelope durably. It is deliberately not a
-// delivery confirmation: nothing here says the evidence authority received
-// anything.
+// signature. It is an HMAC under a dedicated custody secret -- never the
+// runtime-gateway envelope secret -- asserting only that the courier holds an
+// envelope durably. Both are symmetric secrets between the same two parties,
+// which is exactly why they must not be the same bytes: domain separation makes
+// the preimages differ, but it does not stop a component holding the secret for
+// one purpose from minting artifacts for the other. The acknowledgement is
+// deliberately not a delivery confirmation: nothing here says the evidence
+// authority received anything.
 package evidence
 
 import (
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -64,8 +69,43 @@ type CustodyAcknowledgement struct {
 	MAC            string `json:"mac"`
 }
 
+// Salt and info are fixed by evidence-exchange/v1 and must not vary per device
+// or per site. The identifier names a secret generation, not a device: one
+// gateway holding custody for several devices under one secret issues the same
+// key_id for all of them, and that is correct rather than a collision.
+const (
+	custodyKeyIDSalt   = "ori.evidence_custody_key_id.v1"
+	custodyKeyIDInfo   = "gateway_custody"
+	custodyKeyIDPrefix = "hkdf-sha256:"
+	custodyKeyIDBytes  = 16
+)
+
+// DeriveCustodyKeyID returns the (gateway_custody, key_id) selector for one
+// custody secret generation.
+//
+// Derived rather than configured, because a configured name survives a
+// rotation unless an operator remembers to change it, and an identifier that
+// names two different secrets cannot select between them -- which is the
+// selector's whole function on the runtime side.
+func DeriveCustodyKeyID(custodySecret string) (string, error) {
+	if err := validateCustodySecret(custodySecret); err != nil {
+		return "", err
+	}
+	material, err := hkdf.Key(
+		sha256.New,
+		[]byte(custodySecret),
+		[]byte(custodyKeyIDSalt),
+		custodyKeyIDInfo,
+		custodyKeyIDBytes,
+	)
+	if err != nil {
+		return "", fmt.Errorf("evidence: deriving custody key_id: %w", err)
+	}
+	return custodyKeyIDPrefix + hex.EncodeToString(material), nil
+}
+
 // CustodySigner authenticates custody acknowledgements with the current
-// runtime-gateway shared secret.
+// custody secret.
 //
 // It holds exactly one secret. A rotated-out secret is verify-only by
 // definition here, because this type never verifies anything: it signs, and it
@@ -76,20 +116,42 @@ type CustodySigner struct {
 	secret []byte
 }
 
-// NewCustodySigner builds a signer for the named shared-secret generation.
-func NewCustodySigner(keyID string, sharedSecret string) (*CustodySigner, error) {
-	keyID = strings.TrimSpace(keyID)
-	if keyID == "" {
-		return nil, fmt.Errorf("evidence: custody key_id must not be empty")
+// NewCustodySigner builds a signer for one custody secret generation.
+//
+// The identifier is derived here and cannot be supplied. Accepting one would
+// let a misconfigured or hostile value name a secret it was not derived from,
+// and the runtime selects by that identifier -- so a mismatch would present as
+// a failed authentication rather than as the configuration error it is.
+func NewCustodySigner(custodySecret string) (*CustodySigner, error) {
+	keyID, err := DeriveCustodyKeyID(custodySecret)
+	if err != nil {
+		return nil, err
 	}
-	secret := strings.TrimSpace(sharedSecret)
-	if secret == "" {
-		return nil, fmt.Errorf("evidence: custody shared secret must not be empty")
-	}
-	return &CustodySigner{keyID: keyID, secret: []byte(secret)}, nil
+	return &CustodySigner{keyID: keyID, secret: []byte(custodySecret)}, nil
 }
 
-// KeyID names the shared-secret generation this signer authenticates under.
+// validateCustodySecret admits a secret only in the exact form the contract
+// keys from, and normalises nothing.
+//
+// The MAC key is the secret's UTF-8 bytes as configured. Trimming here would
+// key from bytes the operator did not provision, so a secret carrying a stray
+// newline -- the ordinary shape of one read from a file or a Docker env file --
+// would derive an identifier and a MAC that no conforming peer reproduces, and
+// present as a failed authentication rather than as the configuration error it
+// is. Surrounding whitespace is therefore refused outright: nobody provisions a
+// secret whose bytes are meant to include it, and refusing at startup is the
+// one outcome that cannot diverge silently from the other side.
+func validateCustodySecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("evidence: custody secret must not be empty")
+	}
+	if strings.TrimSpace(secret) != secret {
+		return fmt.Errorf("evidence: custody secret must not carry leading or trailing whitespace; the key is the secret's exact UTF-8 bytes")
+	}
+	return nil
+}
+
+// KeyID names the custody secret generation this signer authenticates under.
 func (s *CustodySigner) KeyID() string {
 	if s == nil {
 		return ""

@@ -56,6 +56,7 @@ type GatewayConfig struct {
 	DeviceIDs          []string                `yaml:"device_ids"`
 	HeartbeatIntervalS int                     `yaml:"heartbeat_interval_s"`
 	Auth               GatewayAuthConfig       `yaml:"auth"`
+	Custody            GatewayCustodyConfig    `yaml:"custody"`
 	Encryption         GatewayEncryptionConfig `yaml:"encryption"`
 }
 
@@ -63,6 +64,24 @@ type GatewayAuthConfig struct {
 	Enabled                 bool   `yaml:"enabled"`
 	SharedSecretEnv         string `yaml:"shared_secret_env"`
 	PreviousSharedSecretEnv string `yaml:"previous_shared_secret_env"`
+}
+
+// GatewayCustodyConfig names the secret this gateway authenticates custody
+// acknowledgements with.
+//
+// A section of its own rather than a field under auth, deliberately. Custody
+// uses key material distinct from the runtime-gateway envelope secret: both are
+// symmetric secrets between the same two parties, which is exactly why they
+// must not be the same bytes, since domain separation makes the preimages
+// differ but does not stop a component holding the secret for one purpose from
+// minting artifacts for the other. Folding this into auth would invite the
+// reuse the separation exists to prevent.
+//
+// There is no key_id here. The identifier is derived from the secret, and
+// accepting a configured one would let a value name a generation it was not
+// derived from.
+type GatewayCustodyConfig struct {
+	SecretEnv string `yaml:"secret_env"`
 }
 
 type GatewayEncryptionConfig struct {
@@ -185,6 +204,7 @@ type fileGatewayConfig struct {
 	DeviceIDs          []string                `yaml:"device_ids"`
 	HeartbeatIntervalS *int                    `yaml:"heartbeat_interval_s"`
 	Auth               GatewayAuthConfig       `yaml:"auth"`
+	Custody            GatewayCustodyConfig    `yaml:"custody"`
 	Encryption         GatewayEncryptionConfig `yaml:"encryption"`
 }
 
@@ -237,6 +257,9 @@ func (f *fileConfig) normalize() (Config, error) {
 				SharedSecretEnv:         strings.TrimSpace(f.Gateway.Auth.SharedSecretEnv),
 				PreviousSharedSecretEnv: strings.TrimSpace(f.Gateway.Auth.PreviousSharedSecretEnv),
 			},
+			Custody: GatewayCustodyConfig{
+				SecretEnv: strings.TrimSpace(f.Gateway.Custody.SecretEnv),
+			},
 			Encryption: f.Gateway.Encryption,
 		},
 		Provider: normalizeProviderStrings(ProviderConfig{
@@ -270,6 +293,20 @@ func (f *fileConfig) normalize() (Config, error) {
 	}
 	if cfg.Gateway.Auth.PreviousSharedSecretEnv != "" && strings.ContainsAny(cfg.Gateway.Auth.PreviousSharedSecretEnv, " \t\r\n=") {
 		return Config{}, fmt.Errorf("gateway.auth.previous_shared_secret_env must be an environment variable name")
+	}
+	// Separation is checked on the names here and on the resolved bytes where
+	// the secrets are read. A name check alone would pass two variables holding
+	// one value, which is the reuse this exists to prevent.
+	if strings.ContainsAny(cfg.Gateway.Custody.SecretEnv, " \t\r\n=") {
+		return Config{}, fmt.Errorf("gateway.custody.secret_env must be an environment variable name")
+	}
+	if cfg.Gateway.Custody.SecretEnv != "" {
+		if cfg.Gateway.Custody.SecretEnv == cfg.Gateway.Auth.SharedSecretEnv {
+			return Config{}, fmt.Errorf("gateway.custody.secret_env must differ from gateway.auth.shared_secret_env")
+		}
+		if cfg.Gateway.Custody.SecretEnv == cfg.Gateway.Auth.PreviousSharedSecretEnv {
+			return Config{}, fmt.Errorf("gateway.custody.secret_env must differ from gateway.auth.previous_shared_secret_env")
+		}
 	}
 	if cfg.Gateway.Encryption.Enabled && !cfg.Gateway.Auth.Enabled {
 		return Config{}, fmt.Errorf("gateway.encryption.enabled requires gateway.auth.enabled")

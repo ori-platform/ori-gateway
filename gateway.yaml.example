@@ -7,6 +7,27 @@ gateway:
     enabled: false
     shared_secret_env: "GATEWAY_SHARED_SECRET"
     previous_shared_secret_env: "" # optional verify-only previous secret during rotation
+  custody:
+    # A SEPARATE secret from auth.shared_secret_env above, for a different
+    # purpose: this one authenticates the gateway's claim that it is carrying
+    # evidence. Reusing the envelope secret would let anything holding it for
+    # one purpose mint artifacts for the other, and that is refused on the
+    # resolved bytes rather than on the variable names.
+    #
+    # No key_id here: it is derived from the secret, so it changes when the
+    # secret changes rather than when someone remembers to change it.
+    #
+    # Generate it from a CSPRNG with at least 256 bits of entropy, and provision
+    # it with no surrounding whitespace -- the key is the secret's exact UTF-8
+    # bytes, so a stray newline derives an identifier the runtime does not hold.
+    # For example: openssl rand -base64 32
+    #
+    # A passphrase is not acceptable here. The custody MAC is what stands
+    # between the runtime's queue and anything on the site network that can
+    # reach the broker, and entropy is the only property that guarantee rests
+    # on. Nothing at startup can measure it, so this requirement is yours to
+    # keep: an unguessable secret is assumed by every check downstream of it.
+    secret_env: "" # env var name only; never put the secret in gateway.yaml
   encryption:
     enabled: false # decrypt sensitive runtime export responses; requires auth.enabled
 

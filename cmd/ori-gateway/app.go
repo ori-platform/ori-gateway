@@ -24,6 +24,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/dispatcher"
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
+	"github.com/ori-platform/ori-gateway/internal/evidence"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -158,6 +159,25 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err != nil {
 		return err
 	}
+	custodySecret, err := resolveCustodySecret(cfg.Gateway.Custody, gatewaySecrets)
+	if err != nil {
+		return err
+	}
+	// The signer is built during startup so custody key material is validated
+	// where a failure stops the gateway, rather than at the first envelope the
+	// courier takes custody of. A gateway that cannot derive its own key_id has
+	// no custody to offer, and reporting healthy while the runtime waits for
+	// acknowledgements that can never arrive is the failure mode this ordering
+	// removes. It is held rather than used: nothing routes an acknowledgement
+	// outbound until the inbound path lands.
+	var custodySigner *evidence.CustodySigner
+	if custodySecret != "" {
+		custodySigner, err = evidence.NewCustodySigner(custodySecret)
+		if err != nil {
+			return fmt.Errorf("construct custody signer: %w", err)
+		}
+	}
+	_ = custodySigner
 
 	reasoningProvider, err := deps.newProvider(cfg.Provider)
 	if err != nil {
@@ -625,6 +645,40 @@ func gatewayAuthSecretsFromConfig(auth config.GatewayAuthConfig) (gatewayAuthSec
 		}
 	}
 	return gatewayAuthSecrets{Enabled: true, CurrentSecret: secret, PreviousSecret: previousSecret}, nil
+}
+
+// resolveCustodySecret returns the secret this gateway signs custody
+// acknowledgements with, or "" when custody is not configured.
+//
+// Separation from the envelope secret is enforced here on the resolved bytes.
+// Configuration compares the variable names, which is necessary and not
+// sufficient: two names can hold one value, and a name check would call that
+// configuration correct while the courier signed custody with the same key it
+// uses for ordinary traffic.
+func resolveCustodySecret(
+	custody config.GatewayCustodyConfig,
+	envelope gatewayAuthSecrets,
+) (string, error) {
+	envName := strings.TrimSpace(custody.SecretEnv)
+	if envName == "" {
+		// Not configured is a choice: the courier simply issues no custody.
+		return "", nil
+	}
+	// Read exactly as provisioned. The custody MAC keys from these bytes, so
+	// trimming would key from bytes the operator did not set and derive an
+	// identifier no conforming peer reproduces; evidence.NewCustodySigner
+	// refuses surrounding whitespace instead.
+	secret := os.Getenv(envName)
+	if secret == "" {
+		// Configured and empty is a broken credential, not a decision. Reporting
+		// it as "custody not in use" would leave a gateway looking healthy while
+		// the runtime waited for acknowledgements that never come.
+		return "", fmt.Errorf("gateway.custody.secret_env names %q but that environment variable is empty", envName)
+	}
+	if secret == envelope.CurrentSecret || (envelope.PreviousSecret != "" && secret == envelope.PreviousSecret) {
+		return "", fmt.Errorf("gateway.custody.secret_env resolves to a runtime-gateway envelope secret; custody requires key material of its own")
+	}
+	return secret, nil
 }
 
 func runtimeClientOptionsFromSecrets(
