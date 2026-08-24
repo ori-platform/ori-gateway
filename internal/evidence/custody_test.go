@@ -4,6 +4,7 @@
 package evidence
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,9 +15,15 @@ import (
 )
 
 type custodyVectorFile struct {
-	DomainASCII      string `json:"domain_ascii"`
-	GatewaySecretHex string `json:"gateway_secret_hex"`
-	Cases            []struct {
+	DomainASCII string `json:"domain_ascii"`
+	// Three generations are published. The active one signs the valid case; the
+	// others exist so a rotation window and a retired tombstone can be
+	// exercised, and so a case naming an identifier no secret derives can be
+	// shown to be unproducible.
+	GatewaySecretHex         string `json:"gateway_secret_hex"`
+	PreviousGatewaySecretHex string `json:"previous_gateway_secret_hex"`
+	RetiredGatewaySecretHex  string `json:"retired_gateway_secret_hex"`
+	Cases                    []struct {
 		Name          string `json:"name"`
 		Authenticator string `json:"authenticator"`
 		Expected      string `json:"expected"`
@@ -49,30 +56,92 @@ func loadCustodyVectors(t *testing.T) custodyVectorFile {
 	return doc
 }
 
+// custodySecrets returns every published secret keyed by the identifier it
+// derives to. Selecting a producer this way rather than assuming one secret is
+// what the derived identifier now requires: the cases are signed under three
+// generations, and a producer holding only the active one can reproduce none
+// of the others.
+func custodySecrets(t *testing.T, doc custodyVectorFile) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, hexSecret := range []string{
+		doc.GatewaySecretHex,
+		doc.PreviousGatewaySecretHex,
+		doc.RetiredGatewaySecretHex,
+	} {
+		if hexSecret == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(hexSecret)
+		if err != nil {
+			t.Fatalf("decode secret: %v", err)
+		}
+		keyID, err := DeriveCustodyKeyID(string(raw))
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		out[keyID] = string(raw)
+	}
+	if len(out) == 0 {
+		t.Fatal("the vector file publishes no secrets")
+	}
+	return out
+}
+
 // TestCustodyMatchesContractVectors is the conformance test. The vector file is
 // the arbiter of these bytes, so the producer is checked against it rather than
 // against a locally-computed expectation.
+//
+// A case is reproducible exactly when some published secret derives the
+// identifier it names. That is not a convenience for the test -- it is the
+// property the derived identifier creates, and checking it both ways is what
+// proves a conforming producer cannot emit the adversarial cases at all.
 func TestCustodyMatchesContractVectors(t *testing.T) {
 	doc := loadCustodyVectors(t)
 	if doc.DomainASCII != CustodyDomain {
 		t.Fatalf("domain drift: contract says %q, package says %q", doc.DomainASCII, CustodyDomain)
 	}
-	secret, err := hex.DecodeString(doc.GatewaySecretHex)
-	if err != nil {
-		t.Fatalf("decode gateway secret: %v", err)
-	}
+	secrets := custodySecrets(t, doc)
 
-	checked := 0
+	reproduced, refused := 0, 0
 	for _, c := range doc.Cases {
-		// A case whose authenticator is deliberately invalid cannot be reproduced
-		// by a correct producer; it exists to exercise a verifier.
+		secret, derivable := secrets[c.Artifact.KeyID]
+
+		// An identifier no held secret derives to cannot be produced here, and
+		// a producer that could emit one would be naming a generation it does
+		// not hold.
+		if !derivable {
+			refused++
+			t.Run(c.Name+"_is_not_producible", func(t *testing.T) {
+				for keyID, held := range secrets {
+					signer, err := NewCustodySigner(held)
+					if err != nil {
+						t.Fatalf("signer: %v", err)
+					}
+					if signer.KeyID() == c.Artifact.KeyID {
+						t.Fatalf("secret for %s derives the case's identifier after all", keyID)
+					}
+				}
+			})
+			continue
+		}
+
+		// A case whose authenticator is deliberately invalid cannot be
+		// reproduced by a correct producer; it exists to exercise a verifier.
 		if c.Authenticator != "valid" {
 			continue
 		}
+
+		reproduced++
 		t.Run(c.Name, func(t *testing.T) {
-			signer, err := NewCustodySigner(c.Artifact.KeyID, string(secret))
+			signer, err := NewCustodySigner(secret)
 			if err != nil {
 				t.Fatalf("signer: %v", err)
+			}
+			// Derived, not supplied. Passing the vector's own identifier in
+			// would have made this assertion circular.
+			if signer.KeyID() != c.Artifact.KeyID {
+				t.Fatalf("derived key_id %s, vector names %s", signer.KeyID(), c.Artifact.KeyID)
 			}
 			ack, signed, err := signer.Acknowledge(
 				c.Artifact.DeviceID, c.Artifact.LocalSeq,
@@ -92,14 +161,52 @@ func TestCustodyMatchesContractVectors(t *testing.T) {
 			if signed[len(CustodyDomain)] != 0 {
 				t.Error("the domain must be terminated by a single NUL byte")
 			}
-			if ack.MAC != c.Artifact.MAC {
-				t.Errorf("mac differs\n got %s\nwant %s", ack.MAC, c.Artifact.MAC)
+			if ack.MAC == c.Artifact.MAC {
+				return
 			}
+
+			// A conforming producer always writes the identifier it derives, so
+			// no producer configuration can emit a body naming one generation
+			// while authenticated under another. Differing bytes therefore mean
+			// either that -- the case that separates selection from trial
+			// verification on the verifying side -- or a defect here.
+			//
+			// Telling them apart is a verifier's question, not a producer's:
+			// recompute the MAC over the vector's own canonical bytes under
+			// each held secret. If one matches, the artifact is internally
+			// consistent and unproducible by construction.
+			signedUnder := ""
+			for keyID, held := range secrets {
+				if keyID == c.Artifact.KeyID {
+					continue
+				}
+				mac := hmac.New(sha256.New, []byte(held))
+				mac.Write([]byte(CustodyDomain))
+				mac.Write([]byte{0})
+				mac.Write(wantCanonical)
+				if "hmac-sha256:"+hex.EncodeToString(mac.Sum(nil)) == c.Artifact.MAC {
+					signedUnder = keyID
+					break
+				}
+			}
+			if signedUnder == "" {
+				t.Errorf("mac differs and no other held generation produces it\n got %s\nwant %s",
+					ack.MAC, c.Artifact.MAC)
+				return
+			}
+			if c.Expected != "reject" {
+				t.Errorf("case names %s but was signed under %s, yet expects acceptance",
+					c.Artifact.KeyID, signedUnder)
+			}
+			t.Logf("names %s, signed under %s: unproducible by construction, as intended",
+				c.Artifact.KeyID, signedUnder)
 		})
-		checked++
 	}
-	if checked == 0 {
+	if reproduced == 0 {
 		t.Fatal("no reproducible vector case was exercised")
+	}
+	if refused == 0 {
+		t.Fatal("no non-producible case was exercised; the derived identifier proves nothing here")
 	}
 }
 
@@ -115,7 +222,7 @@ func TestCustodyRejectionVectorsAreNotReproducible(t *testing.T) {
 			continue
 		}
 		seen++
-		signer, err := NewCustodySigner(c.Artifact.KeyID, string(secret))
+		signer, err := NewCustodySigner(string(secret))
 		if err != nil {
 			continue
 		}
@@ -134,7 +241,7 @@ func TestCustodyRejectionVectorsAreNotReproducible(t *testing.T) {
 // TestCustodySignerRefusesIncompleteInput fails closed rather than emitting an
 // artifact a receiver would reject or, worse, accept with a wrong binding.
 func TestCustodySignerRefusesIncompleteInput(t *testing.T) {
-	signer, err := NewCustodySigner("gw-secret-1", "secret")
+	signer, err := NewCustodySigner("secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,18 +277,15 @@ func TestCustodySignerRefusesIncompleteInput(t *testing.T) {
 			}
 		})
 	}
-	if _, err := NewCustodySigner("", "secret"); err == nil {
-		t.Error("expected refusal for an empty key_id")
-	}
-	if _, err := NewCustodySigner("gw-secret-1", "  "); err == nil {
-		t.Error("expected refusal for an empty shared secret")
+	if _, err := NewCustodySigner("  "); err == nil {
+		t.Error("expected refusal for an empty custody secret")
 	}
 }
 
 // TestCustodyPreimageExcludesTheAuthenticator states the rule directly: an
 // artifact never authenticates its own authenticator.
 func TestCustodyPreimageExcludesTheAuthenticator(t *testing.T) {
-	signer, _ := NewCustodySigner("gw-secret-1", "secret")
+	signer, _ := NewCustodySigner("secret")
 	ack, signed, err := signer.Acknowledge("dev-01", 7, "sha256:"+strings.Repeat("ab", 32), 1787000000900)
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +338,7 @@ func TestVendoredCustodyVectorsMatchManifest(t *testing.T) {
 // TestCustodyAcceptsAWellFormedDigest is the positive half of the digest rule,
 // so the validator cannot regress into refusing everything and still pass.
 func TestCustodyAcceptsAWellFormedDigest(t *testing.T) {
-	signer, err := NewCustodySigner("gw-secret-1", "secret")
+	signer, err := NewCustodySigner("secret")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,7 @@
 package evidence
 
 import (
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -64,8 +65,44 @@ type CustodyAcknowledgement struct {
 	MAC            string `json:"mac"`
 }
 
+// Salt and info are fixed by evidence-exchange/v1 and must not vary per device
+// or per site. The identifier names a secret generation, not a device: one
+// gateway holding custody for several devices under one secret issues the same
+// key_id for all of them, and that is correct rather than a collision.
+const (
+	custodyKeyIDSalt   = "ori.evidence_custody_key_id.v1"
+	custodyKeyIDInfo   = "gateway_custody"
+	custodyKeyIDPrefix = "hkdf-sha256:"
+	custodyKeyIDBytes  = 16
+)
+
+// DeriveCustodyKeyID returns the (gateway_custody, key_id) selector for one
+// custody secret generation.
+//
+// Derived rather than configured, because a configured name survives a
+// rotation unless an operator remembers to change it, and an identifier that
+// names two different secrets cannot select between them -- which is the
+// selector's whole function on the runtime side.
+func DeriveCustodyKeyID(sharedSecret string) (string, error) {
+	secret := strings.TrimSpace(sharedSecret)
+	if secret == "" {
+		return "", fmt.Errorf("evidence: custody secret must not be empty")
+	}
+	material, err := hkdf.Key(
+		sha256.New,
+		[]byte(secret),
+		[]byte(custodyKeyIDSalt),
+		custodyKeyIDInfo,
+		custodyKeyIDBytes,
+	)
+	if err != nil {
+		return "", fmt.Errorf("evidence: deriving custody key_id: %w", err)
+	}
+	return custodyKeyIDPrefix + hex.EncodeToString(material), nil
+}
+
 // CustodySigner authenticates custody acknowledgements with the current
-// runtime-gateway shared secret.
+// custody secret.
 //
 // It holds exactly one secret. A rotated-out secret is verify-only by
 // definition here, because this type never verifies anything: it signs, and it
@@ -76,15 +113,20 @@ type CustodySigner struct {
 	secret []byte
 }
 
-// NewCustodySigner builds a signer for the named shared-secret generation.
-func NewCustodySigner(keyID string, sharedSecret string) (*CustodySigner, error) {
-	keyID = strings.TrimSpace(keyID)
-	if keyID == "" {
-		return nil, fmt.Errorf("evidence: custody key_id must not be empty")
-	}
+// NewCustodySigner builds a signer for one custody secret generation.
+//
+// The identifier is derived here and cannot be supplied. Accepting one would
+// let a misconfigured or hostile value name a secret it was not derived from,
+// and the runtime selects by that identifier -- so a mismatch would present as
+// a failed authentication rather than as the configuration error it is.
+func NewCustodySigner(sharedSecret string) (*CustodySigner, error) {
 	secret := strings.TrimSpace(sharedSecret)
 	if secret == "" {
 		return nil, fmt.Errorf("evidence: custody shared secret must not be empty")
+	}
+	keyID, err := DeriveCustodyKeyID(secret)
+	if err != nil {
+		return nil, err
 	}
 	return &CustodySigner{keyID: keyID, secret: []byte(secret)}, nil
 }

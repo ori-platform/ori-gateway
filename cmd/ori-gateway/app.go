@@ -627,6 +627,36 @@ func gatewayAuthSecretsFromConfig(auth config.GatewayAuthConfig) (gatewayAuthSec
 	return gatewayAuthSecrets{Enabled: true, CurrentSecret: secret, PreviousSecret: previousSecret}, nil
 }
 
+// resolveCustodySecret returns the secret this gateway signs custody
+// acknowledgements with, or "" when custody is not configured.
+//
+// Separation from the envelope secret is enforced here on the resolved bytes.
+// Configuration compares the variable names, which is necessary and not
+// sufficient: two names can hold one value, and a name check would call that
+// configuration correct while the courier signed custody with the same key it
+// uses for ordinary traffic.
+func resolveCustodySecret(
+	custody config.GatewayCustodyConfig,
+	envelope gatewayAuthSecrets,
+) (string, error) {
+	envName := strings.TrimSpace(custody.SecretEnv)
+	if envName == "" {
+		// Not configured is a choice: the courier simply issues no custody.
+		return "", nil
+	}
+	secret := strings.TrimSpace(os.Getenv(envName))
+	if secret == "" {
+		// Configured and empty is a broken credential, not a decision. Reporting
+		// it as "custody not in use" would leave a gateway looking healthy while
+		// the runtime waited for acknowledgements that never come.
+		return "", fmt.Errorf("gateway.custody.secret_env names %q but that environment variable is empty", envName)
+	}
+	if secret == envelope.CurrentSecret || (envelope.PreviousSecret != "" && secret == envelope.PreviousSecret) {
+		return "", fmt.Errorf("gateway.custody.secret_env resolves to a runtime-gateway envelope secret; custody requires key material of its own")
+	}
+	return secret, nil
+}
+
 func runtimeClientOptionsFromSecrets(
 	encryption config.GatewayEncryptionConfig,
 	secrets gatewayAuthSecrets,
