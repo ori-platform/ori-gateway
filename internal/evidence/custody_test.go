@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -354,5 +355,42 @@ func TestCustodyAcceptsAWellFormedDigest(t *testing.T) {
 	// The lowest sequence a real envelope can carry must be accepted.
 	if _, _, err := signer.Acknowledge("dev-01", 1, "sha256:"+strings.Repeat("ab", 32), 1787000000900); err != nil {
 		t.Errorf("local_seq 1 refused: %v", err)
+	}
+}
+
+// TestCustodySecretIsNeverNormalised holds the line the contract draws: the key
+// is the secret's exact UTF-8 bytes.
+//
+// A secret carrying a stray newline is the ordinary shape of one read from a
+// file or a Docker env file. Trimming it would key from bytes the operator did
+// not provision and derive an identifier and a MAC no conforming peer
+// reproduces -- a divergence that surfaces as bad_authenticator on the far side
+// rather than as the configuration error it is. The assertion is written so it
+// still holds if a later revision decides to accept surrounding whitespace:
+// what may never happen is such a secret quietly deriving the trimmed one's
+// identifier.
+func TestCustodySecretIsNeverNormalised(t *testing.T) {
+	const base = "custody-secret"
+	trimmed, err := DeriveCustodyKeyID(base)
+	if err != nil {
+		t.Fatalf("deriving from a well-formed secret: %v", err)
+	}
+
+	for _, variant := range []string{
+		base + "\n",
+		base + " ",
+		" " + base,
+		"\t" + base + "\t",
+		"\r\n" + base,
+	} {
+		t.Run(strconv.Quote(variant), func(t *testing.T) {
+			got, err := DeriveCustodyKeyID(variant)
+			if err != nil {
+				return
+			}
+			if got == trimmed {
+				t.Fatalf("%q derived the trimmed secret's key_id; secret material was normalised", variant)
+			}
+		})
 	}
 }
