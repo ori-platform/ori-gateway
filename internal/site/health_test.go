@@ -161,6 +161,28 @@ func TestProjectSiteHealthGatewayDegradedStatus(t *testing.T) {
 	}
 }
 
+func TestProjectSiteHealthEvidenceDeliveryFailureDegradesSite(t *testing.T) {
+	reg := NewRegistry()
+	p := NewProjector(reg, ProjectOptions{})
+	gw := healthyGateway()
+	gw.EvidenceDelivery = &GatewayEvidenceDeliveryView{
+		Pending:         3,
+		Degraded:        true,
+		Blocked:         true,
+		LastFailureAtMS: 10_000,
+		LastError:       "channel_permanent_refusal",
+	}
+
+	h := p.Project(time.UnixMilli(10_000), gw)
+	if h.Status != SiteStatusDegraded {
+		t.Fatalf("blocked evidence delivery must degrade site, got %q", h.Status)
+	}
+	if h.Gateway.EvidenceDelivery == nil || !h.Gateway.EvidenceDelivery.Blocked ||
+		h.Gateway.EvidenceDelivery.Pending != 3 {
+		t.Fatalf("evidence delivery projection = %#v", h.Gateway.EvidenceDelivery)
+	}
+}
+
 func TestProjectSiteHealthNodeDegradedStatus(t *testing.T) {
 	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusDegraded, LastSeenMS: 9900})
@@ -251,6 +273,9 @@ func TestProjectSiteHealthNoSecretsOrURLsInJSON(t *testing.T) {
 		UptimeS:              60,
 		WebhookBridgeEnabled: true,
 		WebhookBridgeReady:   true,
+		EvidenceDelivery: &GatewayEvidenceDeliveryView{
+			Pending: 2, Degraded: true, LastError: "channel_unavailable",
+		},
 	}
 	h := p.Project(time.UnixMilli(10000), gw)
 

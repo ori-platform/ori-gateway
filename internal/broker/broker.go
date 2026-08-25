@@ -32,6 +32,11 @@ type Options struct {
 	ClientID  string
 	Logger    *slog.Logger
 
+	// PersistentSession preserves QoS 1 subscriptions while this stable client
+	// identity is disconnected. It is reserved for durable application
+	// protocols whose own acknowledgements govern retirement.
+	PersistentSession bool
+
 	// ReconnectInitial and ReconnectMax tune Paho auto-reconnect backoff.
 	// Zero values use 1s initial and 30s max.
 	ReconnectInitial time.Duration
@@ -82,7 +87,7 @@ func New(opts Options) (*Client, error) {
 	pahoOpts := mqtt.NewClientOptions()
 	pahoOpts.AddBroker(opts.BrokerURL)
 	pahoOpts.SetClientID(opts.ClientID)
-	pahoOpts.SetCleanSession(true)
+	pahoOpts.SetCleanSession(!opts.PersistentSession)
 	pahoOpts.SetAutoReconnect(true)
 	pahoOpts.SetConnectRetryInterval(reconnectInitial)
 	pahoOpts.SetMaxReconnectInterval(reconnectMax)

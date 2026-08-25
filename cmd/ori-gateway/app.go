@@ -40,6 +40,7 @@ import (
 const (
 	defaultConfigPath          = "gateway.yaml"
 	defaultClientID            = "ori-gateway"
+	defaultEvidenceClientID    = "ori-gateway-evidence"
 	defaultRequestFailureLimit = 5
 )
 
@@ -177,7 +178,44 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			return fmt.Errorf("construct custody signer: %w", err)
 		}
 	}
-	_ = custodySigner
+
+	var evidenceQueue *evidence.DurableQueue
+	var evidenceWorker *evidence.DeliveryWorker
+	var authoritySink *evidence.DurableAuthoritySink
+	if cfg.Evidence.Enabled {
+		if !gatewaySecrets.Enabled || custodySigner == nil {
+			return fmt.Errorf("evidence courier requires gateway auth and dedicated custody configuration")
+		}
+		channelConfig, err := resolveEvidenceChannel(cfg.Evidence, gatewaySecrets, custodySecret)
+		if err != nil {
+			return err
+		}
+		evidenceQueue, err = evidence.OpenDurableQueue(evidence.QueueOptions{
+			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes, Now: deps.now,
+		})
+		if err != nil {
+			return fmt.Errorf("open evidence outbound queue: %w", err)
+		}
+		authoritySink, err = evidence.OpenDurableAuthoritySink(evidence.QueueOptions{
+			Directory: cfg.Evidence.ReturnQueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes, Now: deps.now,
+		})
+		if err != nil {
+			return fmt.Errorf("open evidence return queue: %w", err)
+		}
+		channel, err := evidence.NewHTTPChannel(evidence.HTTPChannelOptions{
+			Endpoint: channelConfig.endpoint, ClientID: channelConfig.clientID, Secret: channelConfig.secret, Now: deps.now,
+		})
+		if err != nil {
+			return fmt.Errorf("construct independent evidence channel")
+		}
+		evidenceWorker, err = evidence.NewDeliveryWorker(
+			evidenceQueue, channel, authoritySink,
+			evidence.DeliveryWorkerOptions{RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second},
+		)
+		if err != nil {
+			return fmt.Errorf("construct evidence delivery worker: %w", err)
+		}
+	}
 
 	reasoningProvider, err := deps.newProvider(cfg.Provider)
 	if err != nil {
@@ -214,6 +252,20 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			_ = client.Disconnect(context.Background())
 		}
 	}()
+	var evidenceBroker brokerClient
+	if cfg.Evidence.Enabled {
+		evidenceBroker, err = deps.newBroker(broker.Options{
+			BrokerURL: cfg.Gateway.BrokerURL, ClientID: defaultEvidenceClientID,
+			Logger: deps.logger, PersistentSession: true,
+		})
+		if err != nil {
+			return fmt.Errorf("construct evidence broker: %w", err)
+		}
+		if err := evidenceBroker.Connect(ctx); err != nil {
+			return fmt.Errorf("connect evidence broker: %w", err)
+		}
+		defer func() { _ = evidenceBroker.Disconnect(context.Background()) }()
+	}
 
 	simClient, err := deps.newSIM(cfg.SIM, sim.Options{})
 	if err != nil {
@@ -296,6 +348,35 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if weeklyReport != nil {
 		runners.start("weekly report runner", weeklyReport.Run)
 	}
+	var evidenceIngress *evidence.RuntimeIngress
+	var returnPublisher *evidence.ReturnPublisher
+	if evidenceWorker != nil {
+		courier, err := evidence.NewCourier(evidenceQueue, custodySigner)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("construct evidence courier: %w", err)
+		}
+		evidenceIngress, err = evidence.NewRuntimeIngress(
+			courier,
+			evidenceBroker.Publish,
+			gatewaySecrets.CurrentSecret,
+			deps.now,
+		)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("construct evidence runtime ingress: %w", err)
+		}
+		returnPublisher, err = evidence.NewReturnPublisher(
+			authoritySink, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
+			deps.now, time.Duration(cfg.Evidence.RetryIntervalS)*time.Second,
+		)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("construct evidence return publisher: %w", err)
+		}
+		runners.start("evidence delivery worker", evidenceWorker.Run)
+		runners.start("evidence return publisher", returnPublisher.Run)
+	}
 	if webhookBridge != nil {
 		webhookBridgeReady.Store(true)
 		runners.start("webhook bridge", func(ctx context.Context) error {
@@ -375,6 +456,48 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return fmt.Errorf("subscribe reasoning requests: %w", err)
 	}
 
+	if evidenceIngress != nil {
+		allowedDevices := make(map[string]bool, len(cfg.Gateway.DeviceIDs))
+		for _, deviceID := range cfg.Gateway.DeviceIDs {
+			allowedDevices[deviceID] = true
+		}
+		if err := evidenceBroker.Subscribe(runCtx, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
+			deviceID, parseErr := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
+			if parseErr != nil || !allowedDevices[deviceID] {
+				deps.logger.Warn("evidence outbound transport refused")
+				return
+			}
+			if err := evidenceIngress.Handle(runCtx, topic, payload); err != nil {
+				deps.logger.Warn("evidence outbound transport refused")
+				return
+			}
+			evidenceWorker.Notify()
+			// A newly observed runtime artifact can repair receiver-state
+			// refusals such as unknown_sequence, and commonly follows a runtime
+			// release that installs an authority key or version. Retry retained
+			// authority output on that event, never on a fixed short loop.
+			returnPublisher.ReceiverStateChanged()
+		}); err != nil {
+			shutdownRunners()
+			return fmt.Errorf("subscribe outbound evidence: %w", err)
+		}
+		for _, deviceID := range cfg.Gateway.DeviceIDs {
+			ackTopic, err := contracts.EvidenceInboundAckTopic(deviceID)
+			if err != nil {
+				shutdownRunners()
+				return fmt.Errorf("evidence inbound acknowledgement topic: %w", err)
+			}
+			if err := evidenceBroker.Subscribe(runCtx, ackTopic, broker.QoSReasoning, func(topic string, payload []byte) {
+				if err := returnPublisher.HandleAck(topic, payload); err != nil {
+					deps.logger.Warn("evidence inbound acknowledgement refused")
+				}
+			}); err != nil {
+				shutdownRunners()
+				return fmt.Errorf("subscribe evidence inbound acknowledgements: %w", err)
+			}
+		}
+	}
+
 	postureDebounce := newPostureDebouncer()
 	for _, deviceID := range cfg.Gateway.DeviceIDs {
 		topic, err := contracts.RuntimeNodeHeartbeatTopic(deviceID)
@@ -438,7 +561,9 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		})
 		gatewayViewFn := func() site.GatewayView {
 			status := site.SiteStatusHealthy
-			if !providerStatus.Healthy(runCtx) {
+			evidenceDelivery := evidenceDeliveryView(evidenceWorker)
+			if !providerStatus.Healthy(runCtx) ||
+				(evidenceDelivery != nil && (evidenceDelivery.Degraded || evidenceDelivery.Blocked)) {
 				status = site.SiteStatusDegraded
 			}
 			return site.GatewayView{
@@ -447,6 +572,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				UptimeS:              deps.now().Sub(startedAt).Seconds(),
 				WebhookBridgeEnabled: cfg.WebhookBridge.Enabled,
 				WebhookBridgeReady:   webhookBridgeReady.Load(),
+				EvidenceDelivery:     evidenceDelivery,
 			}
 		}
 		runners.start("site health server", site.NewHealthHandler(
@@ -471,6 +597,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		shutdownRunners()
 		return err
 	}
+}
+
+func evidenceDeliveryView(worker *evidence.DeliveryWorker) *site.GatewayEvidenceDeliveryView {
+	if worker == nil {
+		return nil
+	}
+	status := worker.Status()
+	view := &site.GatewayEvidenceDeliveryView{
+		Pending:   status.Pending,
+		Degraded:  status.Degraded,
+		Blocked:   status.Blocked,
+		LastError: status.LastError,
+	}
+	if !status.LastFailureAt.IsZero() {
+		view.LastFailureAtMS = status.LastFailureAt.UnixMilli()
+	}
+	return view
 }
 
 func disconnectBroker(client brokerClient, disconnect *bool) error {
@@ -679,6 +822,37 @@ func resolveCustodySecret(
 		return "", fmt.Errorf("gateway.custody.secret_env resolves to a runtime-gateway envelope secret; custody requires key material of its own")
 	}
 	return secret, nil
+}
+
+type resolvedEvidenceChannel struct {
+	endpoint string
+	clientID string
+	secret   string
+}
+
+func resolveEvidenceChannel(
+	cfg config.EvidenceConfig,
+	envelope gatewayAuthSecrets,
+	custodySecret string,
+) (resolvedEvidenceChannel, error) {
+	values := map[string]string{
+		"endpoint":  strings.TrimSpace(os.Getenv(cfg.EndpointEnv)),
+		"client_id": strings.TrimSpace(os.Getenv(cfg.ClientIDEnv)),
+		"secret":    os.Getenv(cfg.SecretEnv),
+	}
+	for field, value := range values {
+		if value == "" {
+			return resolvedEvidenceChannel{}, fmt.Errorf("evidence %s environment variable is empty", field)
+		}
+	}
+	secret := values["secret"]
+	if strings.TrimSpace(secret) != secret {
+		return resolvedEvidenceChannel{}, fmt.Errorf("evidence ingest secret carries surrounding whitespace")
+	}
+	if secret == custodySecret || secret == envelope.CurrentSecret || (envelope.PreviousSecret != "" && secret == envelope.PreviousSecret) {
+		return resolvedEvidenceChannel{}, fmt.Errorf("evidence ingest secret must be distinct from custody and MQTT envelope secrets")
+	}
+	return resolvedEvidenceChannel{endpoint: values["endpoint"], clientID: values["client_id"], secret: secret}, nil
 }
 
 func runtimeClientOptionsFromSecrets(

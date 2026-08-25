@@ -9,6 +9,7 @@ This repository implements the LAN gateway and site coordinator for Ori.
 1. Provide Tier 3 LAN reasoning for [`ori-runtime`](https://github.com/ori-platform/ori-runtime) devices.
 2. Publish a LAN health heartbeat for [`ori-runtime`](https://github.com/ori-platform/ori-runtime) capability posture.
 3. Coordinate multi-device site context.
+4. Act as the blind, durable courier between runtimes and the independent evidence authority.
 
 It is not [`ori-runtime`](https://github.com/ori-platform/ori-runtime) and not [`ori-cloud`](https://github.com/ori-platform/ori-cloud).
 
@@ -184,6 +185,19 @@ Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestGatewaySiteHealthConstructsRuntimeClientForPosture`, and
 `TestGatewaySiteHealthPostureFetchedAfterHeartbeat`.
 
+19. `GW-19` The gateway is a blind, durable evidence courier.
+Outbound evidence artifacts must be queued byte-for-byte before custody is
+acknowledged, and queue exhaustion must be an explicit retriable refusal.
+Custody is authenticated under the dedicated `gateway_custody` secret and must
+never be treated as an authority receipt. Delivery envelopes, registrations,
+commissioning authorisations, and checkpoints remain end-to-end signed; the
+gateway does not verify, rewrite, or re-sign them. Authority receipts and epoch
+confirmations remain opaque and must be durably staged before outbound queue
+retirement. The evidence channel shares no authority, keys, storage,
+acknowledgement, or failure status with fleet management, and transport errors
+must be reduced before reaching logs or status so the evidence authority's
+identity and endpoint cannot leak. Verified by the tests in `internal/evidence`.
+
 ## Layout
 
 ```text
@@ -192,6 +206,7 @@ internal/broker/
 internal/config/
 internal/contracts/
 internal/dispatcher/
+internal/evidence/
 internal/fleet/
 internal/heartbeat/
 internal/provider/

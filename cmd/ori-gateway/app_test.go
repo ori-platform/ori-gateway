@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
+	"github.com/ori-platform/ori-gateway/internal/evidence"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -796,6 +798,62 @@ func TestMainStartsHeartbeatBeforeSubscribe(t *testing.T) {
 	}
 }
 
+func TestEvidenceUsesDedicatedPersistentBrokerSession(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	t.Setenv("GATEWAY_CUSTODY", "gateway-custody-secret-with-at-least-32-bytes")
+	t.Setenv("EVIDENCE_ENDPOINT", "https://evidence.invalid/v1/evidence/artifacts")
+	t.Setenv("EVIDENCE_CLIENT", "site-gateway-a")
+	t.Setenv("EVIDENCE_SECRET", "evidence-ingest-secret-with-at-least-32-bytes")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
+	cfg.Evidence = config.EvidenceConfig{
+		Enabled: true, QueueDirectory: filepath.Join(t.TempDir(), "outbound"),
+		ReturnQueueDirectory: filepath.Join(t.TempDir(), "returned"), MaxItems: 10,
+		MaxBytes: 1 << 20, RetryIntervalS: 1, EndpointEnv: "EVIDENCE_ENDPOINT",
+		ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
+	}
+	mainBroker := newFakeBroker()
+	evidenceBroker := newFakeBroker()
+	deps := baseDeps(t, cfg, mainBroker, &fakeProvider{healthy: true}, newFakeHeartbeat())
+	var opts []broker.Options
+	var optsMu sync.Mutex
+	deps.newBroker = func(got broker.Options) (brokerClient, error) {
+		optsMu.Lock()
+		opts = append(opts, got)
+		optsMu.Unlock()
+		if got.ClientID == defaultEvidenceClientID {
+			return evidenceBroker, nil
+		}
+		return mainBroker, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if evidenceBroker.handlerFor(contracts.EvidenceOutboundTopicFilter) != nil &&
+			evidenceBroker.handlerFor("ori/dev-01/evidence/inbound/ack") != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if evidenceBroker.handlerFor(contracts.EvidenceOutboundTopicFilter) == nil ||
+		evidenceBroker.handlerFor("ori/dev-01/evidence/inbound/ack") == nil {
+		t.Fatalf("evidence broker subscriptions = %v", evidenceBroker.subscribeTopics)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	optsMu.Lock()
+	defer optsMu.Unlock()
+	if len(opts) != 2 || opts[0].ClientID != defaultClientID || opts[0].PersistentSession ||
+		opts[1].ClientID != defaultEvidenceClientID || !opts[1].PersistentSession {
+		t.Fatalf("broker options = %#v", opts)
+	}
+}
+
 func TestMainDisabledOptionalModulesDoNotFailStartup(t *testing.T) {
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
@@ -1018,18 +1076,16 @@ func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "future", Status: site.NodeStatusHealthy, LastSeenMS: 100_000})
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "fresh", Status: site.NodeStatusHealthy, LastSeenMS: 9999})
 	now := time.UnixMilli(10_000)
-	calls := 0
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go evictStaleRuntimeNodes(ctx, registry, time.Millisecond, func() time.Time {
-		calls++
 		return now
 	}, slog.Default())
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := registry.Snapshot()
-		if len(snapshot) == 1 && snapshot[0].DeviceID == "fresh" && calls > 0 {
+		if len(snapshot) == 1 && snapshot[0].DeviceID == "fresh" {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -1952,6 +2008,88 @@ func TestGatewaySiteHealthServerStartsWhenEnabled(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("gateway did not stop")
+	}
+}
+
+func TestGatewaySiteHealthIncludesEnabledEvidenceDelivery(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	t.Setenv("GATEWAY_CUSTODY", "gateway-custody-secret-with-at-least-32-bytes")
+	t.Setenv("EVIDENCE_ENDPOINT", "https://127.0.0.1:1/v1/evidence/artifacts")
+	t.Setenv("EVIDENCE_CLIENT", "site-gateway-a")
+	t.Setenv("EVIDENCE_SECRET", "evidence-ingest-secret-with-at-least-32-bytes")
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	queueDirectory := filepath.Join(t.TempDir(), "outbound")
+	returnQueueDirectory := filepath.Join(t.TempDir(), "returned")
+	queue, err := evidence.OpenDurableQueue(evidence.QueueOptions{
+		Directory: queueDirectory, MaxItems: 10, MaxBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(evidence.ArtifactCheckpoint, []byte("checkpoint-wire-bytes")); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := validConfig()
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
+	cfg.Evidence = config.EvidenceConfig{
+		Enabled: true, QueueDirectory: queueDirectory,
+		ReturnQueueDirectory: returnQueueDirectory, MaxItems: 10,
+		MaxBytes: 1 << 20, RetryIntervalS: 1, EndpointEnv: "EVIDENCE_ENDPOINT",
+		ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
+	}
+
+	mainBroker := newFakeBroker()
+	evidenceBroker := newFakeBroker()
+	deps := baseDeps(t, cfg, mainBroker, &fakeProvider{healthy: true}, newFakeHeartbeat())
+	deps.newBroker = func(opts broker.Options) (brokerClient, error) {
+		if opts.ClientID == defaultEvidenceClientID {
+			return evidenceBroker, nil
+		}
+		return mainBroker, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, getErr := http.Get("http://" + addr + "/health") //nolint:noctx
+		if getErr == nil {
+			defer resp.Body.Close()
+			var health site.SiteHealth
+			if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+				t.Fatal(err)
+			}
+			if health.Gateway.EvidenceDelivery == nil {
+				t.Fatal("enabled evidence courier is absent from site health")
+			}
+			if health.Gateway.EvidenceDelivery.Degraded {
+				if health.Status != site.SiteStatusDegraded ||
+					health.Gateway.EvidenceDelivery.Pending != 1 ||
+					health.Gateway.EvidenceDelivery.LastError != "channel_unavailable" {
+					t.Fatalf("degraded evidence delivery = %#v; site status = %q", health.Gateway.EvidenceDelivery, health.Status)
+				}
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("site health server did not become ready: %v", getErr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

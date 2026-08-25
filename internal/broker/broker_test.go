@@ -43,29 +43,27 @@ func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
 	if err := srv.AddListener(tcp); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan struct{})
-	go func() {
-		_ = srv.Serve()
-		close(done)
-	}()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	// AddListener has already bound the socket, and Serve starts its accept loop
+	// before returning. A raw TCP readiness probe is unsafe here: teardown can
+	// race the broker goroutine still attaching that probe as an MQTT client.
+	if err := srv.Serve(); err != nil {
+		t.Fatal(err)
 	}
 
 	return "tcp://" + addr, func() {
-		_ = srv.Close()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Log("mqtt test broker shutdown timed out")
+		// Paho's Disconnect returns before the embedded broker has necessarily
+		// completed its client-removal path. Mochi's Close may otherwise take a
+		// nested Clients read lock while that removal is waiting for the write
+		// lock, deadlocking teardown. Join the observable client lifecycle first.
+		deadline := time.Now().Add(5 * time.Second)
+		for atomic.LoadInt64(&srv.Info.ClientsConnected) != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
+		if connected := atomic.LoadInt64(&srv.Info.ClientsConnected); connected != 0 {
+			t.Errorf("mqtt test broker still has %d connected clients at shutdown", connected)
+			return
+		}
+		_ = srv.Close()
 	}
 }
 
@@ -131,6 +129,45 @@ func TestConnectAndPublish(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for published message")
+	}
+}
+
+func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *testing.T) {
+	brokerURL, stop := startTestBroker(t)
+	defer stop()
+	ctx := context.Background()
+	sub := testClient(t, brokerURL, "persistent-evidence-sub", Options{PersistentSession: true})
+	pub := testClient(t, brokerURL, "persistent-evidence-pub", Options{})
+	if err := sub.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan []byte, 1)
+	if err := sub.Subscribe(ctx, "ori/device-a/evidence/inbound", QoSReasoning, func(_ string, payload []byte) {
+		received <- append([]byte(nil), payload...)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.Disconnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Disconnect(ctx)
+	if err := pub.Publish(ctx, "ori/device-a/evidence/inbound", QoSReasoning, false, []byte("authority-artifact")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Disconnect(ctx)
+	select {
+	case got := <-received:
+		if string(got) != "authority-artifact" {
+			t.Fatalf("queued payload = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistent evidence session lost QoS 1 message")
 	}
 }
 

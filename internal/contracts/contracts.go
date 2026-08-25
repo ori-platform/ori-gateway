@@ -13,10 +13,14 @@ const (
 	GatewayReasoningRequestTopicFilter = "ori/+/reasoning/request"
 	RuntimeNodeHeartbeatTopicFilter    = "ori/+/runtime/heartbeat"
 	TierCEnrichmentRequestTopicFilter  = "ori/+/tier_c/enrichment/request"
+	EvidenceOutboundTopicFilter        = "ori/+/evidence/outbound"
 	HeartbeatMessageType               = "gateway.heartbeat"
 	RuntimeHeartbeatMessageType        = "runtime.heartbeat"
 	ExportRequestMessageType           = "export_request"
 	ExportResponseMessageType          = "export_response"
+	EvidenceOutboundAckMessageType     = "evidence_outbound_ack"
+	EvidenceInboundMessageType         = "evidence_inbound"
+	EvidenceInboundAckMessageType      = "evidence_inbound_ack"
 	HeartbeatAuthScheme                = "hmac-sha256"
 
 	ActionTierA = "A"
@@ -134,6 +138,57 @@ func RuntimeNodeHeartbeatTopic(deviceID string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("ori/%s/runtime/heartbeat", deviceID), nil
+}
+
+func EvidenceOutboundTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/evidence/outbound", deviceID), nil
+}
+
+func EvidenceOutboundAckTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/evidence/outbound/ack", deviceID), nil
+}
+
+func EvidenceInboundTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/evidence/inbound", deviceID), nil
+}
+
+func EvidenceInboundAckTopic(deviceID string) (string, error) {
+	if err := validateMQTTDeviceID(deviceID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ori/%s/evidence/inbound/ack", deviceID), nil
+}
+
+func DeviceIDFromEvidenceOutboundTopic(topic string) (string, error) {
+	return deviceIDFromEvidenceTopic(topic, "outbound", false)
+}
+
+func DeviceIDFromEvidenceInboundAckTopic(topic string) (string, error) {
+	return deviceIDFromEvidenceTopic(topic, "inbound", true)
+}
+
+func deviceIDFromEvidenceTopic(topic, direction string, ack bool) (string, error) {
+	parts := strings.Split(topic, "/")
+	want := 4
+	if ack {
+		want = 5
+	}
+	if len(parts) != want || parts[0] != "ori" || parts[2] != "evidence" || parts[3] != direction || (ack && parts[4] != "ack") {
+		return "", fmt.Errorf("invalid evidence %s topic %q", direction, topic)
+	}
+	if err := validateMQTTDeviceID(parts[1]); err != nil {
+		return "", err
+	}
+	return parts[1], nil
 }
 
 func TierCEnrichmentRequestTopic(deviceID string) (string, error) {

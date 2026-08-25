@@ -4,6 +4,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +80,49 @@ provider:
 	}
 	if !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEvidenceConfigRequiresSeparatedAbsoluteQueuesAndCredentialEnvNames(t *testing.T) {
+	base := `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+evidence:
+  enabled: true
+  queue_directory: %q
+  return_queue_directory: %q
+  endpoint_env: ORI_EVIDENCE_ENDPOINT
+  client_id_env: ORI_EVIDENCE_CLIENT_ID
+  secret_env: ORI_EVIDENCE_INGEST_SECRET
+`
+	for _, tc := range []struct {
+		name      string
+		outbound  string
+		returned  string
+		wantError bool
+	}{
+		{"separate absolute", "/var/lib/ori/evidence-out", "/var/lib/ori/evidence-return", false},
+		{"relative", "evidence-out", "/var/lib/ori/evidence-return", true},
+		{"same", "/var/lib/ori/evidence", "/var/lib/ori/evidence", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.outbound, tc.returned)))
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("unsafe evidence config was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Evidence.MaxItems != DefaultEvidenceMaxItems || cfg.Evidence.MaxBytes != DefaultEvidenceMaxBytes {
+				t.Fatalf("evidence defaults = %#v", cfg.Evidence)
+			}
+		})
 	}
 }
 

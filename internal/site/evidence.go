@@ -18,6 +18,11 @@ package site
 //
 // Both flags are sticky for the lifetime of the registry entry: an operator
 // must investigate; a subsequent normal heartbeat does not clear suspicion.
+//
+// This is operational heartbeat posture, not courier state. It must never be
+// used to infer gateway custody, authority receipt, queue health, or evidence-
+// channel delivery; those claims have different authenticators and failure
+// boundaries under evidence-exchange/v1.
 type NodeEvidence struct {
 	ChainHeadHash       string `json:"chain_head_hash"`
 	AttestationGapCount int    `json:"attestation_gap_count"`
