@@ -4,9 +4,13 @@
 package evidence
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,11 +22,7 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func TestHTTPChannelMatchesIngestAuthenticationVector(t *testing.T) {
-	const (
-		secret = "published-test-evidence-ingest-secret-with-256-bit-entropy-do-not-use"
-		digest = "sha256:42f21f21565c4a7a98b228eac9708ce9f5ff1bf2889ee4affa4ed85cb7045b07"
-		auth   = "Ori-Evidence-HMAC hmac-sha256:37552fdbc8a2e079e2f75fcc684153ce637459f295974c6ad259c3a70ff7e096"
-	)
+	vector := ingestAuthenticationVector(t)
 	payload := checkpointVectorWire(t)
 	var captured *http.Request
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -36,18 +36,22 @@ func TestHTTPChannelMatchesIngestAuthenticationVector(t *testing.T) {
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body: io.NopCloser(strings.NewReader(
-				`{"artifact_digest":"` + digest + `","authority_artifacts":[],"outcome":"accepted","reason":"","retriable":false,"v":1}`,
+				`{"artifact_digest":"` + vector.ArtifactDigest + `","authority_artifacts":[],"outcome":"accepted","reason":"","retriable":false,"v":1}`,
 			)),
 		}, nil
 	})}
 	channel, err := NewHTTPChannel(HTTPChannelOptions{
 		Endpoint:   "https://authority.invalid/v1/evidence/artifacts",
-		ClientID:   "gateway-test-01",
-		Secret:     secret,
+		ClientID:   vector.Request.ClientID,
+		Secret:     vector.Secret,
 		HTTPClient: client,
-		Now:        func() time.Time { return time.UnixMilli(1787000003100) },
+		Now:        func() time.Time { return time.UnixMilli(vector.Request.SentAtMS) },
 		Nonce: func(out []byte) error {
-			copy(out, []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
+			nonce, err := hex.DecodeString(vector.Request.Nonce)
+			if err != nil {
+				return err
+			}
+			copy(out, nonce)
 			return nil
 		},
 	})
@@ -60,13 +64,13 @@ func TestHTTPChannelMatchesIngestAuthenticationVector(t *testing.T) {
 	if err != nil || !result.Accepted {
 		t.Fatalf("deliver = %#v, %v", result, err)
 	}
-	if captured.Header.Get("X-Ori-Evidence-Key-Id") != "hkdf-sha256:169ab7dc3fdf30297687df61205d72ac" {
+	if captured.Header.Get("X-Ori-Evidence-Key-Id") != vector.KeyID {
 		t.Fatalf("key id = %q", captured.Header.Get("X-Ori-Evidence-Key-Id"))
 	}
-	if captured.Header.Get("X-Ori-Evidence-Artifact-Digest") != digest {
+	if captured.Header.Get("X-Ori-Evidence-Artifact-Digest") != vector.ArtifactDigest {
 		t.Fatalf("digest = %q", captured.Header.Get("X-Ori-Evidence-Artifact-Digest"))
 	}
-	if captured.Header.Get("Authorization") != auth {
+	if captured.Header.Get("Authorization") != vector.ExpectedAuthorization {
 		t.Fatalf("authorization = %q", captured.Header.Get("Authorization"))
 	}
 	got, err := io.ReadAll(captured.Body)
@@ -163,6 +167,87 @@ func TestHTTPChannelNeverFollowsRedirectWithEvidenceCredentials(t *testing.T) {
 
 func checkpointVectorWire(t *testing.T) []byte {
 	t.Helper()
-	// Complete canonical wire bytes from ori-specs checkpoint.json valid.
-	return []byte(`{"anchor_epoch_id":"sha256:7f1b65b8b24f69807441d80c8901207cf22657a9630b12901418a99efbd36f0a","boot_id":7,"device_id":"energy-monitor-ikeja-01","high_water_seq":13,"issued_at_ms":1787000900000,"key_id":"sha256:63a611374f09754a7bca6c60fd51cf2ae05a6eb8f7c58fbbe7ff5906123784a0","signature":"ed25519:UF/Npaw1X02L5V5HH3dM4NbHt3rIRn7LAVzQS7UMQF974WrVuZNIm+owkhOZPfVA8/4gg7Xsk3+NNwYj8Ed6Bw==","v":1}`)
+	raw, err := os.ReadFile("testdata/gateway-api/vectors/outbound-evidence.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vector struct {
+		Cases []struct {
+			Name               string `json:"name"`
+			DecodedArtifactHex string `json:"decoded_artifact_hex"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &vector); err != nil {
+		t.Fatal(err)
+	}
+	for _, testCase := range vector.Cases {
+		if testCase.Name == "checkpoint_carriage" {
+			wire, err := hex.DecodeString(testCase.DecodedArtifactHex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointRaw, err := os.ReadFile("testdata/evidence-exchange/vectors/checkpoint.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var checkpoints struct {
+				Cases []struct {
+					Name     string         `json:"name"`
+					Artifact map[string]any `json:"artifact"`
+				} `json:"cases"`
+			}
+			if err := json.Unmarshal(checkpointRaw, &checkpoints); err != nil {
+				t.Fatal(err)
+			}
+			for _, checkpoint := range checkpoints.Cases {
+				if checkpoint.Name == "valid" {
+					canonical, err := json.Marshal(checkpoint.Artifact)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(canonical, wire) {
+						t.Fatal("gateway carriage bytes drifted from the evidence-exchange checkpoint")
+					}
+					return wire
+				}
+			}
+			t.Fatal("checkpoint vector has no valid case")
+			return wire
+		}
+	}
+	t.Fatal("outbound evidence vector has no checkpoint_carriage case")
+	return nil
+}
+
+func ingestAuthenticationVector(t *testing.T) struct {
+	Secret                string `json:"secret"`
+	KeyID                 string `json:"key_id"`
+	ArtifactDigest        string `json:"artifact_digest"`
+	ExpectedAuthorization string `json:"expected_authorization"`
+	Request               struct {
+		ClientID string `json:"client_id"`
+		SentAtMS int64  `json:"sent_at_ms"`
+		Nonce    string `json:"nonce"`
+	} `json:"request"`
+} {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/evidence-transport/vectors/ingest-auth.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vector struct {
+		Secret                string `json:"secret"`
+		KeyID                 string `json:"key_id"`
+		ArtifactDigest        string `json:"artifact_digest"`
+		ExpectedAuthorization string `json:"expected_authorization"`
+		Request               struct {
+			ClientID string `json:"client_id"`
+			SentAtMS int64  `json:"sent_at_ms"`
+			Nonce    string `json:"nonce"`
+		} `json:"request"`
+	}
+	if err := json.Unmarshal(raw, &vector); err != nil {
+		t.Fatal(err)
+	}
+	return vector
 }

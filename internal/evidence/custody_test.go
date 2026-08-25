@@ -305,8 +305,8 @@ func TestCustodyPreimageExcludesTheAuthenticator(t *testing.T) {
 	}
 }
 
-// TestVendoredCustodyVectorsMatchManifest keeps the vendored corpus honest.
-func TestVendoredCustodyVectorsMatchManifest(t *testing.T) {
+// TestVendoredEvidenceVectorsMatchManifest keeps the vendored corpus honest.
+func TestVendoredEvidenceVectorsMatchManifest(t *testing.T) {
 	raw, err := os.ReadFile("testdata/MANIFEST.json")
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
@@ -332,6 +332,37 @@ func TestVendoredCustodyVectorsMatchManifest(t *testing.T) {
 		if got := hex.EncodeToString(sum[:]); got != want {
 			t.Errorf("%s has been edited locally; re-vendor from %s@%s instead",
 				name, m.SourceRepository, m.SourceCommit)
+		}
+	}
+	actual := make(map[string]bool)
+	var walk func(string)
+	walk = func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read fixture directory %s: %v", dir, err)
+		}
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				walk(path)
+				continue
+			}
+			if filepath.Ext(path) == ".json" && entry.Name() != "MANIFEST.json" {
+				rel, err := filepath.Rel("testdata", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				actual[filepath.ToSlash(rel)] = true
+			}
+		}
+	}
+	walk("testdata")
+	if len(actual) != len(m.Files) {
+		t.Fatalf("manifest lists %d vectors but testdata contains %d", len(m.Files), len(actual))
+	}
+	for name := range actual {
+		if _, ok := m.Files[name]; !ok {
+			t.Errorf("vendored vector %s is not tracked by the manifest", name)
 		}
 	}
 }
