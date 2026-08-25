@@ -6,7 +6,7 @@ LAN gateway and site coordinator for Ori deployments.
 site. [`ori-cloud`](https://github.com/ori-platform/ori-cloud) is the commercial backend for a fleet. Each layer has a
 distinct job and must not absorb the responsibilities of the others.
 
-## Three Purposes
+## Four Purposes
 
 1. Tier 3 LAN reasoning
 
@@ -25,6 +25,13 @@ signal, not a public internet probe.
 The gateway aggregates multiple Edge Node heartbeats, supports cross-device
 anomaly correlation, and can eventually provide shared site resources such as a
 single GSM modem for outbound SMS.
+
+4. Blind evidence courier
+
+The gateway durably accepts exact runtime evidence bytes, issues a dedicated
+custody acknowledgement only after that commit, and carries the bytes over an
+independently authenticated HTTPS channel. It never holds evidence-device or
+authority signing keys and never treats custody as an authority receipt.
 
 ## Runtime Contract
 
@@ -57,6 +64,9 @@ Implemented in this repository:
 - Scheduled weekly report generation against runtime export interfaces, with Gemini as the first reporting provider
 - Weekly report delivery via log, file, and HTTPS cloud deliverers
 - Tier C enrichment contracts
+- Durable outbound evidence and authority-return queues, authenticated custody,
+  an isolated persistent evidence MQTT session, and the independent authority
+  HTTPS channel defined by `gateway-api/v1` and `evidence-transport/v1`
 - SIM and fleet optional-module stubs with disabled-path safety guarantees
 - CI, repository invariants, and contribution guardrails
 

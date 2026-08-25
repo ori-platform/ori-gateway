@@ -31,6 +31,20 @@ gateway:
   encryption:
     enabled: false # decrypt sensitive runtime export responses; requires auth.enabled
 
+evidence:
+  enabled: false
+  # Separate durable directories. Never point either at fleet/report storage.
+  queue_directory: "/var/lib/ori-gateway/evidence-outbound"
+  return_queue_directory: "/var/lib/ori-gateway/evidence-return"
+  max_items: 10000
+  max_bytes: 268435456
+  retry_interval_s: 5
+  # Names only. The endpoint and credential values are provisioned outside this
+  # operator-readable file and must be distinct from fleet, MQTT, and custody.
+  endpoint_env: "ORI_EVIDENCE_ENDPOINT"
+  client_id_env: "ORI_EVIDENCE_CLIENT_ID"
+  secret_env: "ORI_EVIDENCE_INGEST_SECRET"
+
 provider:
   name: "echo" # echo | llama_cpp | cloud_llm
   timeout_ms: 10000

@@ -88,11 +88,23 @@ type SiteNodeAlertOutboxPosture struct {
 // projection. It must not contain target URLs, MQTT URLs, env var names, bearer
 // tokens, HMAC secrets, phone numbers, or filesystem paths.
 type GatewayView struct {
-	Status               string  `json:"status"`
-	ProviderName         string  `json:"provider_name"`
-	UptimeS              float64 `json:"uptime_s"`
-	WebhookBridgeEnabled bool    `json:"webhook_bridge_enabled"`
-	WebhookBridgeReady   bool    `json:"webhook_bridge_ready"`
+	Status               string                       `json:"status"`
+	ProviderName         string                       `json:"provider_name"`
+	UptimeS              float64                      `json:"uptime_s"`
+	WebhookBridgeEnabled bool                         `json:"webhook_bridge_enabled"`
+	WebhookBridgeReady   bool                         `json:"webhook_bridge_ready"`
+	EvidenceDelivery     *GatewayEvidenceDeliveryView `json:"evidence_delivery,omitempty"`
+}
+
+// GatewayEvidenceDeliveryView is the safe operational projection of the
+// durable evidence courier. LastError is a closed contract-owned reason; raw
+// transport errors, endpoints, credentials, and paths never reach this view.
+type GatewayEvidenceDeliveryView struct {
+	Pending         int    `json:"pending"`
+	Degraded        bool   `json:"degraded"`
+	Blocked         bool   `json:"blocked"`
+	LastFailureAtMS int64  `json:"last_failure_at_ms,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
 }
 
 // ProjectOptions configures the site health projection parameters.
@@ -170,7 +182,9 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	}
 
 	status := SiteStatusHealthy
-	if gateway.Status != SiteStatusHealthy {
+	if gateway.Status != SiteStatusHealthy ||
+		(gateway.EvidenceDelivery != nil &&
+			(gateway.EvidenceDelivery.Degraded || gateway.EvidenceDelivery.Blocked)) {
 		status = SiteStatusDegraded
 	}
 	for _, n := range nodes {

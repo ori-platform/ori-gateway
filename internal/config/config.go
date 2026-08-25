@@ -20,6 +20,9 @@ const (
 	DefaultHeartbeatIntervalS   = 30
 	DefaultProviderTimeoutMS    = 10000
 	DefaultGatewayAuthSecretEnv = "GATEWAY_SHARED_SECRET"
+	DefaultEvidenceMaxItems     = 10000
+	DefaultEvidenceMaxBytes     = int64(256 << 20)
+	DefaultEvidenceRetryS       = 5
 
 	DefaultWebhookBridgeListenAddr       = "127.0.0.1:8090"
 	DefaultSiteHealthListenAddr          = "127.0.0.1:8765"
@@ -49,6 +52,7 @@ type Config struct {
 	SIM           SIMConfig           `yaml:"sim"`
 	Fleet         FleetConfig         `yaml:"fleet"`
 	SiteHealth    SiteHealthConfig    `yaml:"site_health"`
+	Evidence      EvidenceConfig      `yaml:"evidence"`
 }
 
 type GatewayConfig struct {
@@ -86,6 +90,18 @@ type GatewayCustodyConfig struct {
 
 type GatewayEncryptionConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+type EvidenceConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	QueueDirectory       string `yaml:"queue_directory"`
+	ReturnQueueDirectory string `yaml:"return_queue_directory"`
+	MaxItems             int    `yaml:"max_items"`
+	MaxBytes             int64  `yaml:"max_bytes"`
+	RetryIntervalS       int    `yaml:"retry_interval_s"`
+	EndpointEnv          string `yaml:"endpoint_env"`
+	ClientIDEnv          string `yaml:"client_id_env"`
+	SecretEnv            string `yaml:"secret_env"`
 }
 
 type ProviderConfig struct {
@@ -197,6 +213,7 @@ type fileConfig struct {
 	SIM           SIMConfig               `yaml:"sim"`
 	Fleet         FleetConfig             `yaml:"fleet"`
 	SiteHealth    SiteHealthConfig        `yaml:"site_health"`
+	Evidence      fileEvidenceConfig      `yaml:"evidence"`
 }
 
 type fileGatewayConfig struct {
@@ -225,6 +242,18 @@ type fileWebhookBridgeConfig struct {
 	HMACSecretEnv       string   `yaml:"hmac_secret_env"`
 	RequestTimeoutMS    *int     `yaml:"request_timeout_ms"`
 	MaxBodyBytes        *int64   `yaml:"max_body_bytes"`
+}
+
+type fileEvidenceConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	QueueDirectory       string `yaml:"queue_directory"`
+	ReturnQueueDirectory string `yaml:"return_queue_directory"`
+	MaxItems             *int   `yaml:"max_items"`
+	MaxBytes             *int64 `yaml:"max_bytes"`
+	RetryIntervalS       *int   `yaml:"retry_interval_s"`
+	EndpointEnv          string `yaml:"endpoint_env"`
+	ClientIDEnv          string `yaml:"client_id_env"`
+	SecretEnv            string `yaml:"secret_env"`
 }
 
 // Load reads and validates gateway configuration from path.
@@ -272,6 +301,7 @@ func (f *fileConfig) normalize() (Config, error) {
 		SIM:           f.SIM,
 		Fleet:         f.Fleet,
 		SiteHealth:    normalizeSiteHealth(f.SiteHealth),
+		Evidence:      normalizeEvidence(f.Evidence),
 	}
 
 	if cfg.Gateway.BrokerURL == "" {
@@ -361,8 +391,62 @@ func (f *fileConfig) normalize() (Config, error) {
 	if err := validateSiteHealth(cfg.SiteHealth); err != nil {
 		return Config{}, err
 	}
+	if err := validateEvidence(cfg.Evidence); err != nil {
+		return Config{}, err
+	}
 
 	return cfg, nil
+}
+
+func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
+	maxItems := DefaultEvidenceMaxItems
+	if raw.MaxItems != nil {
+		maxItems = *raw.MaxItems
+	}
+	maxBytes := DefaultEvidenceMaxBytes
+	if raw.MaxBytes != nil {
+		maxBytes = *raw.MaxBytes
+	}
+	retry := DefaultEvidenceRetryS
+	if raw.RetryIntervalS != nil {
+		retry = *raw.RetryIntervalS
+	}
+	return EvidenceConfig{
+		Enabled:              raw.Enabled,
+		QueueDirectory:       strings.TrimSpace(raw.QueueDirectory),
+		ReturnQueueDirectory: strings.TrimSpace(raw.ReturnQueueDirectory),
+		MaxItems:             maxItems,
+		MaxBytes:             maxBytes,
+		RetryIntervalS:       retry,
+		EndpointEnv:          strings.TrimSpace(raw.EndpointEnv),
+		ClientIDEnv:          strings.TrimSpace(raw.ClientIDEnv),
+		SecretEnv:            strings.TrimSpace(raw.SecretEnv),
+	}
+}
+
+func validateEvidence(cfg EvidenceConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if !filepath.IsAbs(cfg.QueueDirectory) || !filepath.IsAbs(cfg.ReturnQueueDirectory) {
+		return fmt.Errorf("evidence queue directories must be absolute")
+	}
+	if filepath.Clean(cfg.QueueDirectory) == filepath.Clean(cfg.ReturnQueueDirectory) {
+		return fmt.Errorf("evidence outbound and return queues must use distinct directories")
+	}
+	if cfg.MaxItems <= 0 || cfg.MaxBytes <= 0 || cfg.RetryIntervalS <= 0 {
+		return fmt.Errorf("evidence queue bounds and retry interval must be positive")
+	}
+	for field, value := range map[string]string{
+		"evidence.endpoint_env":  cfg.EndpointEnv,
+		"evidence.client_id_env": cfg.ClientIDEnv,
+		"evidence.secret_env":    cfg.SecretEnv,
+	} {
+		if err := validateEnvVarName(field, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func normalizeSiteHealth(cfg SiteHealthConfig) SiteHealthConfig {
