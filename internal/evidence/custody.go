@@ -29,7 +29,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ori-platform/ori-gateway/internal/canonicaljson"
+	canonicaljson "github.com/ori-platform/ori-canonicaljson"
 )
 
 const (
