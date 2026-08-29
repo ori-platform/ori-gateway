@@ -18,6 +18,8 @@ const (
 	RuntimeHeartbeatMessageType        = "runtime.heartbeat"
 	ExportRequestMessageType           = "export_request"
 	ExportResponseMessageType          = "export_response"
+	TierCEnrichmentRequestMessageType  = "tier_c_enrichment_request"
+	TierCEnrichmentResponseMessageType = "tier_c_enrichment_response"
 	EvidenceOutboundAckMessageType     = "evidence_outbound_ack"
 	EvidenceInboundMessageType         = "evidence_inbound"
 	EvidenceInboundAckMessageType      = "evidence_inbound_ack"

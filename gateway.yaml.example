@@ -81,7 +81,7 @@ reporting:
         endpoint: ""  # https URL of the ori-cloud report ingest endpoint
         auth_env: ""  # env var name holding the ori-cloud API key (e.g. ORI_CLOUD_API_KEY)
   tier_c_enrichment:
-    enabled: false
+    enabled: false # advisory only; with gateway.auth.enabled the requests are verified and responses signed
 
 
 webhook_bridge:

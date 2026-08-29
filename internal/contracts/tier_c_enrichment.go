@@ -23,6 +23,7 @@ type TierCEnrichmentRequest struct {
 	SafeDefaultAction string                         `json:"safe_default_action"`
 	OperatorMessage   string                         `json:"operator_message"`
 	TimeoutMS         int                            `json:"timeout_ms"`
+	Auth              *HeartbeatAuth                 `json:"auth,omitempty"`
 }
 
 // TierCEnrichmentHistorySample is the recent context used to explain a Tier C proposal.
@@ -38,26 +39,29 @@ type TierCEnrichmentHistorySample struct {
 // TierCEnrichmentResponse contains only advisory text. It intentionally cannot
 // change action tier, action name, safe default, approval requirement, or actuator settings.
 type TierCEnrichmentResponse struct {
-	RequestID                  string  `json:"request_id"`
-	ProposalID                 string  `json:"proposal_id"`
-	Explanation                string  `json:"explanation,omitempty"`
-	EstimatedImpact            string  `json:"estimated_impact,omitempty"`
-	RecommendedOperatorContext string  `json:"recommended_operator_context,omitempty"`
-	Provider                   string  `json:"provider,omitempty"`
-	Model                      string  `json:"model,omitempty"`
-	TokensUsed                 int     `json:"tokens_used,omitempty"`
-	LatencyMS                  int64   `json:"latency_ms,omitempty"`
-	Error                      *string `json:"error,omitempty"`
+	RequestID                  string         `json:"request_id"`
+	ProposalID                 string         `json:"proposal_id"`
+	DeviceID                   string         `json:"device_id"`
+	Explanation                string         `json:"explanation,omitempty"`
+	EstimatedImpact            string         `json:"estimated_impact,omitempty"`
+	RecommendedOperatorContext string         `json:"recommended_operator_context,omitempty"`
+	Provider                   string         `json:"provider,omitempty"`
+	Model                      string         `json:"model,omitempty"`
+	TokensUsed                 int            `json:"tokens_used,omitempty"`
+	LatencyMS                  int64          `json:"latency_ms,omitempty"`
+	Error                      *string        `json:"error,omitempty"`
+	Auth                       *HeartbeatAuth `json:"auth,omitempty"`
 }
 
 // NewTierCEnrichmentErrorResponse preserves correlation when enrichment fails.
-func NewTierCEnrichmentErrorResponse(requestID string, proposalID string, message string) TierCEnrichmentResponse {
+func NewTierCEnrichmentErrorResponse(requestID string, proposalID string, deviceID string, message string) TierCEnrichmentResponse {
 	if message == "" {
 		message = "enrichment unavailable"
 	}
 	return TierCEnrichmentResponse{
 		RequestID:  requestID,
 		ProposalID: proposalID,
+		DeviceID:   deviceID,
 		Error:      &message,
 	}
 }
@@ -107,6 +111,9 @@ func ValidateTierCEnrichmentResponseForRequest(req TierCEnrichmentRequest, resp 
 	}
 	if req.ProposalID != resp.ProposalID {
 		return fmt.Errorf("response proposal_id %q does not match proposal_id %q", resp.ProposalID, req.ProposalID)
+	}
+	if req.DeviceID != resp.DeviceID {
+		return fmt.Errorf("response device_id %q does not match device_id %q", resp.DeviceID, req.DeviceID)
 	}
 	if resp.Error != nil {
 		if *resp.Error == "" {

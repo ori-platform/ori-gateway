@@ -532,7 +532,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment provider: %w", err)
 		}
-		enrichmentHandler, err := enrichment.NewHandler(client, enrichmentProvider, enrichment.Options{Logger: deps.logger})
+		enrichmentOptions := enrichment.Options{Logger: deps.logger, Now: deps.now}
+		if gatewaySecrets.Enabled {
+			verifier, err := mqttauth.NewVerifier(mqttauth.Config{
+				SharedSecret:         gatewaySecrets.CurrentSecret,
+				PreviousSharedSecret: gatewaySecrets.PreviousSecret,
+				Now:                  deps.now,
+			})
+			if err != nil {
+				shutdownRunners()
+				return fmt.Errorf("construct tier c enrichment verifier: %w", err)
+			}
+			enrichmentOptions.AuthVerifier = verifier
+			enrichmentOptions.SigningSecret = gatewaySecrets.CurrentSecret
+		} else {
+			deps.logger.Warn("tier c enrichment is enabled without gateway.auth; requests are unverified and responses unsigned (development only)")
+		}
+		enrichmentHandler, err := enrichment.NewHandler(client, enrichmentProvider, enrichmentOptions)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment handler: %w", err)

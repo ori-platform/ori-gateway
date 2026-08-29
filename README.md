@@ -63,7 +63,7 @@ Implemented in this repository:
 - SMS webhook signing bridge for providers that cannot sign raw webhook bodies
 - Scheduled weekly report generation against runtime export interfaces, with Gemini as the first reporting provider
 - Weekly report delivery via log, file, and HTTPS cloud deliverers
-- Tier C enrichment contracts
+- Tier C enrichment contracts and handler, with the runtime-gateway HMAC envelope verified on requests and applied to responses when gateway auth is enabled
 - Durable outbound evidence and authority-return queues, authenticated custody,
   an isolated persistent evidence MQTT session, and the independent authority
   HTTPS channel defined by `gateway-api/v1` and `evidence-transport/v1`
