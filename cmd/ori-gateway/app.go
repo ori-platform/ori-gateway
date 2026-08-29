@@ -356,8 +356,15 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence courier: %w", err)
 		}
+		ackClock, err := evidence.OpenAckSigningClock(cfg.Evidence.QueueDirectory, deps.now)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("open evidence acknowledgement clock: %w", err)
+		}
 		evidenceIngress, err = evidence.NewRuntimeIngress(
 			courier,
+			authoritySink,
+			ackClock,
 			evidenceBroker.Publish,
 			gatewaySecrets.CurrentSecret,
 			deps.now,
@@ -366,14 +373,20 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence runtime ingress: %w", err)
 		}
+		returnClock, err := evidence.OpenReturnSigningClock(cfg.Evidence.ReturnQueueDirectory, deps.now)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("open evidence return signing clock: %w", err)
+		}
 		returnPublisher, err = evidence.NewReturnPublisher(
-			authoritySink, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
+			authoritySink, returnClock, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
 			deps.now, time.Duration(cfg.Evidence.RetryIntervalS)*time.Second,
 		)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("construct evidence return publisher: %w", err)
 		}
+		evidenceIngress.SetReturnNotifier(returnPublisher.Notify)
 		runners.start("evidence delivery worker", evidenceWorker.Run)
 		runners.start("evidence return publisher", returnPublisher.Run)
 	}
@@ -489,7 +502,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			}
 			if err := evidenceBroker.Subscribe(runCtx, ackTopic, broker.QoSReasoning, func(topic string, payload []byte) {
 				if err := returnPublisher.HandleAck(topic, payload); err != nil {
-					deps.logger.Warn("evidence inbound acknowledgement refused")
+					deps.logger.Warn("evidence inbound acknowledgement refused", "error", err)
 				}
 			}); err != nil {
 				shutdownRunners()

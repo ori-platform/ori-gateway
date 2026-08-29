@@ -24,12 +24,12 @@ import (
 type ArtifactType string
 
 const (
-	ArtifactDeliveryEnvelope           ArtifactType = "delivery_envelope"
-	ArtifactAnchorRegistration         ArtifactType = "anchor_registration"
-	ArtifactCommissioningAuthorization ArtifactType = "commissioning_authorization"
-	ArtifactCheckpoint                 ArtifactType = "checkpoint"
-	artifactDeliveryReceipt            ArtifactType = "delivery_receipt"
-	artifactEpochConfirmation          ArtifactType = "epoch_confirmation"
+	ArtifactDeliveryEnvelope       ArtifactType = "delivery_envelope"
+	ArtifactAnchorRegistration     ArtifactType = "anchor_registration"
+	ArtifactCheckpoint             ArtifactType = "checkpoint"
+	artifactDeliveryReceipt        ArtifactType = "delivery_receipt"
+	artifactEpochConfirmation      ArtifactType = "epoch_confirmation"
+	artifactCustodyAcknowledgement ArtifactType = "custody_acknowledgement"
 
 	queueRecordVersion = 1
 	queueFileSuffix    = ".json"
@@ -302,7 +302,7 @@ func (q *DurableQueue) load() error {
 	seenQueueSeq := make(map[int64]struct{})
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == queueMarkerName {
+		if name == queueMarkerName || strings.HasPrefix(name, signingClockPrefix) {
 			continue
 		}
 		if strings.HasPrefix(name, queueTempPrefix) {
@@ -499,7 +499,7 @@ func syncDirectory(dir string) error {
 
 func validOutboundArtifactType(kind ArtifactType) bool {
 	switch kind {
-	case ArtifactDeliveryEnvelope, ArtifactAnchorRegistration, ArtifactCommissioningAuthorization, ArtifactCheckpoint:
+	case ArtifactDeliveryEnvelope, ArtifactAnchorRegistration, ArtifactCheckpoint:
 		return true
 	default:
 		return false
@@ -507,7 +507,7 @@ func validOutboundArtifactType(kind ArtifactType) bool {
 }
 
 func validQueueArtifactType(kind ArtifactType) bool {
-	return validOutboundArtifactType(kind) || kind == artifactDeliveryReceipt || kind == artifactEpochConfirmation
+	return validOutboundArtifactType(kind) || kind == artifactDeliveryReceipt || kind == artifactEpochConfirmation || kind == artifactCustodyAcknowledgement
 }
 
 func artifactID(kind ArtifactType, payload []byte) string {

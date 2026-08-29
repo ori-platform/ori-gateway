@@ -23,14 +23,21 @@ type EvidencePublishFunc func(context.Context, string, byte, bool, []byte) error
 
 type RuntimeIngress struct {
 	courier        *Courier
+	returns        *DurableAuthoritySink
 	publish        EvidencePublishFunc
 	envelopeSecret string
 	now            func() time.Time
+	signingClock   *AckSigningClock
+	notify         func()
 }
 
-func NewRuntimeIngress(courier *Courier, publish EvidencePublishFunc, envelopeSecret string, now func() time.Time) (*RuntimeIngress, error) {
-	if courier == nil || publish == nil {
-		return nil, fmt.Errorf("evidence: runtime ingress requires courier and publisher")
+// NewRuntimeIngress builds the runtime-facing side of the courier. Custody
+// acknowledgements it issues are queued in returns, the same durable queue the
+// authority's artifacts travel back through, so the runtime's acknowledgement
+// retires them and a lost one is redelivered rather than reissued.
+func NewRuntimeIngress(courier *Courier, returns *DurableAuthoritySink, signingClock *AckSigningClock, publish EvidencePublishFunc, envelopeSecret string, now func() time.Time) (*RuntimeIngress, error) {
+	if courier == nil || returns == nil || signingClock == nil || publish == nil {
+		return nil, fmt.Errorf("evidence: runtime ingress requires courier, return queue, signing clock and publisher")
 	}
 	if envelopeSecret == "" {
 		return nil, fmt.Errorf("evidence: runtime ingress requires the MQTT envelope secret")
@@ -38,7 +45,12 @@ func NewRuntimeIngress(courier *Courier, publish EvidencePublishFunc, envelopeSe
 	if now == nil {
 		now = time.Now
 	}
-	return &RuntimeIngress{courier: courier, publish: publish, envelopeSecret: envelopeSecret, now: now}, nil
+	return &RuntimeIngress{courier: courier, returns: returns, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret, now: now}, nil
+}
+
+// SetReturnNotifier names what to wake once a custody acknowledgement is queued.
+func (h *RuntimeIngress) SetReturnNotifier(notify func()) {
+	h.notify = notify
 }
 
 func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byte) error {
@@ -89,29 +101,19 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 	if admission.Custody == nil {
 		return nil
 	}
-	artifact, err := json.Marshal(admission.Custody)
+	// Canonical bytes, because the runtime acknowledges by a digest over the
+	// artifact's canonical form and the queue retires by the bytes it holds.
+	artifact, err := mqttauth.CanonicalJSONWithoutAuth(admission.Custody)
 	if err != nil {
 		return fmt.Errorf("evidence: encode custody artifact: %w", err)
 	}
-	inbound := inboundEnvelope{
-		DeviceID: deviceID, ArtifactType: "custody_acknowledgement", Artifact: artifact,
+	if err := h.returns.Store(ctx, AuthorityArtifact{
+		Type: InboundCustodyAcknowledgement, DeviceID: deviceID, Payload: artifact,
+	}); err != nil {
+		return fmt.Errorf("evidence: queue custody acknowledgement: %w", err)
 	}
-	signedAt := h.now().UnixMilli()
-	auth, err := mqttauth.Sign(inbound, contracts.EvidenceInboundMessageType, deviceID, "", signedAt, h.envelopeSecret)
-	if err != nil {
-		return fmt.Errorf("evidence: sign custody delivery: %w", err)
-	}
-	inbound.Auth = &auth
-	encodedInbound, err := json.Marshal(inbound)
-	if err != nil {
-		return fmt.Errorf("evidence: encode custody delivery: %w", err)
-	}
-	inboundTopic, err := contracts.EvidenceInboundTopic(deviceID)
-	if err != nil {
-		return err
-	}
-	if err := h.publish(ctx, inboundTopic, 1, false, encodedInbound); err != nil {
-		return fmt.Errorf("evidence: publish custody delivery: %w", err)
+	if h.notify != nil {
+		h.notify()
 	}
 	return nil
 }
@@ -126,7 +128,14 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		Reason:           reason,
 		AcknowledgedAtMS: acknowledgedAtMS,
 	}
-	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", ack.AcknowledgedAtMS, h.envelopeSecret)
+	// acknowledged_at_ms is the queue decision and repeats on re-admission;
+	// signed_at_ms comes from the durable clock so it never repeats, even
+	// across a restart under an unchanged or regressed system clock.
+	signedAt, err := h.signingClock.Next()
+	if err != nil {
+		return err
+	}
+	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", signedAt, h.envelopeSecret)
 	if err != nil {
 		return fmt.Errorf("evidence: sign outbound acknowledgement: %w", err)
 	}

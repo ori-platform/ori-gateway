@@ -20,6 +20,7 @@ import (
 
 type ReturnPublisher struct {
 	sink           *DurableAuthoritySink
+	signingClock   *AckSigningClock
 	publish        EvidencePublishFunc
 	envelopeSecret string
 	verifier       *mqttauth.Verifier
@@ -29,18 +30,26 @@ type ReturnPublisher struct {
 
 	mu      sync.Mutex
 	blocked bool
+	// The head last carried and when, so a wake arriving right after a
+	// publish — the initial timer and a Notify for the same entry — does not
+	// put the same bytes on the wire twice within one retry interval. The
+	// runtime would apply the first and refuse the second as a replay, then
+	// acknowledge both and find the queue empty for the second.
+	lastID string
+	lastAt time.Time
 }
 
 func NewReturnPublisher(
 	sink *DurableAuthoritySink,
+	signingClock *AckSigningClock,
 	publish EvidencePublishFunc,
 	envelopeSecret string,
 	previousEnvelopeSecret string,
 	now func() time.Time,
 	retry time.Duration,
 ) (*ReturnPublisher, error) {
-	if sink == nil || publish == nil || envelopeSecret == "" {
-		return nil, fmt.Errorf("evidence: return publisher requires sink, publisher, and envelope secret")
+	if sink == nil || signingClock == nil || publish == nil || envelopeSecret == "" {
+		return nil, fmt.Errorf("evidence: return publisher requires sink, signing clock, publisher, and envelope secret")
 	}
 	if now == nil {
 		now = time.Now
@@ -55,7 +64,7 @@ func NewReturnPublisher(
 		return nil, err
 	}
 	return &ReturnPublisher{
-		sink: sink, publish: publish, envelopeSecret: envelopeSecret,
+		sink: sink, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret,
 		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1),
 	}, nil
 }
@@ -114,10 +123,23 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	p.mu.Lock()
+	recentlyCarried := queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
+	p.mu.Unlock()
+	if recentlyCarried {
+		return nil
+	}
 	envelope := inboundEnvelope{
 		DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(queued.Payload),
 	}
-	signedAt := p.now().UnixMilli()
+	// Every delivery attempt is a newly signed envelope, across restarts too:
+	// the durable clock guarantees a later signed_at_ms than any earlier
+	// attempt, so a retained entry re-emitted under a regressed clock cannot
+	// be byte-identical to one the runtime has already refused or applied.
+	signedAt, err := p.signingClock.Next()
+	if err != nil {
+		return err
+	}
 	auth, err := mqttauth.Sign(envelope, contracts.EvidenceInboundMessageType, deviceID, "", signedAt, p.envelopeSecret)
 	if err != nil {
 		return err
@@ -131,7 +153,13 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return p.publish(ctx, topic, 1, false, payload)
+	if err := p.publish(ctx, topic, 1, false, payload); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.lastID, p.lastAt = queued.ID, p.now()
+	p.mu.Unlock()
+	return nil
 }
 
 func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
@@ -222,6 +250,8 @@ func authorityQueueRouting(queued QueuedArtifact) (string, AuthorityArtifactType
 		return value.DeviceID, AuthorityDeliveryReceipt, nil
 	case artifactEpochConfirmation:
 		return value.DeviceID, AuthorityEpochConfirmation, nil
+	case artifactCustodyAcknowledgement:
+		return value.DeviceID, InboundCustodyAcknowledgement, nil
 	default:
 		return "", "", fmt.Errorf("evidence: invalid authority return queue type")
 	}

@@ -105,7 +105,6 @@ func TestCheckpointAndRegistrationAreQueuedWithoutGatewayAuthentication(t *testi
 	courier, q := testCourier(t, 10)
 	for _, kind := range []ArtifactType{
 		ArtifactCheckpoint,
-		ArtifactCommissioningAuthorization,
 		ArtifactAnchorRegistration,
 	} {
 		payload := []byte(`{"v":1,"device_id":"site-a-edge-01","signature":"ed25519:device"}`)
@@ -117,8 +116,8 @@ func TestCheckpointAndRegistrationAreQueuedWithoutGatewayAuthentication(t *testi
 			t.Fatalf("%s was confused with a delivery envelope", kind)
 		}
 	}
-	if q.Len() != 3 {
-		t.Fatalf("queued %d artifacts, want 3", q.Len())
+	if q.Len() != 2 {
+		t.Fatalf("queued %d artifacts, want 2", q.Len())
 	}
 }
 
