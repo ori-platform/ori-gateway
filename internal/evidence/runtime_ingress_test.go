@@ -87,7 +87,7 @@ func TestRuntimeIngressQueuesBeforeAuthenticatedAckAndCustody(t *testing.T) {
 	// The return publisher carries the queued custody on the inbound route,
 	// and only the runtime's acknowledgement retires it.
 	var inbound []publishedEvidenceMessage
-	publisher, err := NewReturnPublisher(returns, func(_ context.Context, topic string, qos byte, retained bool, payload []byte) error {
+	publisher, err := NewReturnPublisher(returns, testAckClock(t, func() time.Time { return now }), func(_ context.Context, topic string, qos byte, retained bool, payload []byte) error {
 		inbound = append(inbound, publishedEvidenceMessage{topic, qos, retained, append([]byte(nil), payload...)})
 		return nil
 	}, "runtime-gateway-envelope-secret", "", func() time.Time { return now }, time.Second)

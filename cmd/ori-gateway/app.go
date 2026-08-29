@@ -373,8 +373,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence runtime ingress: %w", err)
 		}
+		returnClock, err := evidence.OpenReturnSigningClock(cfg.Evidence.ReturnQueueDirectory, deps.now)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("open evidence return signing clock: %w", err)
+		}
 		returnPublisher, err = evidence.NewReturnPublisher(
-			authoritySink, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
+			authoritySink, returnClock, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
 			deps.now, time.Duration(cfg.Evidence.RetryIntervalS)*time.Second,
 		)
 		if err != nil {

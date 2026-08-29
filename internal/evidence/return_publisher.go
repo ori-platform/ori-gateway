@@ -20,6 +20,7 @@ import (
 
 type ReturnPublisher struct {
 	sink           *DurableAuthoritySink
+	signingClock   *AckSigningClock
 	publish        EvidencePublishFunc
 	envelopeSecret string
 	verifier       *mqttauth.Verifier
@@ -40,14 +41,15 @@ type ReturnPublisher struct {
 
 func NewReturnPublisher(
 	sink *DurableAuthoritySink,
+	signingClock *AckSigningClock,
 	publish EvidencePublishFunc,
 	envelopeSecret string,
 	previousEnvelopeSecret string,
 	now func() time.Time,
 	retry time.Duration,
 ) (*ReturnPublisher, error) {
-	if sink == nil || publish == nil || envelopeSecret == "" {
-		return nil, fmt.Errorf("evidence: return publisher requires sink, publisher, and envelope secret")
+	if sink == nil || signingClock == nil || publish == nil || envelopeSecret == "" {
+		return nil, fmt.Errorf("evidence: return publisher requires sink, signing clock, publisher, and envelope secret")
 	}
 	if now == nil {
 		now = time.Now
@@ -62,7 +64,7 @@ func NewReturnPublisher(
 		return nil, err
 	}
 	return &ReturnPublisher{
-		sink: sink, publish: publish, envelopeSecret: envelopeSecret,
+		sink: sink, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret,
 		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1),
 	}, nil
 }
@@ -130,7 +132,14 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	envelope := inboundEnvelope{
 		DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(queued.Payload),
 	}
-	signedAt := p.now().UnixMilli()
+	// Every delivery attempt is a newly signed envelope, across restarts too:
+	// the durable clock guarantees a later signed_at_ms than any earlier
+	// attempt, so a retained entry re-emitted under a regressed clock cannot
+	// be byte-identical to one the runtime has already refused or applied.
+	signedAt, err := p.signingClock.Next()
+	if err != nil {
+		return err
+	}
 	auth, err := mqttauth.Sign(envelope, contracts.EvidenceInboundMessageType, deviceID, "", signedAt, p.envelopeSecret)
 	if err != nil {
 		return err

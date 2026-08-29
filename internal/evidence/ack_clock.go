@@ -15,14 +15,20 @@ import (
 	"time"
 )
 
-const ackSigningTimeName = ".ori-outbound-ack-signed-at"
+// Each signed message family the gateway emits from durable state keeps its
+// own high-water mark, named under one prefix the queue scan ignores.
+const (
+	signingClockPrefix       = ".ori-signed-at-"
+	outboundAckSigningName   = signingClockPrefix + "outbound-ack"
+	inboundReturnSigningName = signingClockPrefix + "inbound-return"
+)
 
-// AckSigningClock issues the signed_at_ms for outbound acknowledgements: the
-// current time, or one millisecond past the last one issued, whichever is
-// later. The high-water mark is persisted before an acknowledgement is signed,
-// so a restarted gateway re-acknowledging the same durable entry under an
+// AckSigningClock issues signed_at_ms for one family of gateway-signed
+// messages: the current time, or one millisecond past the last one issued,
+// whichever is later. The high-water mark is persisted before a message is
+// signed, so a restarted gateway re-emitting the same durable entry under an
 // unchanged or regressed clock still signs later than anything it signed
-// before, and never recreates an earlier acknowledgement byte for byte.
+// before, and never recreates an earlier envelope byte for byte.
 type AckSigningClock struct {
 	path string
 	now  func() time.Time
@@ -31,16 +37,27 @@ type AckSigningClock struct {
 	last int64
 }
 
-// OpenAckSigningClock loads the persisted high-water mark from dir, which must
-// already be an owned queue directory.
+// OpenAckSigningClock loads the outbound acknowledgement clock from the
+// outbound queue directory.
 func OpenAckSigningClock(dir string, now func() time.Time) (*AckSigningClock, error) {
+	return openSigningClock(dir, outboundAckSigningName, now)
+}
+
+// OpenReturnSigningClock loads the inbound delivery clock from the return
+// queue directory. A separate mark: the two families are signed under
+// different message types and retired by different acknowledgements.
+func OpenReturnSigningClock(dir string, now func() time.Time) (*AckSigningClock, error) {
+	return openSigningClock(dir, inboundReturnSigningName, now)
+}
+
+func openSigningClock(dir, name string, now func() time.Time) (*AckSigningClock, error) {
 	if dir == "" {
-		return nil, fmt.Errorf("evidence: acknowledgement clock requires a directory")
+		return nil, fmt.Errorf("evidence: signing clock requires a directory")
 	}
 	if now == nil {
 		now = time.Now
 	}
-	path := filepath.Join(dir, ackSigningTimeName)
+	path := filepath.Join(dir, name)
 	clock := &AckSigningClock{path: path, now: now}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -83,7 +100,7 @@ func (c *AckSigningClock) Next() (int64, error) {
 
 func (c *AckSigningClock) persist(at int64) error {
 	dir := filepath.Dir(c.path)
-	tmp, err := os.CreateTemp(dir, ackSigningTimeName+".*")
+	tmp, err := os.CreateTemp(dir, filepath.Base(c.path)+".*")
 	if err != nil {
 		return fmt.Errorf("evidence: stage acknowledgement clock: %w", err)
 	}

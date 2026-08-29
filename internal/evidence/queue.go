@@ -302,7 +302,7 @@ func (q *DurableQueue) load() error {
 	seenQueueSeq := make(map[int64]struct{})
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == queueMarkerName || strings.HasPrefix(name, ackSigningTimeName) {
+		if name == queueMarkerName || strings.HasPrefix(name, signingClockPrefix) {
 			continue
 		}
 		if strings.HasPrefix(name, queueTempPrefix) {
