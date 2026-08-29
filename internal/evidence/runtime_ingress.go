@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -28,19 +27,17 @@ type RuntimeIngress struct {
 	publish        EvidencePublishFunc
 	envelopeSecret string
 	now            func() time.Time
+	signingClock   *AckSigningClock
 	notify         func()
-
-	mu           sync.Mutex
-	lastSignedAt int64
 }
 
 // NewRuntimeIngress builds the runtime-facing side of the courier. Custody
 // acknowledgements it issues are queued in returns, the same durable queue the
 // authority's artifacts travel back through, so the runtime's acknowledgement
 // retires them and a lost one is redelivered rather than reissued.
-func NewRuntimeIngress(courier *Courier, returns *DurableAuthoritySink, publish EvidencePublishFunc, envelopeSecret string, now func() time.Time) (*RuntimeIngress, error) {
-	if courier == nil || returns == nil || publish == nil {
-		return nil, fmt.Errorf("evidence: runtime ingress requires courier, return queue and publisher")
+func NewRuntimeIngress(courier *Courier, returns *DurableAuthoritySink, signingClock *AckSigningClock, publish EvidencePublishFunc, envelopeSecret string, now func() time.Time) (*RuntimeIngress, error) {
+	if courier == nil || returns == nil || signingClock == nil || publish == nil {
+		return nil, fmt.Errorf("evidence: runtime ingress requires courier, return queue, signing clock and publisher")
 	}
 	if envelopeSecret == "" {
 		return nil, fmt.Errorf("evidence: runtime ingress requires the MQTT envelope secret")
@@ -48,7 +45,7 @@ func NewRuntimeIngress(courier *Courier, returns *DurableAuthoritySink, publish 
 	if now == nil {
 		now = time.Now
 	}
-	return &RuntimeIngress{courier: courier, returns: returns, publish: publish, envelopeSecret: envelopeSecret, now: now}, nil
+	return &RuntimeIngress{courier: courier, returns: returns, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret, now: now}, nil
 }
 
 // SetReturnNotifier names what to wake once a custody acknowledgement is queued.
@@ -131,7 +128,14 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		Reason:           reason,
 		AcknowledgedAtMS: acknowledgedAtMS,
 	}
-	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", h.signingTime(), h.envelopeSecret)
+	// acknowledged_at_ms is the queue decision and repeats on re-admission;
+	// signed_at_ms comes from the durable clock so it never repeats, even
+	// across a restart under an unchanged or regressed system clock.
+	signedAt, err := h.signingClock.Next()
+	if err != nil {
+		return err
+	}
+	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", signedAt, h.envelopeSecret)
 	if err != nil {
 		return fmt.Errorf("evidence: sign outbound acknowledgement: %w", err)
 	}
@@ -148,23 +152,6 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		return fmt.Errorf("evidence: publish outbound acknowledgement: %w", err)
 	}
 	return nil
-}
-
-// signingTime is the signed_at_ms for the next acknowledgement: the current
-// time, or one millisecond past the previous signing time if the clock has not
-// moved. acknowledged_at_ms records the queue decision and repeats when the
-// same bytes are re-admitted; a signature taken at that instant, or at the same
-// millisecond twice, would be byte-identical to the last and refused by the
-// runtime's replay defence where the contract promises a newly signed one.
-func (h *RuntimeIngress) signingTime() int64 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	at := h.now().UnixMilli()
-	if at <= h.lastSignedAt {
-		at = h.lastSignedAt + 1
-	}
-	h.lastSignedAt = at
-	return at
 }
 
 type outboundAck struct {

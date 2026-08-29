@@ -356,9 +356,15 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence courier: %w", err)
 		}
+		ackClock, err := evidence.OpenAckSigningClock(cfg.Evidence.QueueDirectory, deps.now)
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("open evidence acknowledgement clock: %w", err)
+		}
 		evidenceIngress, err = evidence.NewRuntimeIngress(
 			courier,
 			authoritySink,
+			ackClock,
 			evidenceBroker.Publish,
 			gatewaySecrets.CurrentSecret,
 			deps.now,
