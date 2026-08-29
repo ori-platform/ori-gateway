@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -28,6 +29,9 @@ type RuntimeIngress struct {
 	envelopeSecret string
 	now            func() time.Time
 	notify         func()
+
+	mu           sync.Mutex
+	lastSignedAt int64
 }
 
 // NewRuntimeIngress builds the runtime-facing side of the courier. Custody
@@ -127,11 +131,7 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		Reason:           reason,
 		AcknowledgedAtMS: acknowledgedAtMS,
 	}
-	// Signed at the gateway's current time, not the queue decision time: a
-	// re-admission of the same bytes returns the same acknowledged_at_ms, and
-	// an acknowledgement signed then would be byte-identical to the first and
-	// refused by the runtime's replay defence.
-	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", h.now().UnixMilli(), h.envelopeSecret)
+	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", h.signingTime(), h.envelopeSecret)
 	if err != nil {
 		return fmt.Errorf("evidence: sign outbound acknowledgement: %w", err)
 	}
@@ -148,6 +148,23 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		return fmt.Errorf("evidence: publish outbound acknowledgement: %w", err)
 	}
 	return nil
+}
+
+// signingTime is the signed_at_ms for the next acknowledgement: the current
+// time, or one millisecond past the previous signing time if the clock has not
+// moved. acknowledged_at_ms records the queue decision and repeats when the
+// same bytes are re-admitted; a signature taken at that instant, or at the same
+// millisecond twice, would be byte-identical to the last and refused by the
+// runtime's replay defence where the contract promises a newly signed one.
+func (h *RuntimeIngress) signingTime() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	at := h.now().UnixMilli()
+	if at <= h.lastSignedAt {
+		at = h.lastSignedAt + 1
+	}
+	h.lastSignedAt = at
+	return at
 }
 
 type outboundAck struct {

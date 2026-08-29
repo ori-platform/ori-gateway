@@ -140,12 +140,12 @@ func TestRuntimeIngressReacknowledgesReadmittedBytesWithAFreshSignature(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.Handle(context.Background(), "ori/site-a-edge-01/evidence/outbound", carriage); err != nil {
-		t.Fatal(err)
-	}
-	clock = clock.Add(3 * time.Second)
-	if err := handler.Handle(context.Background(), "ori/site-a-edge-01/evidence/outbound", carriage); err != nil {
-		t.Fatal(err)
+	// The clock does not move between the two admissions: this is the case a
+	// runtime's drain and its flush produce within one millisecond.
+	for i := 0; i < 2; i++ {
+		if err := handler.Handle(context.Background(), "ori/site-a-edge-01/evidence/outbound", carriage); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(published) != 2 {
 		t.Fatalf("published %d acknowledgements, want 2", len(published))
@@ -163,8 +163,11 @@ func TestRuntimeIngressReacknowledgesReadmittedBytesWithAFreshSignature(t *testi
 	if first.AcknowledgedAtMS != second.AcknowledgedAtMS || first.ArtifactDigest != second.ArtifactDigest {
 		t.Fatalf("re-admission changed the queue decision: %+v vs %+v", first, second)
 	}
-	if second.Auth.SignedAtMS != clock.UnixMilli() || first.Auth.SignedAtMS == second.Auth.SignedAtMS {
-		t.Fatalf("signed_at_ms did not move to the signing time: %d then %d", first.Auth.SignedAtMS, second.Auth.SignedAtMS)
+	if first.Auth.SignedAtMS != clock.UnixMilli() || second.Auth.SignedAtMS != clock.UnixMilli()+1 {
+		t.Fatalf("signed_at_ms is not strictly monotonic under a frozen clock: %d then %d", first.Auth.SignedAtMS, second.Auth.SignedAtMS)
+	}
+	if first.Auth.Signature == second.Auth.Signature {
+		t.Fatal("the two acknowledgements carry the same signature")
 	}
 	for i, message := range published {
 		verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "runtime-gateway-envelope-secret", Now: func() time.Time { return clock }})
