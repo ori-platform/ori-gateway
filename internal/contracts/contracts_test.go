@@ -211,7 +211,7 @@ func TestValidateRequestRejectsInvalidTier(t *testing.T) {
 }
 
 func TestNewErrorResponsePreservesRequestID(t *testing.T) {
-	resp := NewErrorResponse("req-1", ActionTierC, "provider timeout")
+	resp := NewErrorResponse("req-1", "site-a", ActionTierC, "provider timeout")
 	if resp.RequestID != "req-1" {
 		t.Fatalf("unexpected request_id: %s", resp.RequestID)
 	}
