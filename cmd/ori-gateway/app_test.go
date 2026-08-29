@@ -2421,3 +2421,112 @@ func (c *blockingHealthClient) TierCDecisionLog(_ context.Context, _ runtimeclie
 func (c *blockingHealthClient) ReasoningLog(_ context.Context, _ runtimeclient.ReasoningLogRequest) ([]runtimeclient.ReasoningLogEntry, error) {
 	return nil, nil
 }
+
+func TestMainTierCEnrichmentUnderGatewayAuthDropsUnsignedAndSignsResponses(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Reporting = config.ReportingConfig{
+		Provider:        config.ReportingProviderGemini,
+		Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		TierCEnrichment: config.TierCEnrichmentConfig{Enabled: true},
+	}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	enrichmentProvider := &fakeTierCEnrichmentProvider{}
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	deps.newTierCEnrichmentProvider = func(config.ReportingConfig) (enrichment.Provider, error) {
+		return enrichmentProvider, nil
+	}
+	clock := deps.now
+	if clock == nil {
+		clock = time.Now
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", deps)
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && handler == nil {
+		handler = fb.handlerFor("ori/dev-01/tier_c/enrichment/request")
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing tier c enrichment handler, got topics %v", fb.subscribeTopics)
+	}
+	responsePayload := func() []byte {
+		fb.mu.Lock()
+		defer fb.mu.Unlock()
+		for _, msg := range fb.published {
+			if msg.topic == "ori/dev-01/tier_c/enrichment/response" {
+				return append([]byte(nil), msg.payload...)
+			}
+		}
+		return nil
+	}
+
+	handler("ori/dev-01/tier_c/enrichment/request", validTierCEnrichmentRequestPayload(t))
+	time.Sleep(100 * time.Millisecond)
+	if responsePayload() != nil {
+		t.Fatal("an unsigned enrichment request was answered while gateway auth is enabled")
+	}
+	enrichmentProvider.mu.Lock()
+	unsignedReached := len(enrichmentProvider.requests)
+	enrichmentProvider.mu.Unlock()
+	if unsignedReached != 0 {
+		t.Fatalf("an unsigned enrichment request reached the provider %d times", unsignedReached)
+	}
+
+	var req contracts.TierCEnrichmentRequest
+	if err := json.Unmarshal(validTierCEnrichmentRequestPayload(t), &req); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := mqttauth.Sign(req, contracts.TierCEnrichmentRequestMessageType, req.DeviceID, req.RequestID, clock().UnixMilli(), "runtime-gateway-envelope-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Auth = &auth
+	signed, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler("ori/dev-01/tier_c/enrichment/request", signed)
+
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if payload := responsePayload(); payload != nil {
+			verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "runtime-gateway-envelope-secret", Now: clock})
+			if err != nil {
+				t.Fatal(err)
+			}
+			verified, err := verifier.VerifyJSON(payload, contracts.TierCEnrichmentResponseMessageType, "dev-01", "enrich-1")
+			if err != nil {
+				t.Fatalf("enrichment response does not verify: %v", err)
+			}
+			if verified["proposal_id"] != "proposal-1" || verified["explanation"] == "" {
+				t.Fatalf("unexpected verified enrichment response: %v", verified)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("runGateway returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("gateway did not stop")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for the signed tier c enrichment response")
+}

@@ -32,6 +32,7 @@ func validTierCEnrichmentResponse() TierCEnrichmentResponse {
 	return TierCEnrichmentResponse{
 		RequestID:                  "enrich-req-1",
 		ProposalID:                 "prop-abc123",
+		DeviceID:                   "site-a",
 		Explanation:                "The generator load has stayed above the normal weekly pattern.",
 		EstimatedImpact:            "Likely extra diesel cost.",
 		RecommendedOperatorContext: "Check whether grid power has returned.",
@@ -136,11 +137,17 @@ func TestValidateTierCEnrichmentResponseForRequestRequiresCorrelation(t *testing
 	if err := ValidateTierCEnrichmentResponseForRequest(req, resp); err == nil {
 		t.Fatal("expected proposal_id mismatch")
 	}
+
+	resp = validTierCEnrichmentResponse()
+	resp.DeviceID = "site-b"
+	if err := ValidateTierCEnrichmentResponseForRequest(req, resp); err == nil {
+		t.Fatal("expected device_id mismatch")
+	}
 }
 
 func TestTierCEnrichmentErrorResponseValidation(t *testing.T) {
 	req := validTierCEnrichmentRequest()
-	resp := NewTierCEnrichmentErrorResponse(req.RequestID, req.ProposalID, "provider unavailable")
+	resp := NewTierCEnrichmentErrorResponse(req.RequestID, req.ProposalID, req.DeviceID, "provider unavailable")
 	if err := ValidateTierCEnrichmentResponseForRequest(req, resp); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +155,7 @@ func TestTierCEnrichmentErrorResponseValidation(t *testing.T) {
 		t.Fatalf("unexpected error response: %#v", resp)
 	}
 
-	blank := NewTierCEnrichmentErrorResponse(req.RequestID, req.ProposalID, "")
+	blank := NewTierCEnrichmentErrorResponse(req.RequestID, req.ProposalID, req.DeviceID, "")
 	if err := ValidateTierCEnrichmentResponseForRequest(req, blank); err != nil {
 		t.Fatal(err)
 	}
