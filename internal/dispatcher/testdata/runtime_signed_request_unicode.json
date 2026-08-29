@@ -1,0 +1,15 @@
+{
+  "request_id": "req-unicode-1",
+  "device_id": "site-a",
+  "sensor_type": "current_clamp",
+  "trigger_name": "overcurrent",
+  "prompt": "Ikẹjà load rose to 18.4 A — explain. Ünïcode ✓ 電力",
+  "context": {},
+  "action_tier_hint": "C",
+  "timeout_ms": 1000,
+  "auth": {
+    "scheme": "hmac-sha256",
+    "signed_at_ms": 1700000000000,
+    "signature": "hmac-sha256:09189e19fed2bb8d6035a5aac73245ee78fd2ae8fcc85021bcabc8582a0cd4e1"
+  }
+}

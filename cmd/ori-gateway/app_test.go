@@ -2530,3 +2530,97 @@ func TestMainTierCEnrichmentUnderGatewayAuthDropsUnsignedAndSignsResponses(t *te
 	}
 	t.Fatal("timed out waiting for the signed tier c enrichment response")
 }
+
+func TestMainReasoningUnderGatewayAuthDropsUnsignedAndSignsResponses(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	fb := newFakeBroker()
+	fp := &fakeProvider{healthy: true}
+	hb := newFakeHeartbeat()
+	deps := baseDeps(t, cfg, fb, fp, hb)
+	clock := deps.now
+	if clock == nil {
+		clock = time.Now
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runGateway(ctx, "gateway.yaml", deps)
+	}()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && handler == nil {
+		handler = fb.handlerFor(contracts.GatewayReasoningRequestTopicFilter)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler == nil {
+		t.Fatalf("missing reasoning handler, got topics %v", fb.subscribeTopics)
+	}
+	responsePayload := func() []byte {
+		fb.mu.Lock()
+		defer fb.mu.Unlock()
+		for _, msg := range fb.published {
+			if msg.topic == "ori/site-a/reasoning/response" {
+				return append([]byte(nil), msg.payload...)
+			}
+		}
+		return nil
+	}
+
+	handler("ori/site-a/reasoning/request", validRequestPayload(t))
+	time.Sleep(100 * time.Millisecond)
+	if responsePayload() != nil {
+		t.Fatal("an unsigned reasoning request was answered while gateway auth is enabled")
+	}
+
+	var req contracts.ReasoningRequest
+	if err := json.Unmarshal(validRequestPayload(t), &req); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := mqttauth.Sign(req, contracts.ReasoningRequestMessageType, req.DeviceID, req.RequestID, clock().UnixMilli(), "runtime-gateway-envelope-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Auth = &auth
+	signed, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler("ori/site-a/reasoning/request", signed)
+
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if payload := responsePayload(); payload != nil {
+			verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "runtime-gateway-envelope-secret", Now: clock})
+			if err != nil {
+				t.Fatal(err)
+			}
+			verified, err := verifier.VerifyJSON(payload, contracts.ReasoningResponseMessageType, "site-a", "req-1")
+			if err != nil {
+				t.Fatalf("reasoning response does not verify: %v", err)
+			}
+			if verified["action_tier"] != contracts.ActionTierC || verified["device_id"] != "site-a" {
+				t.Fatalf("unexpected verified reasoning response: %v", verified)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("runGateway returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("gateway did not stop")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for the signed reasoning response")
+}

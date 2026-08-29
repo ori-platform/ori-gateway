@@ -18,6 +18,8 @@ const (
 	RuntimeHeartbeatMessageType        = "runtime.heartbeat"
 	ExportRequestMessageType           = "export_request"
 	ExportResponseMessageType          = "export_response"
+	ReasoningRequestMessageType        = "reasoning_request"
+	ReasoningResponseMessageType       = "reasoning_response"
 	TierCEnrichmentRequestMessageType  = "tier_c_enrichment_request"
 	TierCEnrichmentResponseMessageType = "tier_c_enrichment_response"
 	EvidenceOutboundAckMessageType     = "evidence_outbound_ack"
@@ -52,18 +54,21 @@ type ReasoningRequest struct {
 	Context        ReasoningContext `json:"context"`
 	ActionTierHint string           `json:"action_tier_hint"`
 	TimeoutMS      int              `json:"timeout_ms"`
+	Auth           *HeartbeatAuth   `json:"auth,omitempty"`
 }
 
 type ReasoningResponse struct {
-	RequestID      string  `json:"request_id"`
-	Text           string  `json:"text"`
-	Model          string  `json:"model"`
-	TokensUsed     int     `json:"tokens_used"`
-	LatencyMS      int64   `json:"latency_ms"`
-	Confidence     float64 `json:"confidence"`
-	ActionTier     string  `json:"action_tier"`
-	ProposedAction *string `json:"proposed_action"`
-	Error          *string `json:"error,omitempty"`
+	RequestID      string         `json:"request_id"`
+	DeviceID       string         `json:"device_id"`
+	Text           string         `json:"text"`
+	Model          string         `json:"model"`
+	TokensUsed     int            `json:"tokens_used"`
+	LatencyMS      int64          `json:"latency_ms"`
+	Confidence     float64        `json:"confidence"`
+	ActionTier     string         `json:"action_tier"`
+	ProposedAction *string        `json:"proposed_action"`
+	Error          *string        `json:"error,omitempty"`
+	Auth           *HeartbeatAuth `json:"auth,omitempty"`
 }
 
 type HeartbeatAuth struct {
@@ -285,9 +290,10 @@ func validateMQTTRequestID(requestID string) error {
 	return nil
 }
 
-func NewErrorResponse(requestID string, actionTier string, message string) ReasoningResponse {
+func NewErrorResponse(requestID string, deviceID string, actionTier string, message string) ReasoningResponse {
 	return ReasoningResponse{
 		RequestID:      requestID,
+		DeviceID:       deviceID,
 		Text:           "",
 		Model:          "gateway",
 		TokensUsed:     0,
@@ -327,6 +333,9 @@ func ValidateRequest(req ReasoningRequest) error {
 func ValidateResponseForRequest(req ReasoningRequest, resp ReasoningResponse) error {
 	if req.RequestID != resp.RequestID {
 		return fmt.Errorf("response request_id %q does not match request_id %q", resp.RequestID, req.RequestID)
+	}
+	if req.DeviceID != resp.DeviceID {
+		return fmt.Errorf("response device_id %q does not match device_id %q", resp.DeviceID, req.DeviceID)
 	}
 	if !IsValidActionTier(resp.ActionTier) {
 		return fmt.Errorf("action_tier must be A, B, C, or D")

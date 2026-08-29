@@ -435,9 +435,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
 
-	reasoningDispatcher, err := dispatcher.New(client, reasoningProvider, dispatcher.Options{
-		ProviderTimeoutMS: cfg.Provider.TimeoutMS,
-	})
+	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now}
+	if gatewaySecrets.Enabled {
+		verifier, err := mqttauth.NewVerifier(mqttauth.Config{
+			SharedSecret:         gatewaySecrets.CurrentSecret,
+			PreviousSharedSecret: gatewaySecrets.PreviousSecret,
+			Now:                  deps.now,
+		})
+		if err != nil {
+			shutdownRunners()
+			return fmt.Errorf("construct reasoning verifier: %w", err)
+		}
+		dispatcherOptions.AuthVerifier = verifier
+		dispatcherOptions.SigningSecret = gatewaySecrets.CurrentSecret
+	} else {
+		deps.logger.Warn("reasoning is served without gateway.auth; requests are unverified and responses unsigned (development only)")
+	}
+	reasoningDispatcher, err := dispatcher.New(client, reasoningProvider, dispatcherOptions)
 	if err != nil {
 		shutdownRunners()
 		return fmt.Errorf("construct dispatcher: %w", err)
