@@ -168,3 +168,37 @@ func TestMalformedRuntimeDecisionCannotRetireOrBlockAuthorityArtifact(t *testing
 		t.Fatal("malformed decision changed authority return state")
 	}
 }
+
+func TestReturnPublisherDoesNotCarryTheSameHeadTwiceWithinARetryInterval(t *testing.T) {
+	clock := time.UnixMilli(1787000000000)
+	sink, err := OpenDurableAuthoritySink(QueueOptions{Directory: filepath.Join(t.TempDir(), "return"), MaxItems: 10, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Store(context.Background(), AuthorityArtifact{Type: AuthorityDeliveryReceipt, DeviceID: "site-a-edge-01", Payload: validReceiptBytes("site-a-edge-01", 1, 1)}); err != nil {
+		t.Fatal(err)
+	}
+	published := 0
+	publisher, err := NewReturnPublisher(sink, func(context.Context, string, byte, bool, []byte) error {
+		published++
+		return nil
+	}, "runtime-gateway-envelope-secret", "", func() time.Time { return clock }, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := publisher.publishHead(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if published != 1 {
+		t.Fatalf("head carried %d times within one interval, want once", published)
+	}
+	clock = clock.Add(5 * time.Second)
+	if err := publisher.publishHead(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if published != 2 {
+		t.Fatalf("head not retried after the interval: carried %d times", published)
+	}
+}

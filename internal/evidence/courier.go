@@ -129,6 +129,10 @@ type AuthorityArtifactType string
 const (
 	AuthorityDeliveryReceipt   AuthorityArtifactType = "delivery_receipt"
 	AuthorityEpochConfirmation AuthorityArtifactType = "epoch_confirmation"
+	// InboundCustodyAcknowledgement is gateway-issued, not authority-issued: it
+	// rides the same durable return queue so the runtime's acknowledgement
+	// retires it, but the authority channel never returns one.
+	InboundCustodyAcknowledgement AuthorityArtifactType = "custody_acknowledgement"
 )
 
 // AuthorityArtifact is an authority-signed artifact returned by the evidence

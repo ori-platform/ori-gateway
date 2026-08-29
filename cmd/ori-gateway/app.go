@@ -358,6 +358,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 		evidenceIngress, err = evidence.NewRuntimeIngress(
 			courier,
+			authoritySink,
 			evidenceBroker.Publish,
 			gatewaySecrets.CurrentSecret,
 			deps.now,
@@ -374,6 +375,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence return publisher: %w", err)
 		}
+		evidenceIngress.SetReturnNotifier(returnPublisher.Notify)
 		runners.start("evidence delivery worker", evidenceWorker.Run)
 		runners.start("evidence return publisher", returnPublisher.Run)
 	}
@@ -489,7 +491,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			}
 			if err := evidenceBroker.Subscribe(runCtx, ackTopic, broker.QoSReasoning, func(topic string, payload []byte) {
 				if err := returnPublisher.HandleAck(topic, payload); err != nil {
-					deps.logger.Warn("evidence inbound acknowledgement refused")
+					deps.logger.Warn("evidence inbound acknowledgement refused", "error", err)
 				}
 			}); err != nil {
 				shutdownRunners()

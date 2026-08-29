@@ -22,7 +22,7 @@ func OpenDurableAuthoritySink(opts QueueOptions) (*DurableAuthoritySink, error) 
 		return nil, err
 	}
 	for _, id := range queue.order {
-		if record := queue.entries[id]; record.Type != artifactDeliveryReceipt && record.Type != artifactEpochConfirmation {
+		if record := queue.entries[id]; record.Type != artifactDeliveryReceipt && record.Type != artifactEpochConfirmation && record.Type != artifactCustodyAcknowledgement {
 			return nil, fmt.Errorf("evidence: authority return queue contains an outbound artifact")
 		}
 	}
@@ -39,6 +39,8 @@ func (s *DurableAuthoritySink) Store(_ context.Context, artifact AuthorityArtifa
 		kind = artifactDeliveryReceipt
 	case AuthorityEpochConfirmation:
 		kind = artifactEpochConfirmation
+	case InboundCustodyAcknowledgement:
+		kind = artifactCustodyAcknowledgement
 	default:
 		return fmt.Errorf("evidence: unsupported authority artifact type %q", artifact.Type)
 	}

@@ -29,6 +29,13 @@ type ReturnPublisher struct {
 
 	mu      sync.Mutex
 	blocked bool
+	// The head last carried and when, so a wake arriving right after a
+	// publish — the initial timer and a Notify for the same entry — does not
+	// put the same bytes on the wire twice within one retry interval. The
+	// runtime would apply the first and refuse the second as a replay, then
+	// acknowledge both and find the queue empty for the second.
+	lastID string
+	lastAt time.Time
 }
 
 func NewReturnPublisher(
@@ -114,6 +121,12 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	p.mu.Lock()
+	recentlyCarried := queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
+	p.mu.Unlock()
+	if recentlyCarried {
+		return nil
+	}
 	envelope := inboundEnvelope{
 		DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(queued.Payload),
 	}
@@ -131,7 +144,13 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return p.publish(ctx, topic, 1, false, payload)
+	if err := p.publish(ctx, topic, 1, false, payload); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.lastID, p.lastAt = queued.ID, p.now()
+	p.mu.Unlock()
+	return nil
 }
 
 func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
@@ -222,6 +241,8 @@ func authorityQueueRouting(queued QueuedArtifact) (string, AuthorityArtifactType
 		return value.DeviceID, AuthorityDeliveryReceipt, nil
 	case artifactEpochConfirmation:
 		return value.DeviceID, AuthorityEpochConfirmation, nil
+	case artifactCustodyAcknowledgement:
+		return value.DeviceID, InboundCustodyAcknowledgement, nil
 	default:
 		return "", "", fmt.Errorf("evidence: invalid authority return queue type")
 	}
