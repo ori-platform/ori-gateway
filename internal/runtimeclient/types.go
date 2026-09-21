@@ -120,6 +120,14 @@ type SensorAggregate struct {
 	Samples  int
 	Quality  float64
 	Metadata map[string]any
+	// ReceivedAtMS is the runtime's own clock when it received the reading,
+	// or the greatest receipt among the rows an aggregate covers, and 0 when
+	// the row carries no receipt: a runtime from before the field, or a value
+	// that is not a positive instant. StartMS and EndMS are the producer's
+	// account of when the world was measured. The receipt is for an age or a
+	// mark beside the producer's time; it is not an arrival order, and which
+	// row is current is the runtime's own answer, not derived from an export.
+	ReceivedAtMS int64
 }
 
 // ActionLogRequest asks runtime for bounded action history.

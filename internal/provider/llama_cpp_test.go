@@ -74,7 +74,7 @@ func TestLlamaCppProviderCompletion(t *testing.T) {
 		Unit:      "A",
 		Timestamp: 1_800_000_000_000,
 		History: []contracts.HistoryPoint{
-			{Value: 220.1, Timestamp: 1_799_999_940_000},
+			{Value: 220.1, Timestamp: 1_799_999_940_000, ReceivedAtMS: 1_799_999_940_250},
 		},
 	}
 	resp, err := p.Reason(context.Background(), req)
@@ -84,7 +84,7 @@ func TestLlamaCppProviderCompletion(t *testing.T) {
 	if !strings.Contains(gotPrompt, req.Prompt) {
 		t.Fatalf("prompt = %q, want it to contain %q", gotPrompt, req.Prompt)
 	}
-	for _, want := range []string{"Structured sensor context", "value: 247.3", "unit: A", "timestamp_ms: 1800000000000", "value: 220.1"} {
+	for _, want := range []string{"Structured sensor context", "value: 247.3", "unit: A", "timestamp_ms: 1800000000000", "value: 220.1", "received_at_ms: 1799999940250"} {
 		if !strings.Contains(gotPrompt, want) {
 			t.Fatalf("prompt missing %q: %q", want, gotPrompt)
 		}
