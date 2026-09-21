@@ -36,6 +36,9 @@ const (
 type HistoryPoint struct {
 	Value     float64 `json:"value"`
 	Timestamp int64   `json:"timestamp"`
+	// ReceivedAtMS is the runtime's receipt of the point, carried beside the
+	// producer's timestamp; 0 when the runtime sent none.
+	ReceivedAtMS int64 `json:"received_at_ms,omitempty"`
 }
 
 type ReasoningContext struct {

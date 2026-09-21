@@ -270,7 +270,11 @@ func buildLlamaCppPrompt(req contracts.ReasoningRequest) string {
 	if len(req.Context.History) > 0 {
 		b.WriteString("history:\n")
 		for _, point := range req.Context.History {
-			b.WriteString(fmt.Sprintf("- value: %g, timestamp_ms: %d\n", point.Value, point.Timestamp))
+			if point.ReceivedAtMS > 0 {
+				b.WriteString(fmt.Sprintf("- value: %g, timestamp_ms: %d, received_at_ms: %d\n", point.Value, point.Timestamp, point.ReceivedAtMS))
+			} else {
+				b.WriteString(fmt.Sprintf("- value: %g, timestamp_ms: %d\n", point.Value, point.Timestamp))
+			}
 		}
 	}
 	return strings.TrimSpace(b.String())

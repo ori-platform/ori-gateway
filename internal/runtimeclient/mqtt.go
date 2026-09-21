@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -644,19 +645,58 @@ func mapSensorAggregate(item map[string]any, fallbackDeviceID string, fallbackSe
 		avgValue = floatValue(item, "value")
 	}
 	return SensorAggregate{
-		DeviceID: stringValue(item, "device_id", fallbackDeviceID),
-		SensorID: stringValue(item, "sensor_id", fallbackSensorID),
-		Type:     stringValue(item, "sensor_type", ""),
-		Unit:     stringValue(item, "unit", ""),
-		StartMS:  startMS,
-		EndMS:    endMS,
-		AvgValue: avgValue,
-		MinValue: floatValue(item, "min_value"),
-		MaxValue: floatValue(item, "max_value"),
-		Samples:  intValue(item, "sample_count"),
-		Quality:  floatValue(item, "quality"),
-		Metadata: mapValue(item, "metadata"),
+		DeviceID:     stringValue(item, "device_id", fallbackDeviceID),
+		SensorID:     stringValue(item, "sensor_id", fallbackSensorID),
+		Type:         stringValue(item, "sensor_type", ""),
+		Unit:         stringValue(item, "unit", ""),
+		StartMS:      startMS,
+		EndMS:        endMS,
+		AvgValue:     avgValue,
+		MinValue:     floatValue(item, "min_value"),
+		MaxValue:     floatValue(item, "max_value"),
+		Samples:      intValue(item, "sample_count"),
+		Quality:      floatValue(item, "quality"),
+		Metadata:     mapValue(item, "metadata"),
+		ReceivedAtMS: receiptValue(item, "received_at_ms"),
 	}, nil
+}
+
+// receiptValue reads a receipt: a positive whole number of milliseconds
+// below 2^53, parsed exactly from the decoder's json.Number so a digit is
+// never rounded away. Absent, null, non-numeric, fractional, non-positive,
+// non-finite and out-of-range values all read as 0, which means the row
+// carries no receipt; none of them is ever a copy of the producer's time.
+func receiptValue(m map[string]any, key string) int64 {
+	const bound = int64(1) << 53
+	value, ok := m[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil || n <= 0 || n >= bound {
+			return 0
+		}
+		return n
+	case int:
+		if v <= 0 || int64(v) >= bound {
+			return 0
+		}
+		return int64(v)
+	case int64:
+		if v <= 0 || v >= bound {
+			return 0
+		}
+		return v
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 || v >= float64(bound) || v != math.Trunc(v) {
+			return 0
+		}
+		return int64(v)
+	default:
+		return 0
+	}
 }
 
 func mapActionLogEntry(item map[string]any, fallbackDeviceID string) ActionLogEntry {

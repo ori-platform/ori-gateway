@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -286,17 +287,18 @@ func TestMQTTRuntimeClientSensorHistoryBucketed(t *testing.T) {
 			"export_type": "sensor_history",
 			"complete":    true,
 			"items": []any{map[string]any{
-				"sensor_id":    "current-main",
-				"sensor_type":  "current_clamp",
-				"unit":         "A",
-				"start_ms":     float64(1000),
-				"end_ms":       float64(2000),
-				"avg_value":    nil,
-				"value":        4.2,
-				"min_value":    3.9,
-				"max_value":    4.8,
-				"sample_count": float64(12),
-				"quality":      0.98,
+				"sensor_id":      "current-main",
+				"sensor_type":    "current_clamp",
+				"unit":           "A",
+				"start_ms":       float64(1000),
+				"end_ms":         float64(2000),
+				"avg_value":      nil,
+				"value":          4.2,
+				"min_value":      3.9,
+				"max_value":      4.8,
+				"sample_count":   float64(12),
+				"quality":        0.98,
+				"received_at_ms": float64(2450),
 			}},
 		})
 	}
@@ -311,6 +313,9 @@ func TestMQTTRuntimeClientSensorHistoryBucketed(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].AvgValue != 4.2 || rows[0].Samples != 12 {
 		t.Fatalf("unexpected history rows: %#v", rows)
+	}
+	if rows[0].ReceivedAtMS != 2450 {
+		t.Fatalf("the receipt did not travel with the row: %#v", rows[0])
 	}
 
 	requests := b.publishedRequests()
@@ -912,5 +917,43 @@ func TestMQTTRuntimeClientPreservesEncryptionOptionError(t *testing.T) {
 	_, err := NewMQTTClient(b, WithMessageEncryption(""))
 	if err == nil || !strings.Contains(err.Error(), "shared secret must not be empty") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReceiptValueReadsOnlyAPositiveInstant(t *testing.T) {
+	cases := map[string]struct {
+		value any
+		want  int64
+	}{
+		"absent":       {nil, 0},
+		"null":         {nil, 0},
+		"string":       {"2450", 0},
+		"bool":         {true, 0},
+		"object":       {map[string]any{}, 0},
+		"negative":     {float64(-5), 0},
+		"zero":         {float64(0), 0},
+		"fraction":     {float64(2450.7), 0},
+		"huge":         {9.9e18, 0},
+		"beyond-range": {1e300, 0},
+		"exact-limit":  {float64(1 << 53), 0},
+		"rounded-up":   {float64(9007199254740993), 0},
+		"last-exact":   {float64(1<<53 - 1), 1<<53 - 1},
+		"exact-digits": {json.Number("9007199254740993"), 0},
+		"exact-below":  {json.Number("9007199254740991"), 9007199254740991},
+		"exact-frac":   {json.Number("2450.7"), 0},
+		"exact-neg":    {json.Number("-5"), 0},
+		"exact-value":  {json.Number("1717000000480"), 1717000000480},
+		"infinite":     {math.Inf(1), 0},
+		"nan":          {math.NaN(), 0},
+		"instant":      {float64(1717000000480), 1717000000480},
+	}
+	for name, tc := range cases {
+		item := map[string]any{}
+		if name != "absent" {
+			item["received_at_ms"] = tc.value
+		}
+		if got := receiptValue(item, "received_at_ms"); got != tc.want {
+			t.Fatalf("%s: receiptValue = %d, want %d", name, got, tc.want)
+		}
 	}
 }
