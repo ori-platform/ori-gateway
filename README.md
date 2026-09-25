@@ -85,6 +85,11 @@ Deferred implementation:
   report service — the log, file, and HTTPS cloud deliverers exist; wiring to
   the production service is pending
 
+## Operations
+
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) covers what to do when evidence
+delivery is blocked behind an artifact the evidence authority refused.
+
 ## Invariant
 
 The gateway is never in the Tier D path. Tier D fires locally in the
@@ -101,6 +106,21 @@ pre-commit install
 go test ./...
 go vet ./...
 ```
+
+The evidence courier's refusal-policy and site-health tests read the draft
+vectors from a sibling `ori-specs` checkout (`../ori-specs`) until they are
+vendored into `internal/evidence/testdata`.
+
+An integration test drives the real courier against a running evidence
+authority ingest service. It is outside the default run, behind a build tag:
+
+```bash
+ORI_EVIDENCE_INGEST_BIN=/path/to/the/built/ingest/service \
+  go test -tags evidence_integration -run TestAgainstTheEvidenceAuthority -v ./internal/evidence
+```
+
+`ORI_SPECS_DIR` names the `ori-specs` checkout that supplies the signed vectors
+if it is not the sibling.
 
 ## Versioning and releases
 

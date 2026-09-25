@@ -29,6 +29,23 @@ type RuntimeIngress struct {
 	now            func() time.Time
 	signingClock   *AckSigningClock
 	notify         func()
+	faults         *FaultRecorder
+}
+
+// The two forms of admission a fault is tracked for (gateway-api/v1):
+// durable outbound queueing, and for a delivery envelope, durable staging of its
+// required custody return. Each clears only when a later admission of the same
+// form completes; a store probe clears neither.
+const (
+	admissionQueueSource   = "admission.queue"
+	admissionCustodySource = "admission.custody"
+)
+
+// SetFaultRecorder names where admission failures are recorded: raised when
+// evidence the courier must retain could not be admitted, cleared when an
+// admission next completes.
+func (h *RuntimeIngress) SetFaultRecorder(faults *FaultRecorder) {
+	h.faults = faults
 }
 
 // NewRuntimeIngress builds the runtime-facing side of the courier. Custody
@@ -57,6 +74,12 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 	deviceID, err := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
 	if err != nil {
 		return err
+	}
+	// A topic whose device is not configured is rejected before anything
+	// else: no admission, no custody and no acknowledgement of any outcome.
+	if !h.courier.queue.Configured(deviceID) {
+		_ = h.courier.queue.NoteUnconfiguredDevice(deviceID)
+		return ErrUnconfiguredDevice
 	}
 	var carriage struct {
 		DeviceID     string `json:"device_id"`
@@ -90,28 +113,53 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 	}
 	admission, err := h.courier.Admit(kind, artifactBytes)
 	if err != nil {
+		if errors.Is(err, ErrUnconfiguredDevice) {
+			// The artifact names an unconfigured device; refused before
+			// admission, with no acknowledgement.
+			_ = h.courier.queue.NoteUnconfiguredDevice(deviceID)
+			return err
+		}
 		if errors.Is(err, ErrQueueFull) {
+			// A defined, retriable refusal of a full share, not a failure.
 			return h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "refused", "queue_full", h.now().UnixMilli())
 		}
+		if errors.Is(err, errCustodyConstruction) {
+			// Queued durably, but the envelope's custody return could not be
+			// built: the custody form failed, the queueing form completed.
+			h.faults.Note(FaultAdmissionFailed, admissionQueueSource, nil)
+			h.faults.Note(FaultAdmissionFailed, admissionCustodySource, err)
+			return err
+		}
+		h.faults.Note(FaultAdmissionFailed, admissionQueueSource, err)
 		return err
 	}
+	// Durable outbound queueing completed. What follows — publishing the
+	// acknowledgement — is not admission, and its failure is not
+	// admission_failed: the runtime republishes and the idempotent queue
+	// recovers the same entry.
+	h.faults.Note(FaultAdmissionFailed, admissionQueueSource, nil)
 	if err := h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "queued", "", admission.Queued.EnqueuedAtMS); err != nil {
 		return err
 	}
 	if admission.Custody == nil {
+		h.courier.queue.NoteAdmittedDevice(deviceID)
 		return nil
 	}
 	// Canonical bytes, because the runtime acknowledges by a digest over the
 	// artifact's canonical form and the queue retires by the bytes it holds.
 	artifact, err := mqttauth.CanonicalJSONWithoutAuth(admission.Custody)
 	if err != nil {
+		h.faults.Note(FaultAdmissionFailed, admissionCustodySource, err)
 		return fmt.Errorf("evidence: encode custody artifact: %w", err)
 	}
 	if err := h.returns.Store(ctx, AuthorityArtifact{
 		Type: InboundCustodyAcknowledgement, DeviceID: deviceID, Payload: artifact,
 	}); err != nil {
+		h.faults.Note(FaultAdmissionFailed, admissionCustodySource, err)
 		return fmt.Errorf("evidence: queue custody acknowledgement: %w", err)
 	}
+	h.faults.Note(FaultAdmissionFailed, admissionCustodySource, nil)
+	h.courier.queue.NoteAdmittedDevice(deviceID)
 	if h.notify != nil {
 		h.notify()
 	}

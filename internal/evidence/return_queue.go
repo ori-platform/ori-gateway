@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // DurableAuthoritySink stages exact authority artifacts in a queue separate
@@ -44,15 +45,31 @@ func (s *DurableAuthoritySink) Store(_ context.Context, artifact AuthorityArtifa
 	default:
 		return fmt.Errorf("evidence: unsupported authority artifact type %q", artifact.Type)
 	}
+	// Courier opacity: the routing device_id is read, never the declared v.
 	var routing struct {
-		V        int    `json:"v"`
 		DeviceID string `json:"device_id"`
 	}
-	if err := json.Unmarshal(artifact.Payload, &routing); err != nil || routing.V != 1 || routing.DeviceID == "" || routing.DeviceID != artifact.DeviceID {
+	if err := json.Unmarshal(artifact.Payload, &routing); err != nil || routing.DeviceID == "" || routing.DeviceID != artifact.DeviceID {
 		return fmt.Errorf("evidence: authority artifact routing mismatch")
 	}
 	_, err := s.queue.enqueue(kind, artifact.Payload)
 	return err
+}
+
+// Probe probes the return store once; see DurableQueue.Probe.
+func (s *DurableAuthoritySink) Probe() error {
+	if s == nil || s.queue == nil {
+		return fmt.Errorf("evidence: authority return sink is not configured")
+	}
+	return s.queue.Probe()
+}
+
+// ProbeLoop probes the return store on the interval; see DurableQueue.Probe.
+func (s *DurableAuthoritySink) ProbeLoop(ctx context.Context, interval time.Duration) error {
+	if s == nil || s.queue == nil {
+		return fmt.Errorf("evidence: authority return sink is not configured")
+	}
+	return s.queue.ProbeLoop(ctx, interval)
 }
 
 func (s *DurableAuthoritySink) Len() int {

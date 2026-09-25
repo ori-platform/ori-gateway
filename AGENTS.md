@@ -196,7 +196,125 @@ confirmations remain opaque and must be durably staged before outbound queue
 retirement. The evidence channel shares no authority, keys, storage,
 acknowledgement, or failure status with fleet management, and transport errors
 must be reduced before reaching logs or status so the evidence authority's
-identity and endpoint cannot leak. Verified by the tests in `internal/evidence`.
+identity and endpoint cannot leak.
+
+Delivery order is per device and lane (`evidence-transport/v1`, refusal
+policy). Each device has two lanes, its anchor registrations and every other
+artifact it delivers; a record's lane is derived from its carriage artifact
+type and never stored, so queue directories need no migration. Order, retry
+state, back-off and holds are kept, persisted and restored per `device_id` and
+lane, and a hold or back-off in one lane never delays the device's other lane
+or another device. A handoff is a newly admitted artifact for the same device
+(a handoff for both its lanes), a `200` retiring an anchor registration for
+the same device, confirmed or accepted pending (a handoff for its evidence
+lane), or the courier starting again; it retries only a handoff-only refusal
+and never brings a back-off forward. Queue capacity is reserved per configured
+device, as an equal share of `max_items` and `max_bytes`: a device past its own
+share is refused `queue_full` at admission and cannot exhaust another's. Each
+share reserves one item and one maximum encoded registration record for
+registrations only; the evidence lane is refused `queue_full` before it would
+take that reserve. Each share must hold two items and one maximum encoded
+registration record plus one maximum encoded evidence record, refused at load
+otherwise. A hold in the registration lane is an
+archival: the refused registration is moved, atomically and archive first, to
+`.ori-evidence-archive-<queue_record>`, outside active capacity, never resent,
+and projected in `archived_registrations`; if the archive cannot commit the
+registration stays held and `store_unavailable` is raised. Lane capacity, lane
+head selection, archival and the retirement handoff are each decided in one
+place (`laneShareRefusalLocked`, `deliveryLane.head`, `deliveryLane.archive`,
+`deliveryLane.retired`). A `gateway.device_ids` entry carrying a control
+character (Cc, NUL among them) is always refused at load; with the courier
+enabled, every entry must also be in the evidence routing domain. A failing
+archive move holds `store_unavailable` under its own source, so only the move
+completing clears it, never another successful write or probe. A carriage whose topic names an unconfigured
+device is rejected before admission: nothing is admitted, no custody is issued
+and no acknowledgement is published, so the runtime keeps its bytes and
+retries; `queue_full` is only ever a configured device's full share. An artifact over 1,048,576 bytes is refused
+`malformed` at admission, before custody. The courier is opaque to artifact
+versions: it reads only the routing projection (`device_id`; `local_seq` of an
+envelope; `from_seq` and `to_seq` of a returned receipt), each held to its v1
+domain from `evidence-exchange/v1`, and never rejects,
+holds, retires or classifies an artifact by its declared `v`, so a version it
+does not know is admitted and delivered and the evidence authority alone decides
+version support. Verified by `TestAVersionTheCourierDoesNotKnowIsAdmittedAndDelivered`.
+
+A head the evidence authority refuses terminally is held and never discarded,
+and the running process never re-sends it. The hold is persisted beside its
+queue record, validated on load, and restored at startup without a delivery
+attempt. The bound is per process: each process that starts without a durable
+hold — because an earlier one died, or its hold write failed, between the
+refusal and the durable hold — sends the head once and is refused again; once a
+hold is durably written, no later start sends it. A back-off is persisted the
+same way, so a restart never resends a backed-off head early. Evidence is never
+discarded in any case.
+
+What a refusal does is decided in one place, `refusalPolicy`, which is the
+refusal policy table of `ori-specs/evidence-transport/v1.md`; nothing about
+this hop is taken from `gateway-api/v1`. The `retriable` flag is never used to
+select a well-formed refusal's class. `400` holds; `409` holds, except
+`409 pending_registration_conflict`, which is retained and backed off; `401` and `403` are
+retried on the next handoff only, never on a timer; `422` holds for
+`bad_authenticator`, `binding_mismatch` and `commissioning_digest_mismatch` and
+is handoff-only for `unrecognised_version` and `unknown_key` (`422 malformed`
+is invalid authority output and holds as `unrecognised`); `429` and `503` back
+off, and a `429 rate_limited` or `429 pending_registration_limit` waits no
+less than its `Retry-After`. Back-off is configured as `backoff_max_s >= backoff_base_s >=
+retry_interval_s`, refused at load otherwise; every wait is at least the
+delivery interval, and a `Retry-After` is an additional floor. Each
+status admits only its own closed reason list: a reason outside it is recorded
+as `unrecognised` and takes the status's fail-closed action. Anything else — a
+status outside the table, a response whose media type, body, fields, digest
+binding, outcome or retry metadata is invalid or absent, a `429 rate_limited`
+or `429 pending_registration_limit` without `Retry-After`, any `2xx` that is not a clean `200` acceptance — is an
+unrecognised outcome: retained, recorded `unrecognised`, reported degraded and
+backed off exponentially within a bound, never retired, never held, never
+resent immediately. Only an admitted reason reaches a log or status.
+
+Site health projects `evidence_delivery.devices` exactly as `gateway-api/v1`
+states: one entry per device and lane that is not clean (`held`,
+`waiting_handoff`, `backing_off`), each carrying its `lane`, no two sharing a
+`device_id` and `lane`, `held` present exactly when the state is `held`,
+`blocked` true exactly when pending is positive, every pending artifact is in a
+listed lane and every listed lane is held, and `degraded` true exactly when
+`faults`, `devices` or `archived_registrations` is not empty.
+`archived_registrations` is always carried, one entry per archived registration
+refusal, never in `devices`, `pending` or `blocked`. `faults` is always carried, and a fault never makes `blocked` true:
+`store_unavailable` per durable store, raised by any failed store operation and
+by a failed store probe, and cleared only by that store's next successful
+probe, never by a successful operation (a failing archive move keeps its own
+source until the move completes); `admission_failed` per admission form (durable outbound queueing, and
+the durable staging of an envelope's custody return), cleared only by a later
+completed admission of the same form and never by a probe, and never raised by
+a failure to publish the acknowledgement after durable admission;
+`device_unconfigured` when a carriage names an unconfigured device, persisted
+without the device ID ever being projected, and cleared only when that device
+is configured and a later handoff for it is admitted. `delivery_impaired` is
+never raised, because `devices` is always projected and complete. Each store is
+probed right after opening and then every `store_probe_interval_s` (300 to 900,
+default 900, refused outside the range at load): the probe reads the directory
+and atomically replaces the fixed private file `.ori-evidence-probe`, which the
+loader ignores; it never touches a queue record. `last_error` stays a one-event
+summary.
+Every stall that is not a hold is logged once on entry and again on the
+reminder interval.
+
+Verified by the tests in `internal/evidence`, including
+`TestTerminalRefusalIsAttemptedOnceHoldsTheQueueAndIsLoggedOnce`,
+`TestReceiverStateRefusalRetriesOnNextHandoffAndNeverBlocks`,
+`TestHoldOnOneDeviceNeverDelaysAnother`,
+`TestBackoffOnOneDeviceNeverDelaysAnother`,
+`TestHandoffForOneDeviceNeverRetriesAnother`,
+`TestPerDeviceCapacityRefusesOnlyTheExhaustedDevice`,
+`TestAdmissionRefusesAnArtifactOverTheTransportMaximum`,
+`TestGatewayWideQueueOpensPerDevice`, `TestBackoffSurvivesARestart`,
+`TestRestartRestoresHoldWithoutSendingIt`,
+`TestInvalidHoldRefusesTheQueueAndKeepsTheRecord`,
+`TestEachProcessWithoutADurableHoldSendsOnceUntilOneIsWritten`,
+`TestEveryNonAcceptingOutcomeIsLogged`, the
+`evidence-transport/vectors/refusal-policy.json` corpus through
+`TestRefusalPolicyVectorCases` and `TestRefusalPolicyVectorSequences`, and in
+`cmd/ori-gateway` by `TestRealProjectionsSatisfyTheContract` and
+`TestProjectionOracleAgreesWithTheVectors`.
 
 ## Layout
 

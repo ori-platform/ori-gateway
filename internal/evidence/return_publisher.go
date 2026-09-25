@@ -238,11 +238,11 @@ type inboundAck struct {
 }
 
 func authorityQueueRouting(queued QueuedArtifact) (string, AuthorityArtifactType, error) {
+	// Courier opacity: the routing device_id is read, never the declared v.
 	var value struct {
-		V        int    `json:"v"`
 		DeviceID string `json:"device_id"`
 	}
-	if err := json.Unmarshal(queued.Payload, &value); err != nil || value.V != 1 || value.DeviceID == "" {
+	if err := json.Unmarshal(queued.Payload, &value); err != nil || value.DeviceID == "" {
 		return "", "", fmt.Errorf("evidence: invalid queued authority artifact")
 	}
 	switch queued.Type {

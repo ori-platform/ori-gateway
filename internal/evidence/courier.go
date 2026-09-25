@@ -10,19 +10,60 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
+
+	"github.com/ori-platform/ori-gateway/internal/contracts"
 )
 
-const defaultDeliveryRetry = 5 * time.Second
+const (
+	defaultDeliveryRetry   = 5 * time.Second
+	defaultBlockedReminder = 15 * time.Minute
+	// maxArtifactBytes is the evidence-transport/v1 artifact size limit. A
+	// larger artifact is refused at admission, before custody.
+	maxArtifactBytes = 1 << 20
+	// maxQueueRecordBytes is the exact encoded size of the largest outbound
+	// queue record: a maximum-size artifact under the longest outbound type
+	// (anchor_registration), with the largest queue_seq and enqueued_at_ms a
+	// positive int64 can hold. It is the maximum encoded registration record,
+	// and no evidence record is larger.
+	maxQueueRecordBytes = maxRecordOverhead + int64(len(ArtifactAnchorRegistration))
+	// maxEvidenceRecordBytes is the exact encoded size of the largest
+	// non-registration record: the longer of delivery_envelope and checkpoint,
+	// which is delivery_envelope.
+	maxEvidenceRecordBytes = maxRecordOverhead + int64(len(ArtifactDeliveryEnvelope))
+	// maxRecordOverhead is every byte of a maximum queue record but its type
+	// name: the fixed fields, 19-digit queue_seq and enqueued_at_ms, and the
+	// Base64 of a maximum-size artifact.
+	maxRecordOverhead = int64(len(`{"v":1,"id":"`) + 64 +
+		len(`","artifact_type":"`) +
+		len(`","queue_seq":`) + 19 +
+		len(`,"enqueued_at_ms":`) + 19 +
+		len(`,"payload":"`) + 4*((maxArtifactBytes+2)/3) + len(`"}`))
+
+	// MinDeviceShareItems and MinDeviceShareBytes are the least one device's
+	// share may hold: the registration reserve (one anchor_registration slot
+	// and one maximum encoded registration record) plus one maximum encoded
+	// evidence record (evidence-transport/v1, gateway-config/v1).
+	MinDeviceShareItems = 2
+	MinDeviceShareBytes = maxQueueRecordBytes + maxEvidenceRecordBytes
+)
 
 var (
 	errChannelUnavailable      = errors.New("evidence channel unavailable")
 	errChannelRefused          = errors.New("evidence channel explicitly refused artifact")
 	errChannelPermanentRefusal = errors.New("evidence channel permanently refused artifact")
+	errChannelReceiverState    = errors.New("evidence channel refused artifact pending receiver state")
+	errHeadHeld                = errors.New("queue head is held after a permanent refusal")
+	errRegistrationArchived    = errors.New("terminally refused registration archived")
 	errRuntimeSink             = errors.New("runtime authority-artifact sink unavailable")
 	errMalformedResponse       = errors.New("evidence channel returned a malformed artifact")
 	errQueueRetirement         = errors.New("durable queue retirement failed")
+	errCustodyConstruction     = errors.New("evidence: construct custody acknowledgement")
+	// ErrUnrecognisedOutcome is a response outside the refusal policy: a status
+	// outside the table, or a response whose media type, body, fields, digest
+	// binding, outcome or retry metadata is invalid or absent. It is retained,
+	// recorded as unrecognised, and backed off; never retired or held.
+	ErrUnrecognisedOutcome = errors.New("evidence: unrecognised transport outcome")
 )
 
 // Admission is the result of accepting one runtime artifact into durable
@@ -88,7 +129,7 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 		// The artifact is already durable. Returning an error is intentional: the
 		// runtime must retry and the idempotent enqueue will recover the same entry
 		// and timestamp rather than losing it or claiming custody prematurely.
-		return Admission{}, fmt.Errorf("evidence: construct custody acknowledgement: %w", err)
+		return Admission{}, fmt.Errorf("%w: %w", errCustodyConstruction, err)
 	}
 	admission.Custody = &ack
 	return admission, nil
@@ -98,19 +139,23 @@ func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
 	if !validOutboundArtifactType(kind) {
 		return fmt.Errorf("evidence: unsupported outbound artifact type %q", kind)
 	}
+	// Courier opacity (evidence-transport/v1): only the stable routing
+	// projection is read — device_id, and local_seq for an envelope. The
+	// artifact's declared v is never read, so an artifact version the courier
+	// does not know is admitted and delivered; the evidence authority alone
+	// decides version support.
 	var routing struct {
-		V        int    `json:"v"`
 		DeviceID string `json:"device_id"`
 		LocalSeq int64  `json:"local_seq"`
 	}
 	if err := json.Unmarshal(payload, &routing); err != nil {
-		return fmt.Errorf("evidence: artifact is not a JSON object: %w", err)
+		return fmt.Errorf("evidence: artifact routing fields are missing or unparseable: %w", err)
 	}
-	if routing.V != 1 {
-		return fmt.Errorf("evidence: artifact version must be 1")
+	if !validRoutingDeviceID(routing.DeviceID) {
+		return fmt.Errorf("evidence: artifact device_id is outside its routing domain")
 	}
-	if routing.DeviceID == "" {
-		return fmt.Errorf("evidence: artifact device_id must not be empty")
+	if len(payload) > maxArtifactBytes {
+		return fmt.Errorf("evidence: artifact exceeds the evidence-transport maximum of %d bytes", maxArtifactBytes)
 	}
 	if kind == ArtifactDeliveryEnvelope && routing.LocalSeq <= 0 {
 		return fmt.Errorf("evidence: delivery envelope local_seq must be positive")
@@ -119,6 +164,37 @@ func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
 		return fmt.Errorf("evidence: delivery envelope local_seq is outside the D-011 integer zone")
 	}
 	return nil
+}
+
+// validRoutingDeviceID applies the v1 routing domain of device_id, as a
+// carriage topic segment requires (evidence-exchange/v1).
+func validRoutingDeviceID(device string) bool {
+	return contracts.ValidEvidenceRoutingDeviceID(device)
+}
+
+// authorityRouting is the stable routing projection of an authority artifact.
+type authorityRouting struct {
+	DeviceID string `json:"device_id"`
+	FromSeq  *int64 `json:"from_seq"`
+	ToSeq    *int64 `json:"to_seq"`
+}
+
+// authorityRoutingProjection reads only the routing projection of an authority
+// artifact (evidence-exchange/v1): device_id, and from_seq and to_seq on a
+// delivery receipt, each present with its v1 type. The version is never read.
+func authorityRoutingProjection(kind AuthorityArtifactType, payload []byte) (authorityRouting, error) {
+	var routing authorityRouting
+	if err := json.Unmarshal(payload, &routing); err != nil || !validRoutingDeviceID(routing.DeviceID) {
+		return authorityRouting{}, fmt.Errorf("invalid authority routing fields")
+	}
+	if kind != AuthorityDeliveryReceipt {
+		return routing, nil
+	}
+	if routing.FromSeq == nil || routing.ToSeq == nil ||
+		*routing.FromSeq <= 0 || *routing.ToSeq < *routing.FromSeq || *routing.ToSeq > maxSafeInteger {
+		return authorityRouting{}, fmt.Errorf("invalid receipt range")
+	}
+	return routing, nil
 }
 
 // AuthorityArtifactType is deliberately disjoint from ArtifactType and from
@@ -149,9 +225,17 @@ type AuthorityArtifact struct {
 // affirmative application by the evidence authority, not broker receipt and
 // not gateway custody.
 type DeliveryResult struct {
-	Accepted           bool
-	Retriable          bool
-	RetryAfter         time.Duration
+	Accepted   bool
+	Retriable  bool
+	RetryAfter time.Duration
+	// ReceiverState marks a non-retriable refusal that names receiver or
+	// credential state rather than the artifact bytes. It is retried on the
+	// next runtime handoff and never holds the queue. A non-retriable refusal
+	// without it is terminal for these bytes: attempted once, then held.
+	ReceiverState bool
+	// RefusalStatus is the HTTP status of a refusal, or 0 when the channel has
+	// none.
+	RefusalStatus      int
 	RefusalReason      string
 	AuthorityArtifacts []AuthorityArtifact
 }
@@ -171,200 +255,24 @@ type AuthoritySink interface {
 	Store(ctx context.Context, artifact AuthorityArtifact) error
 }
 
-// DeliveryWorker drains the durable queue through the independent evidence
-// channel. Failure leaves the head entry intact and retries later.
-type DeliveryWorker struct {
-	queue   *DurableQueue
-	channel EvidenceChannel
-	sink    AuthoritySink
-	retry   time.Duration
-	wake    chan struct{}
-
-	deliveryMu    sync.Mutex
-	mu            sync.Mutex
-	lastFailureAt time.Time
-	lastError     string
-	blocked       bool
-}
-
-type DeliveryWorkerOptions struct {
-	RetryInterval time.Duration
-}
-
-type channelRefusalError struct {
-	retryAfter time.Duration
-}
-
-func (e *channelRefusalError) Error() string { return errChannelRefused.Error() }
-func (e *channelRefusalError) Unwrap() error { return errChannelRefused }
-
-func NewDeliveryWorker(queue *DurableQueue, channel EvidenceChannel, sink AuthoritySink, opts DeliveryWorkerOptions) (*DeliveryWorker, error) {
-	if queue == nil {
-		return nil, fmt.Errorf("evidence: delivery worker requires a durable queue")
-	}
-	if channel == nil {
-		return nil, fmt.Errorf("evidence: delivery worker requires an independent evidence channel")
-	}
-	retry := opts.RetryInterval
-	if retry <= 0 {
-		retry = defaultDeliveryRetry
-	}
-	return &DeliveryWorker{
-		queue: queue, channel: channel, sink: sink, retry: retry, wake: make(chan struct{}, 1),
-	}, nil
-}
-
-// Notify wakes a worker after a new durable admission. It is edge-triggered and
-// non-blocking; a full signal buffer already means the worker will look again.
-func (w *DeliveryWorker) Notify() {
-	if w == nil {
-		return
-	}
-	w.mu.Lock()
-	w.blocked = false
-	w.mu.Unlock()
-	select {
-	case w.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (w *DeliveryWorker) Run(ctx context.Context) error {
-	if w == nil {
-		return fmt.Errorf("evidence: nil delivery worker")
-	}
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-w.wake:
-		case <-timer.C:
-		}
-
-		delivered, err := w.deliverHead(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-				return nil
-			}
-			w.recordFailure(err)
-			if errors.Is(err, errChannelPermanentRefusal) {
-				w.mu.Lock()
-				w.blocked = true
-				w.mu.Unlock()
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				continue
-			}
-			delay := w.retry
-			var refusal *channelRefusalError
-			if errors.As(err, &refusal) && refusal.retryAfter > delay {
-				delay = refusal.retryAfter
-			}
-			resetTimer(timer, delay)
-			continue
-		}
-		w.clearFailure()
-		if delivered {
-			// Drain immediately while work exists. No timer is needed to make
-			// progress, and each successful removal is durably committed first.
-			resetTimer(timer, 0)
-			continue
-		}
-		resetTimer(timer, w.retry)
-	}
-}
-
-func resetTimer(timer *time.Timer, delay time.Duration) {
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-	timer.Reset(delay)
-}
-
-func (w *DeliveryWorker) deliverHead(ctx context.Context) (bool, error) {
-	w.deliveryMu.Lock()
-	defer w.deliveryMu.Unlock()
-
-	queued, ok := w.queue.Peek()
-	if !ok {
-		return false, nil
-	}
-	result, err := w.channel.Deliver(ctx, queued)
-	if err != nil {
-		return false, errChannelUnavailable
-	}
-	if !result.Accepted {
-		if !result.Retriable {
-			return false, errChannelPermanentRefusal
-		}
-		return false, &channelRefusalError{retryAfter: result.RetryAfter}
-	}
-	if len(result.AuthorityArtifacts) > 0 && w.sink == nil {
-		return false, errRuntimeSink
-	}
-	routed := make([]AuthorityArtifact, 0, len(result.AuthorityArtifacts))
-	hasCoveringReceipt := false
-	for _, artifact := range result.AuthorityArtifacts {
-		if len(artifact.Payload) == 0 || !validAuthorityArtifactType(artifact.Type) {
-			return false, errMalformedResponse
-		}
-		deviceID, coversEnvelope, err := validateAuthorityRouting(queued, artifact)
-		if err != nil {
-			return false, errMalformedResponse
-		}
-		hasCoveringReceipt = hasCoveringReceipt || coversEnvelope
-		routed = append(routed, AuthorityArtifact{
-			Type: artifact.Type, DeviceID: deviceID, Payload: append([]byte(nil), artifact.Payload...),
-		})
-	}
-	if queued.Type == ArtifactDeliveryEnvelope && !hasCoveringReceipt {
-		// An authority accepting an envelope without returning a receipt covering
-		// that device and sequence leaves the runtime unable to distinguish
-		// recorded evidence from a stalled or substituted hop. Keep the envelope
-		// so an idempotent retry can recover the correct receipt.
-		return false, errMalformedResponse
-	}
-	for _, artifact := range routed {
-		if err := w.sink.Store(ctx, artifact); err != nil {
-			return false, errRuntimeSink
-		}
-	}
-	if err := w.queue.Remove(queued.ID); err != nil {
-		return false, errQueueRetirement
-	}
-	return true, nil
-}
-
 func validAuthorityArtifactType(kind AuthorityArtifactType) bool {
 	return kind == AuthorityDeliveryReceipt || kind == AuthorityEpochConfirmation
 }
 
 func validateAuthorityRouting(queued QueuedArtifact, artifact AuthorityArtifact) (string, bool, error) {
+	// Only the routing projection is read, never v: device_id and local_seq
+	// of the queued artifact, and device_id with from_seq and to_seq of a
+	// returned receipt.
 	var outbound struct {
-		V        int    `json:"v"`
 		DeviceID string `json:"device_id"`
 		LocalSeq int64  `json:"local_seq"`
 	}
-	if err := json.Unmarshal(queued.Payload, &outbound); err != nil || outbound.V != 1 || outbound.DeviceID == "" {
+	if err := json.Unmarshal(queued.Payload, &outbound); err != nil || outbound.DeviceID == "" {
 		return "", false, fmt.Errorf("invalid queued routing fields")
 	}
-	var authority struct {
-		V        int    `json:"v"`
-		DeviceID string `json:"device_id"`
-		FromSeq  int64  `json:"from_seq"`
-		ToSeq    int64  `json:"to_seq"`
-	}
-	if err := json.Unmarshal(artifact.Payload, &authority); err != nil || authority.V != 1 || authority.DeviceID == "" {
-		return "", false, fmt.Errorf("invalid authority routing fields")
+	authority, err := authorityRoutingProjection(artifact.Type, artifact.Payload)
+	if err != nil {
+		return "", false, err
 	}
 	if authority.DeviceID != outbound.DeviceID {
 		return "", false, fmt.Errorf("authority artifact names a different device")
@@ -372,43 +280,26 @@ func validateAuthorityRouting(queued QueuedArtifact, artifact AuthorityArtifact)
 	if artifact.Type != AuthorityDeliveryReceipt {
 		return authority.DeviceID, false, nil
 	}
-	if authority.FromSeq <= 0 || authority.ToSeq < authority.FromSeq || authority.ToSeq > maxSafeInteger {
-		return "", false, fmt.Errorf("invalid receipt range")
-	}
 	covers := queued.Type == ArtifactDeliveryEnvelope &&
-		outbound.LocalSeq >= authority.FromSeq && outbound.LocalSeq <= authority.ToSeq
+		outbound.LocalSeq >= *authority.FromSeq && outbound.LocalSeq <= *authority.ToSeq
 	return authority.DeviceID, covers, nil
 }
 
-// Status exposes queue/failure state without channel endpoint, credentials,
-// implementation identity, or authority details.
-type DeliveryStatus struct {
-	Pending       int
-	Degraded      bool
-	Blocked       bool
-	LastFailureAt time.Time
-	LastError     string
+func payloadDigest(payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
-func (w *DeliveryWorker) Status() DeliveryStatus {
-	if w == nil {
-		return DeliveryStatus{}
+func artifactDeviceID(payload []byte) string {
+	var routing struct {
+		DeviceID string `json:"device_id"`
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return DeliveryStatus{
-		Pending: w.queue.Len(), Degraded: w.lastError != "", Blocked: w.blocked,
-		LastFailureAt: w.lastFailureAt, LastError: w.lastError,
+	// The device is the one the admission path bound to its topic and the
+	// configured device list; the log handler escapes it.
+	if err := json.Unmarshal(payload, &routing); err != nil || routing.DeviceID == "" {
+		return "unrecognised"
 	}
-}
-
-func (w *DeliveryWorker) recordFailure(err error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.lastFailureAt = time.Now()
-	// Errors are deliberately reduced to a closed, implementation-neutral
-	// vocabulary. Raw transport errors may contain hostnames or URLs.
-	w.lastError = safeFailureReason(err)
+	return routing.DeviceID
 }
 
 func safeFailureReason(err error) string {
@@ -419,6 +310,8 @@ func safeFailureReason(err error) string {
 		return "channel_refused"
 	case errors.Is(err, errChannelPermanentRefusal):
 		return "channel_permanent_refusal"
+	case errors.Is(err, errChannelReceiverState):
+		return "channel_receiver_state_refusal"
 	case errors.Is(err, errRuntimeSink):
 		return "runtime_sink_unavailable"
 	case errors.Is(err, errMalformedResponse):
@@ -428,11 +321,4 @@ func safeFailureReason(err error) string {
 	default:
 		return "delivery_pending"
 	}
-}
-
-func (w *DeliveryWorker) clearFailure() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.lastError = ""
-	w.blocked = false
 }

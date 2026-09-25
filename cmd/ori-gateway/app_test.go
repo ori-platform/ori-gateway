@@ -810,7 +810,7 @@ func TestEvidenceUsesDedicatedPersistentBrokerSession(t *testing.T) {
 	cfg.Evidence = config.EvidenceConfig{
 		Enabled: true, QueueDirectory: filepath.Join(t.TempDir(), "outbound"),
 		ReturnQueueDirectory: filepath.Join(t.TempDir(), "returned"), MaxItems: 10,
-		MaxBytes: 1 << 20, RetryIntervalS: 1, EndpointEnv: "EVIDENCE_ENDPOINT",
+		MaxBytes: 4 << 20, RetryIntervalS: 1, StoreProbeIntervalS: 900, EndpointEnv: "EVIDENCE_ENDPOINT",
 		ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
 	}
 	mainBroker := newFakeBroker()
@@ -2028,7 +2028,7 @@ func TestGatewaySiteHealthIncludesEnabledEvidenceDelivery(t *testing.T) {
 	queueDirectory := filepath.Join(t.TempDir(), "outbound")
 	returnQueueDirectory := filepath.Join(t.TempDir(), "returned")
 	queue, err := evidence.OpenDurableQueue(evidence.QueueOptions{
-		Directory: queueDirectory, MaxItems: 10, MaxBytes: 1 << 20,
+		Directory: queueDirectory, MaxItems: 10, MaxBytes: 4 << 20,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2044,7 +2044,7 @@ func TestGatewaySiteHealthIncludesEnabledEvidenceDelivery(t *testing.T) {
 	cfg.Evidence = config.EvidenceConfig{
 		Enabled: true, QueueDirectory: queueDirectory,
 		ReturnQueueDirectory: returnQueueDirectory, MaxItems: 10,
-		MaxBytes: 1 << 20, RetryIntervalS: 1, EndpointEnv: "EVIDENCE_ENDPOINT",
+		MaxBytes: 4 << 20, RetryIntervalS: 1, StoreProbeIntervalS: 900, EndpointEnv: "EVIDENCE_ENDPOINT",
 		ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
 	}
 

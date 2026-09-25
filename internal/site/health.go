@@ -105,6 +105,54 @@ type GatewayEvidenceDeliveryView struct {
 	Blocked         bool   `json:"blocked"`
 	LastFailureAtMS int64  `json:"last_failure_at_ms,omitempty"`
 	LastError       string `json:"last_error,omitempty"`
+	// Devices has one entry for each device and lane whose delivery is not
+	// clean, and none for a lane delivering cleanly (gateway-api/v1). It is
+	// always present, empty when every lane is clean.
+	Devices []GatewayEvidenceDeliveryDevice `json:"devices"`
+	// Faults is the active courier-level fault set from a closed vocabulary
+	// (store_unavailable, admission_failed). It is always present, empty when
+	// none is active. LastError is a one-event summary, not the fault state.
+	Faults []string `json:"faults"`
+	// ArchivedRegistrations has one entry for each unacknowledged archived
+	// terminal registration refusal (gateway-api/v1). It is always present,
+	// empty when there is none; it is never in Devices, never counted in
+	// Pending, never makes Blocked true, and makes Degraded true.
+	ArchivedRegistrations []GatewayEvidenceArchivedRegistration `json:"archived_registrations"`
+}
+
+// GatewayEvidenceArchivedRegistration identifies an archived registration
+// refusal by device, digest and closed vocabulary only; the archived bytes are
+// never projected.
+type GatewayEvidenceArchivedRegistration struct {
+	DeviceID       string `json:"device_id"`
+	ArtifactDigest string `json:"artifact_digest"`
+	RefusalStatus  int    `json:"refusal_status"`
+	Reason         string `json:"reason"`
+	RefusedAtMS    int64  `json:"refused_at_ms"`
+	Acknowledged   bool   `json:"acknowledged"`
+}
+
+// GatewayEvidenceDeliveryDevice is one device's lane whose evidence delivery
+// is not clean. Lane is "registration" or "evidence". Held is present exactly
+// when State is "held".
+type GatewayEvidenceDeliveryDevice struct {
+	DeviceID string                       `json:"device_id"`
+	Lane     string                       `json:"lane"`
+	Pending  int                          `json:"pending"`
+	State    string                       `json:"state"`
+	Held     *GatewayEvidenceDeliveryHeld `json:"held,omitempty"`
+}
+
+// GatewayEvidenceDeliveryHeld identifies a held head by bytes and closed
+// vocabulary only: no endpoint, path or credential.
+type GatewayEvidenceDeliveryHeld struct {
+	QueueRecord    string `json:"queue_record"`
+	ArtifactDigest string `json:"artifact_digest"`
+	ArtifactType   string `json:"artifact_type"`
+	RefusalStatus  int    `json:"refusal_status"`
+	Reason         string `json:"reason"`
+	FirstHeldAtMS  int64  `json:"first_held_at_ms"`
+	Acknowledged   bool   `json:"acknowledged"`
 }
 
 // ProjectOptions configures the site health projection parameters.

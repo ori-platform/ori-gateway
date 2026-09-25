@@ -155,71 +155,112 @@ func (c *HTTPChannel) Deliver(ctx context.Context, artifact QueuedArtifact) (Del
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil || len(body) > maxResponseBytes {
+	if err != nil {
 		return DeliveryResult{}, fmt.Errorf("evidence: ingest response unavailable")
+	}
+	// Everything below is a response the authority did send. One that falls
+	// outside the refusal policy is an unrecognised outcome: retained, backed
+	// off, never retired and never held.
+	if len(body) > maxResponseBytes {
+		return DeliveryResult{}, unrecognised("oversized response")
 	}
 	mediaType, _, mediaErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if mediaErr != nil || mediaType != "application/json" {
-		return DeliveryResult{}, fmt.Errorf("evidence: ingest response has wrong content type")
+		return DeliveryResult{}, unrecognised("wrong content type")
 	}
 	var wire channelResponse
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return DeliveryResult{}, fmt.Errorf("evidence: malformed ingest response")
+		return DeliveryResult{}, unrecognised("malformed response body")
 	}
 	if wire.V != 1 {
-		return DeliveryResult{}, fmt.Errorf("evidence: unrecognised ingest response")
+		return DeliveryResult{}, unrecognised("unsupported response version")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return refusedDeliveryResult(resp, wire, artifactDigest)
 	}
+	// Only a 200 meeting every acceptance requirement retires an entry.
 	if wire.Outcome != "accepted" || wire.Reason != "" || wire.Retriable || wire.ArtifactDigest != artifactDigest {
-		return DeliveryResult{}, fmt.Errorf("evidence: malformed accepted response")
+		return DeliveryResult{}, unrecognised("malformed acceptance")
 	}
 	authority := make([]AuthorityArtifact, 0, len(wire.AuthorityArtifacts))
 	for _, returned := range wire.AuthorityArtifacts {
 		kind := AuthorityArtifactType(returned.ArtifactType)
 		if !validAuthorityArtifactType(kind) {
-			return DeliveryResult{}, fmt.Errorf("evidence: unknown authority artifact type")
+			return DeliveryResult{}, unrecognised("unknown authority artifact type")
 		}
 		payload, err := base64.StdEncoding.Strict().DecodeString(returned.ArtifactB64)
 		if err != nil || len(payload) == 0 {
-			return DeliveryResult{}, fmt.Errorf("evidence: malformed authority artifact bytes")
+			return DeliveryResult{}, unrecognised("malformed authority artifact bytes")
 		}
 		authority = append(authority, AuthorityArtifact{Type: kind, Payload: payload})
 	}
 	return DeliveryResult{Accepted: true, AuthorityArtifacts: authority}, nil
 }
 
+func unrecognised(detail string) error {
+	return fmt.Errorf("%w: %s", ErrUnrecognisedOutcome, detail)
+}
+
+// refusedDeliveryResult checks that a non-200 response is well formed for its
+// status, then takes its class from refusalPolicy, the evidence-transport/v1
+// refusal policy table. The reason is not part of the well-formedness check: a
+// missing or unadmitted reason is recorded as unrecognised and takes the
+// status's fail-closed action. The retriable flag is never used to select a
+// well-formed refusal's class.
 func refusedDeliveryResult(resp *http.Response, wire channelResponse, artifactDigest string) (DeliveryResult, error) {
-	result := DeliveryResult{Accepted: false, Retriable: wire.Retriable, RefusalReason: wire.Reason}
+	recorded := recordedRefusalReason(resp.StatusCode, wire.Reason)
+	result := DeliveryResult{
+		Accepted: false, RefusalStatus: resp.StatusCode, RefusalReason: recorded,
+	}
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusConflict, http.StatusUnprocessableEntity:
-		if wire.Outcome != "refused" || wire.Retriable || wire.Reason == "" || wire.ArtifactDigest != artifactDigest || len(wire.AuthorityArtifacts) != 0 {
-			return DeliveryResult{}, fmt.Errorf("evidence: malformed refusal response")
+		// A 400 may omit the digest: evidence-transport/v1 refuses malformed
+		// requests before authentication, and unauthenticated responses omit
+		// it. Every other refusal here is authenticated and bound to the digest.
+		digestBound := wire.ArtifactDigest == artifactDigest ||
+			(resp.StatusCode == http.StatusBadRequest && wire.ArtifactDigest == "")
+		if wire.Outcome != "refused" || !digestBound || len(wire.AuthorityArtifacts) != 0 {
+			return DeliveryResult{}, unrecognised("malformed refusal")
 		}
 	case http.StatusUnauthorized:
-		if wire.Outcome != "refused" || wire.Reason == "" || wire.ArtifactDigest != "" || len(wire.AuthorityArtifacts) != 0 {
-			return DeliveryResult{}, fmt.Errorf("evidence: malformed authentication refusal")
+		if wire.Outcome != "refused" || wire.ArtifactDigest != "" || len(wire.AuthorityArtifacts) != 0 {
+			return DeliveryResult{}, unrecognised("malformed authentication refusal")
 		}
 	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
 		digestBound := wire.ArtifactDigest == artifactDigest
 		preAuthUnavailable := resp.StatusCode == http.StatusServiceUnavailable && wire.ArtifactDigest == ""
-		if wire.Outcome != "pending" || !wire.Retriable || wire.Reason == "" || (!digestBound && !preAuthUnavailable) || len(wire.AuthorityArtifacts) != 0 {
-			return DeliveryResult{}, fmt.Errorf("evidence: malformed backpressure response")
+		if wire.Outcome != "pending" || (!digestBound && !preAuthUnavailable) || len(wire.AuthorityArtifacts) != 0 {
+			return DeliveryResult{}, unrecognised("malformed backpressure")
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			delaySeconds, err := strconv.ParseUint(strings.TrimSpace(resp.Header.Get("Retry-After")), 10, 31)
-			if err != nil || delaySeconds == 0 {
-				return DeliveryResult{}, fmt.Errorf("evidence: malformed rate-limit retry interval")
+			retryAfter, ok := parseRetryAfter(resp.Header.Get("Retry-After"))
+			// A 429 MUST carry Retry-After: a rate_limited or
+			// pending_registration_limit without a positive integer one is
+			// missing retry metadata, an unrecognised outcome. Any other 429
+			// backs off, waiting no less than a parseable Retry-After.
+			if (recorded == "rate_limited" || recorded == "pending_registration_limit") && !ok {
+				return DeliveryResult{}, unrecognised("rate limit without Retry-After")
 			}
-			result.RetryAfter = time.Duration(delaySeconds) * time.Second
+			result.RetryAfter = retryAfter
 		}
 	default:
-		return DeliveryResult{}, fmt.Errorf("evidence: unrecognised ingest status")
+		return DeliveryResult{}, unrecognised("status outside the refusal policy")
 	}
+	class := refusalPolicy(resp.StatusCode, wire.Reason)
+	result.Retriable = class == refusalBackoff
+	result.ReceiverState = class == refusalHandoff
 	return result, nil
+}
+
+// parseRetryAfter reads a Retry-After given in whole seconds.
+func parseRetryAfter(value string) (time.Duration, bool) {
+	seconds, err := strconv.ParseUint(strings.TrimSpace(value), 10, 31)
+	if err != nil || seconds == 0 {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
 }
 
 type channelResponse struct {

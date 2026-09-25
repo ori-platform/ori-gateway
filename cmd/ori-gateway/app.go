@@ -180,6 +180,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}
 
 	var evidenceQueue *evidence.DurableQueue
+	var evidenceFaults *evidence.FaultRecorder
 	var evidenceWorker *evidence.DeliveryWorker
 	var authoritySink *evidence.DurableAuthoritySink
 	if cfg.Evidence.Enabled {
@@ -190,14 +191,19 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return err
 		}
+		// Capacity is reserved per configured device: each holds an equal share
+		// of max_items and max_bytes, so one device cannot exhaust another's.
+		evidenceFaults = evidence.NewFaultRecorder()
 		evidenceQueue, err = evidence.OpenDurableQueue(evidence.QueueOptions{
-			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes, Now: deps.now,
+			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
+			Devices: cfg.Gateway.DeviceIDs, Faults: evidenceFaults, FaultSource: "outbound", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence outbound queue: %w", err)
 		}
 		authoritySink, err = evidence.OpenDurableAuthoritySink(evidence.QueueOptions{
-			Directory: cfg.Evidence.ReturnQueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes, Now: deps.now,
+			Directory: cfg.Evidence.ReturnQueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
+			Faults: evidenceFaults, FaultSource: "return", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence return queue: %w", err)
@@ -210,7 +216,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 		evidenceWorker, err = evidence.NewDeliveryWorker(
 			evidenceQueue, channel, authoritySink,
-			evidence.DeliveryWorkerOptions{RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second},
+			evidence.DeliveryWorkerOptions{
+				RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second,
+				BackoffBase:   time.Duration(cfg.Evidence.BackoffBaseS) * time.Second,
+				MaxBackoff:    time.Duration(cfg.Evidence.BackoffMaxS) * time.Second,
+				Faults:        evidenceFaults,
+				Logger:        deps.logger,
+			},
 		)
 		if err != nil {
 			return fmt.Errorf("construct evidence delivery worker: %w", err)
@@ -387,7 +399,17 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			return fmt.Errorf("construct evidence return publisher: %w", err)
 		}
 		evidenceIngress.SetReturnNotifier(returnPublisher.Notify)
+		evidenceIngress.SetFaultRecorder(evidenceFaults)
 		runners.start("evidence delivery worker", evidenceWorker.Run)
+		// Each durable store was probed when it opened; these keep probing it,
+		// independently of admissions and of health publication.
+		probeInterval := time.Duration(cfg.Evidence.StoreProbeIntervalS) * time.Second
+		runners.start("evidence outbound store probe", func(ctx context.Context) error {
+			return evidenceQueue.ProbeLoop(ctx, probeInterval)
+		})
+		runners.start("evidence return store probe", func(ctx context.Context) error {
+			return authoritySink.ProbeLoop(ctx, probeInterval)
+		})
 		runners.start("evidence return publisher", returnPublisher.Run)
 	}
 	if webhookBridge != nil {
@@ -490,15 +512,27 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 		if err := evidenceBroker.Subscribe(runCtx, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 			deviceID, parseErr := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
-			if parseErr != nil || !allowedDevices[deviceID] {
+			if parseErr != nil {
 				deps.logger.Warn("evidence outbound transport refused")
+				return
+			}
+			// An unconfigured device is rejected before admission: nothing is
+			// admitted, no custody is issued and no acknowledgement is
+			// published, so the runtime keeps its bytes and retries
+			// (gateway-api/v1). The observation raises device_unconfigured,
+			// which never carries the device ID.
+			if !allowedDevices[deviceID] {
+				_ = evidenceQueue.NoteUnconfiguredDevice(deviceID)
+				deps.logger.Warn("evidence outbound carriage for an unconfigured device refused")
 				return
 			}
 			if err := evidenceIngress.Handle(runCtx, topic, payload); err != nil {
 				deps.logger.Warn("evidence outbound transport refused")
 				return
 			}
-			evidenceWorker.Notify()
+			// A handoff for both of this device's lanes only: it retries
+			// their handoff-only refusals and never touches another device's.
+			evidenceWorker.NotifyDevice(deviceID)
 			// A newly observed runtime artifact can repair receiver-state
 			// refusals such as unknown_sequence, and commonly follows a runtime
 			// release that installs an authority key or version. Retry retained
@@ -655,6 +689,30 @@ func evidenceDeliveryView(worker *evidence.DeliveryWorker) *site.GatewayEvidence
 	}
 	if !status.LastFailureAt.IsZero() {
 		view.LastFailureAtMS = status.LastFailureAt.UnixMilli()
+	}
+	view.Faults = append([]string{}, status.Faults...)
+	view.Devices = make([]site.GatewayEvidenceDeliveryDevice, 0, len(status.Devices))
+	for _, device := range status.Devices {
+		entry := site.GatewayEvidenceDeliveryDevice{
+			DeviceID: device.DeviceID, Lane: string(device.Lane), Pending: device.Pending, State: device.State,
+		}
+		if device.Held != nil {
+			entry.Held = &site.GatewayEvidenceDeliveryHeld{
+				QueueRecord: device.Held.QueueRecord, ArtifactDigest: device.Held.ArtifactDigest,
+				ArtifactType: string(device.Held.ArtifactType), RefusalStatus: device.Held.RefusalStatus,
+				Reason: device.Held.Reason, FirstHeldAtMS: device.Held.FirstHeldAt.UnixMilli(),
+				Acknowledged: device.Held.Acknowledged,
+			}
+		}
+		view.Devices = append(view.Devices, entry)
+	}
+	view.ArchivedRegistrations = make([]site.GatewayEvidenceArchivedRegistration, 0, len(status.Archived))
+	for _, archived := range status.Archived {
+		view.ArchivedRegistrations = append(view.ArchivedRegistrations, site.GatewayEvidenceArchivedRegistration{
+			DeviceID: archived.DeviceID, ArtifactDigest: archived.ArtifactDigest,
+			RefusalStatus: archived.RefusalStatus, Reason: archived.Reason,
+			RefusedAtMS: archived.RefusedAt.UnixMilli(), Acknowledged: archived.Acknowledged,
+		})
 	}
 	return view
 }

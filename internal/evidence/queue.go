@@ -84,7 +84,18 @@ type QueueOptions struct {
 	Directory string
 	MaxItems  int
 	MaxBytes  int64
-	Now       func() time.Time
+	// Devices, when set, reserves capacity per device: each named device may
+	// hold at most MaxItems/len(Devices) records and MaxBytes/len(Devices)
+	// bytes, so one device exhausting its share cannot refuse another's
+	// admissions. A device not named has no share. Left empty, one share is the
+	// whole queue.
+	Devices []string
+	// Faults, when set, records store_unavailable under FaultSource while a
+	// durable write, removal or directory sync fails, and clears it on the
+	// next that succeeds.
+	Faults      *FaultRecorder
+	FaultSource string
+	Now         func() time.Time
 }
 
 // DurableQueue stores artifacts as independently atomic records. A committed
@@ -97,10 +108,43 @@ type DurableQueue struct {
 	maxBytes int64
 	now      func() time.Time
 	entries  map[string]queueRecord
+	holds    map[string]HoldRecord
+	backoffs map[string]BackoffRecord
+	// archives is the terminal-registration archive, keyed by queue record
+	// id. It is outside active capacity and never delivered.
+	archives map[string]ArchiveRecord
 	sizes    map[string]int64
 	order    []string
 	bytes    int64
 	nextSeq  int64
+
+	// Per-lane delivery order and per-device reserved capacity. laneOf is
+	// derived from each record's routing device_id and carriage artifact type;
+	// nothing about it is stored separately, so a queue written before
+	// delivery order was per device and lane needs no migration.
+	laneOf      map[string]LaneKey
+	laneItems   map[LaneKey]int
+	laneBytes   map[LaneKey]int64
+	deviceItems map[string]int
+	deviceBytes map[string]int64
+	configured  map[string]bool
+	shareItems  int
+	shareBytes  int64
+
+	faults      *FaultRecorder
+	faultSource string
+
+	unconfigured         map[string]bool
+	unconfiguredOverflow bool
+}
+
+// noteStore records the outcome of one durable-store operation: a failure
+// raises the store's store_unavailable, and a success leaves it as it is.
+// Only a successful probe of the store clears it (gateway-api/v1; see Probe).
+func (q *DurableQueue) noteStore(err error) {
+	if err != nil {
+		q.faults.Note(FaultStoreUnavailable, q.faultSource, err)
+	}
 }
 
 // OpenDurableQueue opens or creates a private queue and reconstructs its state.
@@ -140,18 +184,115 @@ func openDurableQueue(opts QueueOptions) (*DurableQueue, error) {
 	}
 
 	q := &DurableQueue{
-		dir:      dir,
-		maxItems: opts.MaxItems,
-		maxBytes: opts.MaxBytes,
-		now:      now,
-		entries:  make(map[string]queueRecord),
-		sizes:    make(map[string]int64),
-		nextSeq:  1,
+		dir:          dir,
+		maxItems:     opts.MaxItems,
+		maxBytes:     opts.MaxBytes,
+		now:          now,
+		entries:      make(map[string]queueRecord),
+		holds:        make(map[string]HoldRecord),
+		backoffs:     make(map[string]BackoffRecord),
+		archives:     make(map[string]ArchiveRecord),
+		sizes:        make(map[string]int64),
+		nextSeq:      1,
+		laneOf:       make(map[string]LaneKey),
+		laneItems:    make(map[LaneKey]int),
+		laneBytes:    make(map[LaneKey]int64),
+		deviceItems:  make(map[string]int),
+		deviceBytes:  make(map[string]int64),
+		shareItems:   opts.MaxItems,
+		shareBytes:   opts.MaxBytes,
+		faults:       opts.Faults,
+		faultSource:  opts.FaultSource,
+		unconfigured: make(map[string]bool),
+	}
+	if len(opts.Devices) > 0 {
+		q.configured = make(map[string]bool, len(opts.Devices))
+		for _, device := range opts.Devices {
+			q.configured[device] = true
+		}
+		q.shareItems = opts.MaxItems / len(q.configured)
+		q.shareBytes = opts.MaxBytes / int64(len(q.configured))
+		if q.shareItems < MinDeviceShareItems || q.shareBytes < MinDeviceShareBytes {
+			return nil, fmt.Errorf("evidence: per-device queue share (%d items, %d bytes over %d devices) cannot hold the registration reserve and one maximum-size evidence record",
+				q.shareItems, q.shareBytes, len(q.configured))
+		}
 	}
 	if err := q.load(); err != nil {
 		return nil, err
 	}
+	// Probed immediately after opening; a failure is reported as the store's
+	// store_unavailable, not as a failure to open.
+	_ = q.Probe()
 	return q, nil
+}
+
+// recordDevice is the device a record belongs to, from its routing fields.
+func recordDevice(payload []byte) string {
+	var routing struct {
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.Unmarshal(payload, &routing); err != nil {
+		return ""
+	}
+	return routing.DeviceID
+}
+
+// Lane is one of a device's two delivery orders (evidence-transport/v1,
+// refusal policy): its anchor registrations, and every other artifact it
+// delivers.
+type Lane string
+
+const (
+	LaneRegistration Lane = "registration"
+	LaneEvidence     Lane = "evidence"
+)
+
+// LaneKey names one device's lane. Order, retry state and holds are kept per
+// LaneKey; capacity is kept per device and shared by its two lanes.
+type LaneKey struct {
+	Device string
+	Lane   Lane
+}
+
+// LaneOf is the lane an artifact of the given carriage type travels in. It is
+// derived, never stored: an anchor registration is in the registration lane,
+// and every other artifact in the evidence lane.
+func LaneOf(kind ArtifactType) Lane {
+	if kind == ArtifactAnchorRegistration {
+		return LaneRegistration
+	}
+	return LaneEvidence
+}
+
+func recordLane(record queueRecord) LaneKey {
+	return LaneKey{Device: recordDevice(record.Payload), Lane: LaneOf(record.Type)}
+}
+
+func (q *DurableQueue) indexLocked(record queueRecord, size int64) {
+	key := recordLane(record)
+	q.laneOf[record.ID] = key
+	q.laneItems[key]++
+	q.laneBytes[key] += size
+	q.deviceItems[key.Device]++
+	q.deviceBytes[key.Device] += size
+}
+
+func (q *DurableQueue) unindexLocked(id string, size int64) {
+	key := q.laneOf[id]
+	delete(q.laneOf, id)
+	q.laneItems[key]--
+	q.laneBytes[key] -= size
+	if q.laneItems[key] <= 0 {
+		delete(q.laneItems, key)
+		delete(q.laneBytes, key)
+	}
+	device := key.Device
+	q.deviceItems[device]--
+	q.deviceBytes[device] -= size
+	if q.deviceItems[device] <= 0 {
+		delete(q.deviceItems, device)
+		delete(q.deviceBytes, device)
+	}
 }
 
 // Enqueue durably stores the exact artifact bytes. Re-enqueueing the same type
@@ -182,8 +323,17 @@ func (q *DurableQueue) enqueue(kind ArtifactType, payload []byte) (QueuedArtifac
 	if existing, ok := q.entries[id]; ok {
 		return recordArtifact(existing), nil
 	}
+	device := recordDevice(payload)
+	if q.configured != nil && !q.configured[device] {
+		// Not queue_full: an unconfigured device holds no share to be full.
+		return QueuedArtifact{}, ErrUnconfiguredDevice
+	}
 	if len(q.entries) >= q.maxItems {
 		return QueuedArtifact{}, &QueueFullError{Limit: "item"}
+	}
+	key := LaneKey{Device: device, Lane: LaneOf(kind)}
+	if err := q.laneShareRefusalLocked(key, 0); err != nil {
+		return QueuedArtifact{}, err
 	}
 
 	enqueuedAtMS := q.now().UnixMilli()
@@ -205,11 +355,15 @@ func (q *DurableQueue) enqueue(kind ArtifactType, payload []byte) (QueuedArtifac
 	if q.bytes+int64(len(encoded)) > q.maxBytes {
 		return QueuedArtifact{}, &QueueFullError{Limit: "byte"}
 	}
+	if err := q.laneShareRefusalLocked(key, int64(len(encoded))); err != nil {
+		return QueuedArtifact{}, err
+	}
 	if err := q.writeRecord(record, encoded); err != nil {
 		return QueuedArtifact{}, err
 	}
 	q.entries[id] = record
 	q.sizes[id] = int64(len(encoded))
+	q.indexLocked(record, int64(len(encoded)))
 	q.order = append(q.order, id)
 	q.sortOrder()
 	q.bytes += int64(len(encoded))
@@ -217,7 +371,136 @@ func (q *DurableQueue) enqueue(kind ArtifactType, payload []byte) (QueuedArtifac
 	return recordArtifact(record), nil
 }
 
-// Peek returns the oldest queued artifact without retiring it.
+// laneShareRefusalLocked is the only place a lane's admission is refused for
+// capacity (evidence-transport/v1). Capacity is reserved per device. With
+// configured devices, every share reserves one anchor_registration slot and
+// the maximum encoded registration record for registrations only: evidence
+// admission may never take that reserve, so an evidence lane waiting on an
+// unconfirmed epoch can never refuse the registration that would confirm it:
+// the evidence lane holds at most the share less the reserve, and both lanes
+// together at most the share. Without configured devices the queue is one
+// unreserved share. With size 0 it checks items; with a record's encoded size
+// it checks bytes.
+func (q *DurableQueue) laneShareRefusalLocked(key LaneKey, size int64) error {
+	reserved := q.configured != nil && key.Lane != LaneRegistration
+	if size == 0 {
+		if q.deviceItems[key.Device] >= q.shareItems ||
+			(reserved && q.laneItems[key] >= q.shareItems-1) {
+			return &QueueFullError{Limit: "device item"}
+		}
+		return nil
+	}
+	if q.deviceBytes[key.Device]+size > q.shareBytes ||
+		(reserved && q.laneBytes[key]+size > q.shareBytes-maxQueueRecordBytes) {
+		return &QueueFullError{Limit: "device byte"}
+	}
+	return nil
+}
+
+// PeekLane returns the oldest queued artifact of one device's lane without
+// retiring it. Delivery order is per device and lane: another device's
+// records, and the device's other lane, never stand in front of it.
+func (q *DurableQueue) PeekLane(key LaneKey) (QueuedArtifact, bool) {
+	if q == nil {
+		return QueuedArtifact{}, false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, id := range q.order {
+		if q.laneOf[id] == key {
+			return recordArtifact(q.entries[id]), true
+		}
+	}
+	return QueuedArtifact{}, false
+}
+
+// PeekDevice returns the oldest queued artifact of one device, in either lane.
+func (q *DurableQueue) PeekDevice(device string) (QueuedArtifact, bool) {
+	if q == nil {
+		return QueuedArtifact{}, false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, id := range q.order {
+		if q.laneOf[id].Device == device {
+			return recordArtifact(q.entries[id]), true
+		}
+	}
+	return QueuedArtifact{}, false
+}
+
+// Lanes lists every lane with queued records, sorted by device then lane.
+func (q *DurableQueue) Lanes() []LaneKey {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]LaneKey, 0, len(q.laneItems))
+	for key := range q.laneItems {
+		out = append(out, key)
+	}
+	sortLaneKeys(out)
+	return out
+}
+
+// LenLane is the number of records queued in one device's lane.
+func (q *DurableQueue) LenLane(key LaneKey) int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.laneItems[key]
+}
+
+// laneCounts is the total and every lane's count, read under one lock so the
+// lanes never sum to more than the total.
+func (q *DurableQueue) laneCounts() (int, map[LaneKey]int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	counts := make(map[LaneKey]int, len(q.laneItems))
+	for key, n := range q.laneItems {
+		counts[key] = n
+	}
+	return len(q.entries), counts
+}
+
+func sortLaneKeys(keys []LaneKey) {
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Device != keys[j].Device {
+			return keys[i].Device < keys[j].Device
+		}
+		return keys[i].Lane < keys[j].Lane
+	})
+}
+
+// Devices lists every device with queued records, in no particular order.
+func (q *DurableQueue) Devices() []string {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]string, 0, len(q.deviceItems))
+	for device := range q.deviceItems {
+		out = append(out, device)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// LenDevice is the number of records queued for one device.
+func (q *DurableQueue) LenDevice(device string) int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.deviceItems[device]
+}
+
+// Peek returns the oldest queued artifact of any device without retiring it.
 func (q *DurableQueue) Peek() (QueuedArtifact, bool) {
 	if q == nil {
 		return QueuedArtifact{}, false
@@ -236,8 +519,22 @@ func (q *DurableQueue) Remove(id string) error {
 	if q == nil {
 		return fmt.Errorf("evidence: nil durable queue")
 	}
+	err := q.remove(id)
+	if !errors.Is(err, ErrArtifactNotFound) {
+		q.noteStore(err)
+	}
+	return err
+}
+
+func (q *DurableQueue) remove(id string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	return q.removeLocked(id)
+}
+
+// removeLocked durably retires one record and its sidecars and releases its
+// capacity.
+func (q *DurableQueue) removeLocked(id string) error {
 	record, ok := q.entries[id]
 	if !ok {
 		return ErrArtifactNotFound
@@ -246,6 +543,12 @@ func (q *DurableQueue) Remove(id string) error {
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("evidence: encode queued artifact for retirement: %w", err)
+	}
+	if err := q.removeHoldLocked(id); err != nil {
+		return err
+	}
+	if err := q.removeBackoffLocked(id); err != nil {
+		return err
 	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("evidence: retire queued artifact: %w", err)
@@ -264,6 +567,7 @@ func (q *DurableQueue) Remove(id string) error {
 	delete(q.entries, id)
 	storedSize := q.sizes[id]
 	delete(q.sizes, id)
+	q.unindexLocked(id, storedSize)
 	for i, queuedID := range q.order {
 		if queuedID == id {
 			q.order = append(q.order[:i], q.order[i+1:]...)
@@ -300,9 +604,27 @@ func (q *DurableQueue) load() error {
 		return fmt.Errorf("evidence: read durable queue: %w", err)
 	}
 	seenQueueSeq := make(map[int64]struct{})
+	var holdNames, backoffNames, archiveNames []string
+	unconfiguredPresent := false
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == queueMarkerName || strings.HasPrefix(name, signingClockPrefix) {
+		if name == queueMarkerName || strings.HasPrefix(name, signingClockPrefix) || name == probeFileName {
+			continue
+		}
+		if name == unconfiguredFileName {
+			unconfiguredPresent = true
+			continue
+		}
+		if strings.HasPrefix(name, holdFilePrefix) {
+			holdNames = append(holdNames, name)
+			continue
+		}
+		if strings.HasPrefix(name, backoffFilePrefix) {
+			backoffNames = append(backoffNames, name)
+			continue
+		}
+		if strings.HasPrefix(name, archiveFilePrefix) {
+			archiveNames = append(archiveNames, name)
 			continue
 		}
 		if strings.HasPrefix(name, queueTempPrefix) {
@@ -352,6 +674,7 @@ func (q *DurableQueue) load() error {
 		seenQueueSeq[record.QueueSeq] = struct{}{}
 		q.entries[record.ID] = record
 		q.sizes[record.ID] = int64(len(raw))
+		q.indexLocked(record, int64(len(raw)))
 		q.order = append(q.order, record.ID)
 		q.bytes += int64(len(raw))
 		if record.QueueSeq >= q.nextSeq {
@@ -362,10 +685,35 @@ func (q *DurableQueue) load() error {
 	if len(q.entries) > q.maxItems || q.bytes > q.maxBytes {
 		return fmt.Errorf("evidence: existing durable queue exceeds configured bounds")
 	}
-	return nil
+	// Per-device shares gate new admissions only. A queue written while
+	// capacity was gateway-wide may hold more for one device than its share;
+	// it opens, delivers, and refuses that device's admissions until it drains
+	// below its share, rather than refusing to start.
+	if err := q.loadHolds(holdNames); err != nil {
+		return err
+	}
+	if err := q.loadBackoffs(backoffNames); err != nil {
+		return err
+	}
+	if err := q.loadArchives(archiveNames); err != nil {
+		return err
+	}
+	return q.loadUnconfigured(unconfiguredPresent)
 }
 
 func (q *DurableQueue) writeRecord(record queueRecord, encoded []byte) error {
+	return q.writeFileAtomic(record.ID+queueFileSuffix, encoded)
+}
+
+// writeFileAtomic commits one private file into the queue directory: temp
+// file, fsync, rename, directory fsync.
+func (q *DurableQueue) writeFileAtomic(name string, encoded []byte) error {
+	err := q.writeFileAtomicRaw(name, encoded)
+	q.noteStore(err)
+	return err
+}
+
+func (q *DurableQueue) writeFileAtomicRaw(name string, encoded []byte) error {
 	tmp, err := os.CreateTemp(q.dir, queueTempPrefix)
 	if err != nil {
 		return fmt.Errorf("evidence: create queue record: %w", err)
@@ -390,7 +738,7 @@ func (q *DurableQueue) writeRecord(record queueRecord, encoded []byte) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("evidence: close queue record: %w", err)
 	}
-	if err := os.Rename(tmpName, q.recordPath(record.ID)); err != nil {
+	if err := os.Rename(tmpName, filepath.Join(q.dir, name)); err != nil {
 		return fmt.Errorf("evidence: commit queue record: %w", err)
 	}
 	if err := syncDirectory(q.dir); err != nil {

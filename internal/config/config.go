@@ -12,8 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/evidence"
 )
 
 const (
@@ -22,7 +26,12 @@ const (
 	DefaultGatewayAuthSecretEnv = "GATEWAY_SHARED_SECRET"
 	DefaultEvidenceMaxItems     = 10000
 	DefaultEvidenceMaxBytes     = int64(256 << 20)
-	DefaultEvidenceRetryS       = 5
+	DefaultEvidenceBackoffMaxS  = 300
+
+	DefaultEvidenceStoreProbeIntervalS = 900
+	MinEvidenceStoreProbeIntervalS     = 300
+	MaxEvidenceStoreProbeIntervalS     = 900
+	DefaultEvidenceRetryS              = 5
 
 	DefaultWebhookBridgeListenAddr       = "127.0.0.1:8090"
 	DefaultSiteHealthListenAddr          = "127.0.0.1:8765"
@@ -99,9 +108,16 @@ type EvidenceConfig struct {
 	MaxItems             int    `yaml:"max_items"`
 	MaxBytes             int64  `yaml:"max_bytes"`
 	RetryIntervalS       int    `yaml:"retry_interval_s"`
-	EndpointEnv          string `yaml:"endpoint_env"`
-	ClientIDEnv          string `yaml:"client_id_env"`
-	SecretEnv            string `yaml:"secret_env"`
+	// BackoffBaseS and BackoffMaxS are the courier's back-off base and bound.
+	// evidence-transport/v1 requires bound >= base >= delivery interval.
+	BackoffBaseS int `yaml:"backoff_base_s"`
+	BackoffMaxS  int `yaml:"backoff_max_s"`
+	// StoreProbeIntervalS is how often each durable evidence store is probed,
+	// 300 through 900 seconds (gateway-api/v1).
+	StoreProbeIntervalS int    `yaml:"store_probe_interval_s"`
+	EndpointEnv         string `yaml:"endpoint_env"`
+	ClientIDEnv         string `yaml:"client_id_env"`
+	SecretEnv           string `yaml:"secret_env"`
 }
 
 type ProviderConfig struct {
@@ -251,6 +267,9 @@ type fileEvidenceConfig struct {
 	MaxItems             *int   `yaml:"max_items"`
 	MaxBytes             *int64 `yaml:"max_bytes"`
 	RetryIntervalS       *int   `yaml:"retry_interval_s"`
+	BackoffBaseS         *int   `yaml:"backoff_base_s"`
+	BackoffMaxS          *int   `yaml:"backoff_max_s"`
+	StoreProbeIntervalS  *int   `yaml:"store_probe_interval_s"`
 	EndpointEnv          string `yaml:"endpoint_env"`
 	ClientIDEnv          string `yaml:"client_id_env"`
 	SecretEnv            string `yaml:"secret_env"`
@@ -391,7 +410,7 @@ func (f *fileConfig) normalize() (Config, error) {
 	if err := validateSiteHealth(cfg.SiteHealth); err != nil {
 		return Config{}, err
 	}
-	if err := validateEvidence(cfg.Evidence); err != nil {
+	if err := validateEvidence(cfg.Evidence, cfg.Gateway.DeviceIDs); err != nil {
 		return Config{}, err
 	}
 
@@ -411,7 +430,24 @@ func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
 	if raw.RetryIntervalS != nil {
 		retry = *raw.RetryIntervalS
 	}
+	// Unset, the base is the delivery interval and the bound is five minutes
+	// or the base, whichever is longer; set, they are validated as given.
+	base := retry
+	if raw.BackoffBaseS != nil {
+		base = *raw.BackoffBaseS
+	}
+	bound := max(DefaultEvidenceBackoffMaxS, base)
+	if raw.BackoffMaxS != nil {
+		bound = *raw.BackoffMaxS
+	}
+	probe := DefaultEvidenceStoreProbeIntervalS
+	if raw.StoreProbeIntervalS != nil {
+		probe = *raw.StoreProbeIntervalS
+	}
 	return EvidenceConfig{
+		StoreProbeIntervalS:  probe,
+		BackoffBaseS:         base,
+		BackoffMaxS:          bound,
 		Enabled:              raw.Enabled,
 		QueueDirectory:       strings.TrimSpace(raw.QueueDirectory),
 		ReturnQueueDirectory: strings.TrimSpace(raw.ReturnQueueDirectory),
@@ -424,10 +460,20 @@ func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
 	}
 }
 
-func validateEvidence(cfg EvidenceConfig) error {
+// validateEvidence checks the evidence courier. Queue capacity is reserved per
+// configured device, as an equal share of max_items and max_bytes, and each
+// share must hold the registration reserve plus one maximum encoded evidence
+// record (evidence-transport/v1, gateway-config/v1).
+func validateEvidence(cfg EvidenceConfig, deviceIDs []string) error {
 	if !cfg.Enabled {
 		return nil
 	}
+	for _, deviceID := range deviceIDs {
+		if err := validateEvidenceDeviceID(deviceID); err != nil {
+			return err
+		}
+	}
+	devices := len(deviceIDs)
 	if !filepath.IsAbs(cfg.QueueDirectory) || !filepath.IsAbs(cfg.ReturnQueueDirectory) {
 		return fmt.Errorf("evidence queue directories must be absolute")
 	}
@@ -436,6 +482,18 @@ func validateEvidence(cfg EvidenceConfig) error {
 	}
 	if cfg.MaxItems <= 0 || cfg.MaxBytes <= 0 || cfg.RetryIntervalS <= 0 {
 		return fmt.Errorf("evidence queue bounds and retry interval must be positive")
+	}
+	if cfg.StoreProbeIntervalS < MinEvidenceStoreProbeIntervalS || cfg.StoreProbeIntervalS > MaxEvidenceStoreProbeIntervalS {
+		return fmt.Errorf("evidence.store_probe_interval_s must be %d through %d seconds (got %d)",
+			MinEvidenceStoreProbeIntervalS, MaxEvidenceStoreProbeIntervalS, cfg.StoreProbeIntervalS)
+	}
+	if cfg.BackoffMaxS < cfg.BackoffBaseS || cfg.BackoffBaseS < cfg.RetryIntervalS {
+		return fmt.Errorf("evidence back-off must satisfy backoff_max_s >= backoff_base_s >= retry_interval_s (got %d, %d, %d)",
+			cfg.BackoffMaxS, cfg.BackoffBaseS, cfg.RetryIntervalS)
+	}
+	if devices > 0 && (cfg.MaxItems/devices < evidence.MinDeviceShareItems || cfg.MaxBytes/int64(devices) < evidence.MinDeviceShareBytes) {
+		return fmt.Errorf("evidence.max_items and evidence.max_bytes are shared equally across %d devices; each share must be at least %d items and %d bytes (a registration reserve and one evidence record)",
+			devices, evidence.MinDeviceShareItems, evidence.MinDeviceShareBytes)
 	}
 	for field, value := range map[string]string{
 		"evidence.endpoint_env":  cfg.EndpointEnv,
@@ -491,6 +549,24 @@ func validateGatewayDeviceID(deviceID string) error {
 	}
 	if strings.ContainsAny(deviceID, "/+#|") {
 		return fmt.Errorf("device_id %q must not contain MQTT separators, wildcards, or auth delimiters", deviceID)
+	}
+	// Control characters (general category Cc, NUL among them, which an MQTT
+	// topic cannot carry) are refused whether or not the courier is enabled
+	// (gateway-config/v1).
+	for _, r := range deviceID {
+		if unicode.Is(unicode.Cc, r) {
+			return fmt.Errorf("device_id %q must not contain control characters", deviceID)
+		}
+	}
+	return nil
+}
+
+// validateEvidenceDeviceID holds a configured device to the evidence routing
+// domain while the courier is enabled: a device outside it would have every
+// artifact it hands off refused malformed at admission.
+func validateEvidenceDeviceID(deviceID string) error {
+	if !contracts.ValidEvidenceRoutingDeviceID(deviceID) {
+		return fmt.Errorf("gateway.device_ids: device_id %q must be 1 to 128 Unicode characters with no control character, whitespace, \"/\", \"+\" or \"#\" while the evidence courier is enabled", deviceID)
 	}
 	return nil
 }
