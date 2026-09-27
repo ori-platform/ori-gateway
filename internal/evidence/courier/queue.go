@@ -98,6 +98,11 @@ type QueueOptions struct {
 	// Unset, the queue is one gateway-wide share, as a site that declares
 	// nothing has always had.
 	ReserveDeviceShares bool
+	// VersionedDevices are the devices that declare
+	// gateway-evidence-carriage/v1, whose device_id is held to the
+	// evidence-exchange/v2 routing domain. Every other device is carried under
+	// gateway-api/v1, whose device_id need only be present.
+	VersionedDevices []string
 	// Faults, when set, records store_unavailable under FaultSource while a
 	// durable write, removal or directory sync fails, and clears it on the
 	// next that succeeds.
@@ -116,14 +121,16 @@ type DurableQueue struct {
 	maxBytes int64
 	// reserved is whether capacity is reserved per configured device.
 	reserved bool
-	now      func() time.Time
-	entries  map[string]queueRecord
-	holds    map[string]HoldRecord
-	backoffs map[string]BackoffRecord
-	sizes    map[string]int64
-	order    []string
-	bytes    int64
-	nextSeq  int64
+	// versioned is the set of devices held to the v2 routing domain.
+	versioned map[string]bool
+	now       func() time.Time
+	entries   map[string]queueRecord
+	holds     map[string]HoldRecord
+	backoffs  map[string]BackoffRecord
+	sizes     map[string]int64
+	order     []string
+	bytes     int64
+	nextSeq   int64
 
 	// Per-lane delivery order and per-device reserved capacity. laneOf is
 	// derived from each record's routing device_id and carriage artifact type;
@@ -217,6 +224,10 @@ func openDurableQueue(opts QueueOptions) (*DurableQueue, error) {
 			q.configured[device] = true
 		}
 	}
+	q.versioned = make(map[string]bool, len(opts.VersionedDevices))
+	for _, device := range opts.VersionedDevices {
+		q.versioned[device] = true
+	}
 	if opts.ReserveDeviceShares {
 		if len(q.configured) == 0 {
 			return nil, fmt.Errorf("evidence: per-device queue shares require the configured devices")
@@ -236,6 +247,16 @@ func openDurableQueue(opts QueueOptions) (*DurableQueue, error) {
 	// store_unavailable, not as a failure to open.
 	_ = q.Probe()
 	return q, nil
+}
+
+// RoutingDeviceID reports whether device is a routable device_id for this
+// queue: within the evidence-exchange/v2 routing domain for a device that
+// declares gateway-evidence-carriage/v1, and present for any other.
+func (q *DurableQueue) RoutingDeviceID(device string) bool {
+	if q != nil && q.versioned[device] {
+		return validRoutingDeviceID(device)
+	}
+	return device != ""
 }
 
 // recordDevice is the device a record belongs to, from its routing fields.

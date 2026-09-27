@@ -145,6 +145,19 @@ func (c EvidenceConfig) DeclaresVersionedCarriage() bool {
 	return false
 }
 
+// VersionedDevices lists the configured devices that declare
+// gateway-evidence-carriage/v1.
+func (c EvidenceConfig) VersionedDevices() []string {
+	var out []string
+	for device, carriage := range c.DeviceCarriage {
+		if carriage == CarriageEvidenceCarriageV1 {
+			out = append(out, device)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // StoreProbeInterval is the interval each durable evidence store is probed
 // at. A site that declares no gateway-evidence-carriage/v1 keeps whatever
 // store_probe_interval_s it carries, unvalidated; a non-positive value probes

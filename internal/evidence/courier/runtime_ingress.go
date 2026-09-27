@@ -110,7 +110,7 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 		return h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "refused", "binding_mismatch", h.now().UnixMilli())
 	}
 	kind := ArtifactType(carriage.ArtifactType)
-	if err := validateArtifactRoutingFields(kind, artifactBytes); err != nil {
+	if err := validateArtifactRoutingFields(kind, artifactBytes, h.courier.queue.RoutingDeviceID); err != nil {
 		return h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "refused", "malformed", h.now().UnixMilli())
 	}
 	admission, err := h.courier.Admit(kind, artifactBytes)

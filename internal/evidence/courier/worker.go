@@ -460,7 +460,7 @@ func (l *deliveryLane) deliverHead(ctx context.Context) (bool, error) {
 			l.setAttemptReason(refusal.Unrecognised)
 			return false, errMalformedResponse
 		}
-		deviceID, coversEnvelope, err := validateAuthorityRouting(queued, artifact)
+		deviceID, coversEnvelope, err := validateAuthorityRouting(queued, artifact, l.w.queue.RoutingDeviceID)
 		if err != nil {
 			l.setAttemptReason(refusal.Unrecognised)
 			return false, errMalformedResponse

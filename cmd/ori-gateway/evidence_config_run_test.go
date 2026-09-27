@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"maps"
 	"os"
@@ -24,8 +25,8 @@ import (
 // TestEveryAcceptedEvidenceConfigRuns carries each configuration the
 // gateway-config/v2 evidence corpus accepts with the courier enabled through
 // config.Load and into a running gateway: a configuration the loader accepts
-// must not then refuse to start, whether or not any device declares
-// gateway-evidence-carriage/v1.
+// must not then refuse to start, or refuse the evidence of any device it
+// configures, whether or not any device declares gateway-evidence-carriage/v1.
 func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 	raw, err := specvectors.Read("gateway-config/vectors/evidence-config-v2.json")
 	if err != nil {
@@ -63,6 +64,7 @@ func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 	legacy("a negative legacy store probe", []string{"dev-01"}, map[string]any{"store_probe_interval_s": -1})
 	legacy("a legacy store probe past any duration", []string{"dev-01"}, map[string]any{"store_probe_interval_s": int64(1) << 40})
 	legacy("a one-item legacy queue across two devices", []string{"dev-01", "dev-02"}, map[string]any{"max_items": 1})
+	legacy("a legacy device outside the routing domain", []string{"site a edge 01"}, nil)
 	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
 	t.Setenv("GATEWAY_CUSTODY", "gateway-custody-secret-with-at-least-32-bytes")
 	// Unreachable, so nothing admitted is retired during the test.
@@ -131,6 +133,36 @@ func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 					<-done
 					t.Fatal("outbound evidence subscription never started")
 				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			// Every configured device can hand evidence to the courier: its
+			// artifact is queued, or refused only because a share is full.
+			handle := evidenceBroker.handlerFor(contracts.EvidenceOutboundTopicFilter)
+			for _, device := range cfg.Gateway.DeviceIDs {
+				artifact, _ := json.Marshal(map[string]any{"v": 1, "device_id": device, "high_water_seq": 1, "signature": "ed25519:opaque"})
+				carriage, _ := json.Marshal(map[string]string{
+					"device_id": device, "artifact_type": "checkpoint",
+					"artifact_b64": base64.StdEncoding.EncodeToString(artifact),
+				})
+				evidenceBroker.mu.Lock()
+				before := len(evidenceBroker.published)
+				evidenceBroker.mu.Unlock()
+				handle("ori/"+device+"/evidence/outbound", carriage)
+				var ack struct {
+					Outcome string `json:"outcome"`
+					Reason  string `json:"reason"`
+				}
+				evidenceBroker.mu.Lock()
+				for _, msg := range evidenceBroker.published[before:] {
+					if msg.topic == "ori/"+device+"/evidence/outbound/ack" {
+						_ = json.Unmarshal(msg.payload, &ack)
+					}
+				}
+				evidenceBroker.mu.Unlock()
+				if ack.Outcome != "queued" && (ack.Outcome != "refused" || ack.Reason != "queue_full") {
+					cancel()
+					<-done
+					t.Fatalf("device %q handed off a checkpoint: %q %q", device, ack.Outcome, ack.Reason)
 				}
 			}
 			select {

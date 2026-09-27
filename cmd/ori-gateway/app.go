@@ -202,7 +202,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		evidenceQueue, err = courier.OpenDurableQueue(courier.QueueOptions{
 			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
 			Devices: cfg.Gateway.DeviceIDs, ReserveDeviceShares: cfg.Evidence.DeclaresVersionedCarriage(),
-			Faults: evidenceFaults, FaultSource: "outbound", Now: deps.now,
+			VersionedDevices: cfg.Evidence.VersionedDevices(),
+			Faults:           evidenceFaults, FaultSource: "outbound", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence outbound queue: %w", err)

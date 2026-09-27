@@ -96,7 +96,7 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 	if c == nil || c.queue == nil {
 		return Admission{}, fmt.Errorf("evidence: courier is not configured")
 	}
-	if err := validateArtifactRoutingFields(kind, payload); err != nil {
+	if err := validateArtifactRoutingFields(kind, payload, c.queue.RoutingDeviceID); err != nil {
 		return Admission{}, err
 	}
 	queued, err := c.queue.Enqueue(kind, payload)
@@ -134,7 +134,7 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 	return admission, nil
 }
 
-func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
+func validateArtifactRoutingFields(kind ArtifactType, payload []byte, domain func(string) bool) error {
 	if !validOutboundArtifactType(kind) {
 		return fmt.Errorf("evidence: unsupported outbound artifact type %q", kind)
 	}
@@ -150,7 +150,7 @@ func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
 	if err := decodeRouting(payload, &routing); err != nil {
 		return fmt.Errorf("evidence: artifact routing fields are missing or unparseable: %w", err)
 	}
-	if !validRoutingDeviceID(routing.DeviceID) {
+	if !domain(routing.DeviceID) {
 		return fmt.Errorf("evidence: artifact device_id is outside its routing domain")
 	}
 	if len(payload) > maxArtifactBytes {
@@ -165,8 +165,8 @@ func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
 	return nil
 }
 
-// validRoutingDeviceID applies the v1 routing domain of device_id, as a
-// carriage topic segment requires (evidence-exchange/v1).
+// validRoutingDeviceID applies the evidence-exchange/v2 routing domain of
+// device_id, as a carriage topic segment requires.
 func validRoutingDeviceID(device string) bool {
 	return contracts.ValidEvidenceRoutingDeviceID(device)
 }
@@ -181,9 +181,9 @@ type authorityRouting struct {
 // authorityRoutingProjection reads only the routing projection of an authority
 // artifact (evidence-exchange/v1): device_id, and from_seq and to_seq on a
 // delivery receipt, each present with its v1 type. The version is never read.
-func authorityRoutingProjection(kind AuthorityArtifactType, payload []byte) (authorityRouting, error) {
+func authorityRoutingProjection(kind AuthorityArtifactType, payload []byte, domain func(string) bool) (authorityRouting, error) {
 	var routing authorityRouting
-	if err := decodeRouting(payload, &routing); err != nil || !validRoutingDeviceID(routing.DeviceID) {
+	if err := decodeRouting(payload, &routing); err != nil || !domain(routing.DeviceID) {
 		return authorityRouting{}, fmt.Errorf("invalid authority routing fields")
 	}
 	if kind != AuthorityDeliveryReceipt {
@@ -258,7 +258,7 @@ func validAuthorityArtifactType(kind AuthorityArtifactType) bool {
 	return kind == AuthorityDeliveryReceipt || kind == AuthorityEpochConfirmation
 }
 
-func validateAuthorityRouting(queued QueuedArtifact, artifact AuthorityArtifact) (string, bool, error) {
+func validateAuthorityRouting(queued QueuedArtifact, artifact AuthorityArtifact, domain func(string) bool) (string, bool, error) {
 	// Only the routing projection is read, never v: device_id and local_seq
 	// of the queued artifact, and device_id with from_seq and to_seq of a
 	// returned receipt.
@@ -269,7 +269,7 @@ func validateAuthorityRouting(queued QueuedArtifact, artifact AuthorityArtifact)
 	if err := decodeRouting(queued.Payload, &outbound); err != nil || outbound.DeviceID == "" {
 		return "", false, fmt.Errorf("invalid queued routing fields")
 	}
-	authority, err := authorityRoutingProjection(artifact.Type, artifact.Payload)
+	authority, err := authorityRoutingProjection(artifact.Type, artifact.Payload, domain)
 	if err != nil {
 		return "", false, err
 	}

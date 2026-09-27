@@ -107,9 +107,9 @@ func TestRoutingProjectionVectors(t *testing.T) {
 			var err error
 			switch tc.ArtifactType {
 			case string(ArtifactDeliveryEnvelope), string(ArtifactCheckpoint), string(ArtifactAnchorRegistration):
-				err = validateArtifactRoutingFields(ArtifactType(tc.ArtifactType), tc.Artifact)
+				err = validateArtifactRoutingFields(ArtifactType(tc.ArtifactType), tc.Artifact, validRoutingDeviceID)
 			case string(AuthorityDeliveryReceipt), string(AuthorityEpochConfirmation):
-				_, err = authorityRoutingProjection(AuthorityArtifactType(tc.ArtifactType), tc.Artifact)
+				_, err = authorityRoutingProjection(AuthorityArtifactType(tc.ArtifactType), tc.Artifact, validRoutingDeviceID)
 			default:
 				checkPin(t, routingProjectionPins, tc.Name, fmt.Sprintf("artifact type %s is not carried", tc.ArtifactType))
 				return
