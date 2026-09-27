@@ -520,8 +520,12 @@ func (l *deliveryLane) hold(queued QueuedArtifact, status int, reason string) {
 	// bytes again.
 	held := &heldHead{record: record, deviceID: artifactDeviceID(queued.Payload)}
 	behind := l.queued() - 1
+	// The hold and its failure are published together, so no status read
+	// sees a held lane without its last_error.
 	l.mu.Lock()
 	l.held, l.stall = held, nil
+	l.lastError = safeFailureReason(errChannelPermanentRefusal)
+	l.lastFailureAt = time.UnixMilli(record.FirstHeldAtMS)
 	l.mu.Unlock()
 	persistErr := l.w.queue.Hold(record)
 	l.mu.Lock()

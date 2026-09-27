@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/custody"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -286,6 +287,42 @@ func TestPermanentAuthorityRefusalBlocksWithoutHotRetryOrRetirement(t *testing.T
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestAHeldLaneNeverReadsWithoutItsFailure reads the worker's status
+// continuously while a head is refused terminally: no snapshot may show the
+// lane held without the last_error and failure time that explain it.
+func TestAHeldLaneNeverReadsWithoutItsFailure(t *testing.T) {
+	for range 20 {
+		q := openTestQueue(t, 10, 1<<20)
+		if _, err := q.Enqueue(ArtifactCheckpoint, []byte(`{"v":1,"device_id":"d"}`)); err != nil {
+			t.Fatal(err)
+		}
+		channel := &permanentRefusalChannel{}
+		worker, err := NewDeliveryWorker(q, channel, nil, DeliveryWorkerOptions{
+			RetryInterval: time.Hour, Logger: slog.New(slog.DiscardHandler),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		running := startWorker(t, worker)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			status := worker.Status()
+			if status.Held != nil && (status.LastError != "channel_permanent_refusal" || status.LastFailureAt.IsZero()) {
+				running.stop()
+				t.Fatalf("a held lane read without its failure: %#v", status)
+			}
+			if status.Held != nil && status.Held.Persisted {
+				break
+			}
+			if time.Now().After(deadline) {
+				running.stop()
+				t.Fatal("the refusal was never held")
+			}
+		}
+		running.stop()
 	}
 }
 
