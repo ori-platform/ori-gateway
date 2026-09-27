@@ -44,8 +44,7 @@ const (
 // file with fresh bytes, synced, renamed over the probe file, and the
 // directory synced. A failure raises this store's store_unavailable and a
 // success clears it: a successful probe is the only thing that clears it
-// (gateway-evidence-carriage/v1). Neither affects admission_failed, and a failing archive
-// move keeps its own source raised until the move completes.
+// (gateway-evidence-carriage/v1). Neither affects admission_failed.
 func (q *DurableQueue) Probe() error {
 	if q == nil {
 		return fmt.Errorf("evidence: nil durable queue")

@@ -244,15 +244,12 @@ evidence delivery state.
 
 A gateway built before persisted holds refuses to open a queue directory that
 contains `.ori-evidence-hold-*`, `.ori-evidence-backoff-*`,
-`.ori-evidence-archive-*`, `.ori-evidence-probe` or
-`.ori-evidence-unconfigured`. With the gateway stopped, `.ori-evidence-probe`
-and `.ori-evidence-unconfigured` may be deleted; neither holds evidence. Moving
-hold and back-off records out returns their heads to the older gateway's
-behaviour, which resends them; the queue records themselves are unchanged and
-must stay. An archive record is the only copy of a refused registration's
-bytes: move `.ori-evidence-archive-*` out to a private location and keep it,
-never delete it. The older gateway does not know it and does not resend it.
-Moving it back before starting this gateway again restores the archive.
+`.ori-evidence-probe` or `.ori-evidence-unconfigured`. With the gateway
+stopped, `.ori-evidence-probe` and `.ori-evidence-unconfigured` may be deleted;
+neither holds evidence. Moving hold and back-off records out returns their
+heads to the older gateway's behaviour, which resends them; the queue records
+themselves are unchanged and must stay. This gateway writes no archive record,
+and refuses to open a queue directory that contains one.
 
 ### The hold survives a restart
 

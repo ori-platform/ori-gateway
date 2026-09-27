@@ -510,15 +510,15 @@ func TestQueueWrittenWithoutLanesOpensIntoLanes(t *testing.T) {
 		t.Fatalf("lane lengths = %d, %d", q.LenLane(evLane), q.LenLane(regLane))
 	}
 	authority := newLaneAuthority()
-	// A durable hold on a registration is restored as a hold: never archived,
-	// never sent, and holding only its own lane.
+	// A durable hold on a registration is restored as a hold: kept, never
+	// sent, and holding only its own lane.
 	worker := laneWorker(t, q, authority, nil, 10*time.Millisecond)
 	running := startWorker(t, worker)
 	waitFor(t, "the evidence lane to drain", func() bool { return q.LenLane(evLane) == 0 })
 	waitFor(t, "the registration hold restored", func() bool { e, ok := laneEntry(worker, regLane); return ok && e.State == DeviceHeld })
 	running.stop()
-	if _, archived := q.ArchivedFor(regID); archived || q.LenLane(regLane) != 1 || authority.count(regLane) != 0 {
-		t.Fatalf("archived %v, registration lane %d, attempts %d", archived, q.LenLane(regLane), authority.count(regLane))
+	if q.LenLane(regLane) != 1 || authority.count(regLane) != 0 {
+		t.Fatalf("registration lane %d, attempts %d", q.LenLane(regLane), authority.count(regLane))
 	}
 	if _, err := os.Stat(filepath.Join(dir, holdFilePrefix+regID)); err != nil {
 		t.Fatalf("the restored hold record was removed: %v", err)

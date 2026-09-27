@@ -114,9 +114,6 @@ type DurableQueue struct {
 	entries  map[string]queueRecord
 	holds    map[string]HoldRecord
 	backoffs map[string]BackoffRecord
-	// archives is the terminal-registration archive, keyed by queue record
-	// id. It is outside active capacity and never delivered.
-	archives map[string]ArchiveRecord
 	sizes    map[string]int64
 	order    []string
 	bytes    int64
@@ -195,7 +192,6 @@ func openDurableQueue(opts QueueOptions) (*DurableQueue, error) {
 		entries:      make(map[string]queueRecord),
 		holds:        make(map[string]HoldRecord),
 		backoffs:     make(map[string]BackoffRecord),
-		archives:     make(map[string]ArchiveRecord),
 		sizes:        make(map[string]int64),
 		nextSeq:      1,
 		laneOf:       make(map[string]LaneKey),
@@ -606,7 +602,7 @@ func (q *DurableQueue) load() error {
 		return fmt.Errorf("evidence: read durable queue: %w", err)
 	}
 	seenQueueSeq := make(map[int64]struct{})
-	var holdNames, backoffNames, archiveNames []string
+	var holdNames, backoffNames []string
 	unconfiguredPresent := false
 	for _, entry := range entries {
 		name := entry.Name()
@@ -623,10 +619,6 @@ func (q *DurableQueue) load() error {
 		}
 		if strings.HasPrefix(name, backoffFilePrefix) {
 			backoffNames = append(backoffNames, name)
-			continue
-		}
-		if strings.HasPrefix(name, archiveFilePrefix) {
-			archiveNames = append(archiveNames, name)
 			continue
 		}
 		if strings.HasPrefix(name, queueTempPrefix) {
@@ -695,9 +687,6 @@ func (q *DurableQueue) load() error {
 		return err
 	}
 	if err := q.loadBackoffs(backoffNames); err != nil {
-		return err
-	}
-	if err := q.loadArchives(archiveNames); err != nil {
 		return err
 	}
 	return q.loadUnconfigured(unconfiguredPresent)

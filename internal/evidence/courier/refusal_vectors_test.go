@@ -602,21 +602,19 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 			runStep := func(i int, step refusalVectorStep) string {
 				key := keyOf(step)
 				// waitArchived holds this lane's current artifact to an
-				// archival: out of the active lane, in the archive, and not
-				// reported as a lane state.
+				// archival. The gateway keeps no archive, so none is ever
+				// observed; an artifact that leaves its lane anyway has left
+				// custody, which is reported as its own deviation.
 				waitArchived := func(label string) string {
-					kind, payload := laneArtifact(key, generation[key])
-					id := artifactID(kind, payload)
-					archivedNow := waitUntil(func() bool {
-						_, archived := q.ArchivedFor(id)
+					released := waitUntil(func() bool {
 						_, listed := laneEntry(worker, key)
-						return archived && q.LenLane(key) == 0 && !listed
+						return q.LenLane(key) == 0 && !listed
 					})
 					generation[key]++
-					if !archivedNow {
-						return label + ": not archived"
+					if released {
+						return label + ": released from custody with no archive"
 					}
-					return ""
+					return label + ": not archived"
 				}
 				if step.Response != nil && step.Response.RetryAfterS > 0 {
 					step.Response.RetryAfterS = scaledRetryAfterS
@@ -813,9 +811,6 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					id := q.firstID(key)
 					if _, ok := q.HoldFor(id); ok {
 						return label + ": a hold was persisted while the write was made to fail"
-					}
-					if _, ok := q.ArchivedFor(id); ok {
-						return label + ": an archive was committed while the write was made to fail"
 					}
 				}
 				return ""
