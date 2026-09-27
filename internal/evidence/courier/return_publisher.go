@@ -172,6 +172,9 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 		return err
 	}
 	var ack inboundAck
+	if err := refuseAmbiguousMembers(payload, &ack); err != nil {
+		return fmt.Errorf("evidence: malformed inbound acknowledgement")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ack); err != nil || decoder.Decode(&struct{}{}) != io.EOF {

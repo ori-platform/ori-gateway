@@ -218,20 +218,32 @@ func TestRuntimeIngressRejectsTopicWrapperAndArtifactBindingMismatch(t *testing.
 }
 
 // TestRuntimeIngressRefusesAnAmbiguousRoutingMember holds admission to
-// routing members spelled exactly and named once (evidence-exchange/v2): an
-// artifact naming device_id twice, or by a case variant, is refused as
-// malformed whichever spelling or position matches the topic, and nothing is
-// queued or given custody.
+// routing members spelled exactly, named once, and carrying Unicode scalar
+// values (evidence-exchange/v2): an artifact naming device_id twice, by a case
+// variant, or with bytes encoding/json would repair into U+FFFD is refused as
+// malformed whichever reading would match the topic, and nothing is queued or
+// given custody. A surrogate pair escaping a real character is admitted.
 func TestRuntimeIngressRefusesAnAmbiguousRoutingMember(t *testing.T) {
 	const seq = `"local_seq":1,"anchor_epoch_id":"sha256:7f1b65b8b24f69807441d80c8901207cf22657a9630b12901418a99efbd36f0a"`
-	for name, artifact := range map[string]string{
-		"the topic's device last":          `{"v":1,"device_id":"site-b-edge-09","device_id":"site-a-edge-01",` + seq + `}`,
-		"the topic's device first":         `{"v":1,"device_id":"site-a-edge-01","device_id":"site-b-edge-09",` + seq + `}`,
-		"a case variant alone":             `{"v":1,"Device_ID":"site-a-edge-01",` + seq + `}`,
-		"a case variant beside the member": `{"v":1,"device_id":"site-a-edge-01","DEVICE_ID":"site-b-edge-09",` + seq + `}`,
-		"local_seq named twice":            `{"v":1,"device_id":"site-a-edge-01","local_seq":2,` + seq + `}`,
+	const replaced = "site-\ufffd"
+	for _, tc := range []struct {
+		name, device, artifact string
+		admitted               bool
+	}{
+		{"the topic's device last", "site-a-edge-01", `{"v":1,"device_id":"site-b-edge-09","device_id":"site-a-edge-01",` + seq + `}`, false},
+		{"the topic's device first", "site-a-edge-01", `{"v":1,"device_id":"site-a-edge-01","device_id":"site-b-edge-09",` + seq + `}`, false},
+		{"a case variant alone", "site-a-edge-01", `{"v":1,"Device_ID":"site-a-edge-01",` + seq + `}`, false},
+		{"a case variant beside the member", "site-a-edge-01", `{"v":1,"device_id":"site-a-edge-01","DEVICE_ID":"site-b-edge-09",` + seq + `}`, false},
+		{"local_seq named twice", "site-a-edge-01", `{"v":1,"device_id":"site-a-edge-01","local_seq":2,` + seq + `}`, false},
+		{"an invalid UTF-8 byte", "site-\ufffd", `{"v":1,"device_id":"site-` + "\xff" + `",` + seq + `}`, false},
+		{"a lone high surrogate", replaced, `{"v":1,"device_id":"site-\ud800",` + seq + `}`, false},
+		{"a lone low surrogate", replaced, `{"v":1,"device_id":"site-\udc00",` + seq + `}`, false},
+		{"a high surrogate before a non-surrogate", replaced + "A", `{"v":1,"device_id":"site-\ud800\u0041",` + seq + `}`, false},
+		{"a surrogate pair", "site-\U0001F600", `{"v":1,"device_id":"site-\ud83d\ude00",` + seq + `}`, true},
+		{"the exact member", "site-a-edge-01", `{"v":1,"device_id":"site-a-edge-01",` + seq + `}`, true},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
+			device, artifact := tc.device, tc.artifact
 			courier, q := testCourier(t, 10)
 			var published []publishedEvidenceMessage
 			handler, err := NewRuntimeIngress(courier, testReturnSink(t, time.Now()), testAckClock(t, time.Now), func(_ context.Context, topic string, qos byte, retained bool, payload []byte) error {
@@ -242,24 +254,58 @@ func TestRuntimeIngressRefusesAnAmbiguousRoutingMember(t *testing.T) {
 				t.Fatal(err)
 			}
 			carriage, err := json.Marshal(map[string]any{
-				"device_id": "site-a-edge-01", "artifact_type": "delivery_envelope",
+				"device_id": device, "artifact_type": "delivery_envelope",
 				"artifact_b64": base64.StdEncoding.EncodeToString([]byte(artifact)),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := handler.Handle(context.Background(), "ori/site-a-edge-01/evidence/outbound", carriage); err != nil {
+			if err := handler.Handle(context.Background(), "ori/"+device+"/evidence/outbound", carriage); err != nil {
 				t.Fatal(err)
 			}
 			if len(published) != 1 {
-				t.Fatalf("published %d messages, want the one refusal", len(published))
+				t.Fatalf("published %d messages, want one acknowledgement", len(published))
 			}
 			var ack outboundAck
 			if err := json.Unmarshal(published[0].payload, &ack); err != nil {
 				t.Fatal(err)
 			}
-			if ack.Outcome != "refused" || ack.Reason != "malformed" || q.Len() != 0 {
+			switch {
+			case tc.admitted && (ack.Outcome != "queued" || q.Len() != 1):
+				t.Fatalf("ack %#v with %d queued; want the artifact queued", ack, q.Len())
+			case !tc.admitted && (ack.Outcome != "refused" || ack.Reason != "malformed" || q.Len() != 0):
 				t.Fatalf("ack %#v with %d queued; want refused malformed and nothing queued", ack, q.Len())
+			}
+		})
+	}
+}
+
+// TestRuntimeIngressRefusesAnAmbiguousCarriageMember holds the carriage
+// wrapper to members named once and spelled exactly: a duplicate or
+// case-variant artifact_type or device_id is a malformed carriage, answered
+// with nothing and queueing nothing.
+func TestRuntimeIngressRefusesAnAmbiguousCarriageMember(t *testing.T) {
+	artifact := base64.StdEncoding.EncodeToString(validEnvelopeBytes(1))
+	for name, carriage := range map[string]string{
+		"artifact_type named twice": `{"device_id":"site-a-edge-01","artifact_type":"checkpoint","artifact_type":"delivery_envelope","artifact_b64":"` + artifact + `"}`,
+		"a case-variant device_id":  `{"Device_ID":"site-a-edge-01","artifact_type":"delivery_envelope","artifact_b64":"` + artifact + `"}`,
+		"device_id named twice":     `{"device_id":"site-b-edge-09","device_id":"site-a-edge-01","artifact_type":"delivery_envelope","artifact_b64":"` + artifact + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			courier, q := testCourier(t, 10)
+			var published int
+			handler, err := NewRuntimeIngress(courier, testReturnSink(t, time.Now()), testAckClock(t, time.Now), func(context.Context, string, byte, bool, []byte) error {
+				published++
+				return nil
+			}, "runtime-gateway-envelope-secret", time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := handler.Handle(context.Background(), "ori/site-a-edge-01/evidence/outbound", []byte(carriage)); err == nil {
+				t.Fatal("an ambiguous carriage was handled")
+			}
+			if published != 0 || q.Len() != 0 {
+				t.Fatalf("published %d, queued %d; want nothing", published, q.Len())
 			}
 		})
 	}

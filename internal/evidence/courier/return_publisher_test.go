@@ -270,3 +270,55 @@ func TestReturnPublisherReemitsAfterARestartWithAFreshEnvelope(t *testing.T) {
 		t.Fatalf("signed_at_ms did not advance across the restart: %d then %d", signedAt[0], signedAt[1])
 	}
 }
+
+// TestAnAmbiguousRuntimeDecisionRetiresNothing holds the runtime's signed
+// decision to members named once and spelled exactly. The authenticator covers
+// every member as written, so a decision carrying both outcome and Outcome
+// verifies; encoding/json would act on one of them. It is refused, and the
+// authority artifact stays queued.
+func TestAnAmbiguousRuntimeDecisionRetiresNothing(t *testing.T) {
+	now := time.UnixMilli(1787000003000)
+	sink, err := OpenDurableAuthoritySink(QueueOptions{
+		Directory: filepath.Join(t.TempDir(), "return"), MaxItems: 10, MaxBytes: 1 << 20,
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := validReceiptBytes("site-a-edge-01", 1, 1)
+	if err := sink.Store(context.Background(), AuthorityArtifact{
+		Type: AuthorityDeliveryReceipt, DeviceID: "site-a-edge-01", Payload: artifact,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewReturnPublisher(sink, testAckClock(t, func() time.Time { return now }),
+		func(context.Context, string, byte, bool, []byte) error { return nil },
+		"runtime-gateway-envelope-secret", "", func() time.Time { return now }, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.publishHead(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(artifact)
+	decision := map[string]any{
+		"device_id": "site-a-edge-01", "artifact_type": "delivery_receipt",
+		"artifact_digest": "sha256:" + hex.EncodeToString(digest[:]),
+		"outcome":         "applied", "Outcome": "rejected", "reason": "", "acknowledged_at_ms": now.UnixMilli(),
+	}
+	auth, err := mqttauth.Sign(decision, contracts.EvidenceInboundAckMessageType, "site-a-edge-01", "", now.UnixMilli(), "runtime-gateway-envelope-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision["auth"] = auth
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.HandleAck("ori/site-a-edge-01/evidence/inbound/ack", payload); err == nil {
+		t.Fatal("an ambiguous decision was accepted")
+	}
+	if sink.Len() != 1 {
+		t.Fatal("an ambiguous decision retired the authority artifact")
+	}
+}

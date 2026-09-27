@@ -171,6 +171,9 @@ func (c *HTTPChannel) Deliver(ctx context.Context, artifact QueuedArtifact) (Del
 		return DeliveryResult{}, unrecognised("wrong content type")
 	}
 	var wire channelResponse
+	if err := refuseAmbiguousMembers(body, &wire); err != nil {
+		return DeliveryResult{}, unrecognised("ambiguous response member")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
@@ -277,6 +280,23 @@ type channelResponse struct {
 type channelAuthorityArtifact struct {
 	ArtifactType string `json:"artifact_type"`
 	ArtifactB64  string `json:"artifact_b64"`
+}
+
+// UnmarshalJSON decodes one returned artifact entry exactly: each member named
+// once, spelled exactly, and no member it does not know.
+func (a *channelAuthorityArtifact) UnmarshalJSON(raw []byte) error {
+	type entry channelAuthorityArtifact
+	var decoded entry
+	if err := refuseAmbiguousMembers(raw, &decoded); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*a = channelAuthorityArtifact(decoded)
+	return nil
 }
 
 func ingestPreimage(clientID, keyID string, kind ArtifactType, artifactDigest string, sentAtMS int64, nonce string) ([]byte, error) {

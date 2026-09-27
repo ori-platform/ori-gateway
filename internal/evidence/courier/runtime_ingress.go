@@ -88,6 +88,9 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 		ArtifactType string `json:"artifact_type"`
 		ArtifactB64  string `json:"artifact_b64"`
 	}
+	if err := refuseAmbiguousMembers(payload, &carriage); err != nil {
+		return fmt.Errorf("evidence: malformed outbound carriage")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&carriage); err != nil || decoder.Decode(&struct{}{}) != io.EOF {

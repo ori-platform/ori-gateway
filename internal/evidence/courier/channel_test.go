@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"github.com/ori-platform/ori-gateway/internal/specvectors"
 	"io"
 	"net/http"
@@ -250,4 +251,47 @@ func ingestAuthenticationVector(t *testing.T) struct {
 		t.Fatal(err)
 	}
 	return vector
+}
+
+// TestHTTPChannelRefusesAnAmbiguousResponseMember holds the authority's
+// response to members named once and spelled exactly, at the top level and in
+// each returned artifact entry: encoding/json would otherwise act on the last
+// duplicate or a case variant. Such a response is an unrecognised outcome.
+func TestHTTPChannelRefusesAnAmbiguousResponseMember(t *testing.T) {
+	receipt := base64Std([]byte(`{"v":1,"device_id":"site-a-edge-01"}`))
+	for name, tc := range map[string]struct {
+		status int
+		body   func(digest string) string
+	}{
+		"outcome named twice": {http.StatusUnprocessableEntity, func(digest string) string {
+			return `{"v":1,"outcome":"accepted","outcome":"refused","reason":"unknown_key","retriable":false,"artifact_digest":"` + digest + `","authority_artifacts":[]}`
+		}},
+		"a case-variant outcome": {http.StatusUnprocessableEntity, func(digest string) string {
+			return `{"v":1,"Outcome":"refused","reason":"unknown_key","retriable":false,"artifact_digest":"` + digest + `","authority_artifacts":[]}`
+		}},
+		"a returned entry's type named twice": {http.StatusOK, func(digest string) string {
+			return `{"v":1,"outcome":"accepted","reason":"","retriable":false,"artifact_digest":"` + digest + `","authority_artifacts":[{"artifact_type":"epoch_confirmation","artifact_type":"delivery_receipt","artifact_b64":"` + receipt + `"}]}`
+		}},
+		"a returned entry's case-variant type": {http.StatusOK, func(digest string) string {
+			return `{"v":1,"outcome":"accepted","reason":"","retriable":false,"artifact_digest":"` + digest + `","authority_artifacts":[{"Artifact_Type":"delivery_receipt","artifact_b64":"` + receipt + `"}]}`
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			channel, err := NewHTTPChannel(HTTPChannelOptions{
+				Endpoint: "https://authority.invalid/v1/evidence/artifacts", ClientID: "gateway-test-01",
+				Secret: "published-test-evidence-ingest-secret-with-256-bit-entropy-do-not-use",
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					digest := req.Header.Get("X-Ori-Evidence-Artifact-Digest")
+					return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": []string{"application/json"}},
+						Body: io.NopCloser(strings.NewReader(tc.body(digest)))}, nil
+				})},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := channel.Deliver(context.Background(), QueuedArtifact{Type: ArtifactCheckpoint, Payload: checkpointVectorWire(t)}); !errors.Is(err, ErrUnrecognisedOutcome) {
+				t.Fatalf("Deliver = %v, want an unrecognised outcome", err)
+			}
+		})
+	}
 }
