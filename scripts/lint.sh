@@ -23,6 +23,9 @@ echo "modernize"
 "${TOOL[@]}" modernize -tags "$TAGS" -test ./... || status=1
 
 echo "gopls check"
+# Build gopls first: on a cold module cache the go command reports its
+# downloads on stderr, which the capture below would read as findings.
+"${TOOL[@]}" gopls version >/dev/null || status=1
 files=()
 while IFS= read -r file; do
   # The index can still name a file a pending rename or removal took away.
