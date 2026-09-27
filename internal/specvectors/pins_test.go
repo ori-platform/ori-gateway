@@ -72,11 +72,10 @@ func TestPinsLinkEachRequirementToOneIssue(t *testing.T) {
 			return err
 		}
 		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "tools":
-				return filepath.SkipDir
-			}
-			if filepath.ToSlash(path) == filepath.ToSlash(filepath.Join(root, "internal", "specvectors", "vectors")) {
+			switch filepath.ToSlash(path) {
+			case filepath.ToSlash(filepath.Join(root, ".git")),
+				filepath.ToSlash(filepath.Join(root, "tools")),
+				filepath.ToSlash(filepath.Join(root, "internal", "specvectors", "vectors")):
 				return filepath.SkipDir
 			}
 			return nil
@@ -117,7 +116,7 @@ func TestPinsLinkEachRequirementToOneIssue(t *testing.T) {
 				}
 			}
 			if !inside {
-				t.Errorf("%s: an issue reference outside a pin's Issue field: %s", path, body[ref[0]:ref[1]])
+				t.Errorf("%s: an issue reference outside a pin's Issue field: %s (this guard recognises full GitHub issue and pull request URLs and ori-<repo>#N; a bare #N it cannot tell from other text, and review must catch it)", path, body[ref[0]:ref[1]])
 			}
 		}
 		return nil
