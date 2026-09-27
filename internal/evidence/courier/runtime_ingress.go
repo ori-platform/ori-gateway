@@ -34,7 +34,7 @@ type RuntimeIngress struct {
 	faults         *faults.Recorder
 }
 
-// The two forms of admission a fault is tracked for (gateway-api/v1):
+// The two forms of admission a fault is tracked for (gateway-evidence-carriage/v1):
 // durable outbound queueing, and for a delivery envelope, durable staging of its
 // required custody return. Each clears only when a later admission of the same
 // form completes; a store probe clears neither.

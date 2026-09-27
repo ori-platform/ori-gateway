@@ -67,7 +67,7 @@ Implemented in this repository:
 - Tier C enrichment contracts and handler, with the runtime-gateway HMAC envelope verified on requests and applied to responses when gateway auth is enabled
 - Durable outbound evidence and authority-return queues, authenticated custody,
   an isolated persistent evidence MQTT session, and the independent authority
-  HTTPS channel defined by `gateway-api/v1` and `evidence-transport/v1`
+  HTTPS channel defined by `evidence-transport/v2`
 - SIM and fleet optional-module stubs with disabled-path safety guarantees
 - CI, repository invariants, and contribution guardrails
 
@@ -107,20 +107,19 @@ go test ./...
 go vet ./...
 ```
 
-The evidence courier's refusal-policy and site-health tests read the draft
-vectors from a sibling `ori-specs` checkout (`../ori-specs`) until they are
-vendored into `internal/evidence/testdata`.
+The evidence courier's contract tests read the `ori-specs` vectors vendored in
+`internal/specvectors`, pinned to one `ori-specs` commit by its `MANIFEST.json`;
+no test reads an `ori-specs` checkout. A case the gateway does not yet satisfy
+runs as an expected failure that names its missing requirement and tracking
+issue.
 
 An integration test drives the real courier against a running evidence
 authority ingest service. It is outside the default run, behind a build tag:
 
 ```bash
 ORI_EVIDENCE_INGEST_BIN=/path/to/the/built/ingest/service \
-  go test -tags evidence_integration -run TestAgainstTheEvidenceAuthority -v ./internal/evidence
+  go test -tags evidence_integration -run TestAgainstTheEvidenceAuthority -v ./internal/evidence/courier
 ```
-
-`ORI_SPECS_DIR` names the `ori-specs` checkout that supplies the signed vectors
-if it is not the sibling.
 
 ## Versioning and releases
 

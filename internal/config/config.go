@@ -110,11 +110,13 @@ type EvidenceConfig struct {
 	MaxBytes             int64  `yaml:"max_bytes"`
 	RetryIntervalS       int    `yaml:"retry_interval_s"`
 	// BackoffBaseS and BackoffMaxS are the courier's back-off base and bound.
-	// evidence-transport/v1 requires bound >= base >= delivery interval.
+	// evidence-transport/v2 requires bound >= base >= delivery interval, which
+	// the loader enforces when a device declares gateway-evidence-carriage/v1.
 	BackoffBaseS int `yaml:"backoff_base_s"`
 	BackoffMaxS  int `yaml:"backoff_max_s"`
 	// StoreProbeIntervalS is how often each durable evidence store is probed,
-	// 300 through 900 seconds (gateway-api/v1).
+	// 300 through 900 seconds when a device declares gateway-evidence-carriage/v1
+	// (gateway-config/v2).
 	StoreProbeIntervalS int    `yaml:"store_probe_interval_s"`
 	EndpointEnv         string `yaml:"endpoint_env"`
 	ClientIDEnv         string `yaml:"client_id_env"`
@@ -625,7 +627,7 @@ func validateGatewayDeviceID(deviceID string) error {
 	}
 	// Control characters (general category Cc, NUL among them, which an MQTT
 	// topic cannot carry) are refused whether or not the courier is enabled
-	// (gateway-config/v1).
+	// (gateway-config/v2).
 	for _, r := range deviceID {
 		if unicode.Is(unicode.Cc, r) {
 			return fmt.Errorf("device_id %q must not contain control characters", deviceID)

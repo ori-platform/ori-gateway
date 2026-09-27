@@ -415,7 +415,7 @@ func TestReleasedHeldHeadLogsUnblockedOnce(t *testing.T) {
 	}
 }
 
-// contractReasons is every 422 reason evidence-transport/v1 owns, with whether
+// contractReasons is every 422 reason evidence-transport/v2 owns, with whether
 // it names receiver state. It is written out here rather than read from
 // refusal.go so a reason moved between the sets fails this test.
 var contractReasons = []struct {

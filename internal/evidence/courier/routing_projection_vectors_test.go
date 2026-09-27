@@ -11,9 +11,6 @@ import (
 	"testing"
 )
 
-// TestRoutingProjectionVectors holds both hops to the evidence-exchange/v1
-// stable routing projection: routability is decided by the routing fields
-// alone, never by a declared version or by fields a later version adds.
 // routingProjectionPins are the routing-projection cases this gateway does not
 // yet satisfy.
 var routingProjectionPins = map[string]vectorPin{
@@ -74,6 +71,9 @@ var routingProjectionPins = map[string]vectorPin{
 	},
 }
 
+// TestRoutingProjectionVectors holds both hops to the evidence-exchange/v2
+// stable routing projection: routability is decided by the routing fields
+// alone, never by a declared version or by fields a later version adds.
 func TestRoutingProjectionVectors(t *testing.T) {
 	raw, err := specvectors.Read("evidence-exchange/vectors/routing-projection-v2.json")
 	if err != nil {

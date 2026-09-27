@@ -290,7 +290,7 @@ func TestMaxQueueRecordBytesIsExact(t *testing.T) {
 		}
 	}
 	// One maximum registration record plus one maximum evidence record
-	// (evidence-transport/v1, gateway-config/v1), each measured above.
+	// (evidence-transport/v2, gateway-config/v2), each measured above.
 	if MinDeviceShareBytes != maxQueueRecordBytes+maxEvidenceRecordBytes {
 		t.Fatalf("the least byte share %d is not one registration plus one evidence record", MinDeviceShareBytes)
 	}

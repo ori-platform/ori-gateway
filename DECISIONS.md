@@ -114,8 +114,6 @@ When `gateway.auth.enabled: false`, existing unsigned heartbeat behavior is
 preserved for initial LAN setup, but production deployments should enable HMAC
 and broker ACLs.
 
-Related: ori-runtime#144, ori-runtime#145, gateway #43.
-
 ---
 
 ## 2026-06-11 — Runtime Node Heartbeat Consumption
@@ -149,8 +147,6 @@ Registry eviction treats future-dated `last_seen_ms` values as stale. A node
 with a bad forward clock must not become immortal in the site registry. Far-future
 `last_seen_ms` values are rejected at ingest and future-dated entries are also
 evicted defensively during registry sweeps.
-
-Related: ori-runtime#145, ori-gateway#45.
 
 ---
 

@@ -106,7 +106,7 @@ type GatewayEvidenceDeliveryView struct {
 	LastFailureAtMS int64  `json:"last_failure_at_ms,omitempty"`
 	LastError       string `json:"last_error,omitempty"`
 	// Devices has one entry for each device and lane whose delivery is not
-	// clean, and none for a lane delivering cleanly (gateway-api/v1). It is
+	// clean, and none for a lane delivering cleanly (gateway-evidence-carriage/v1). It is
 	// always present, empty when every lane is clean.
 	Devices []GatewayEvidenceDeliveryDevice `json:"devices"`
 	// Faults is the active courier-level fault set from a closed vocabulary

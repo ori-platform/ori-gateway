@@ -31,7 +31,7 @@ var evidenceRuleMessages = map[string]string{
 	"stopped":  "evidence.stopped",
 }
 
-// TestEvidenceConfigVectors loads every gateway-config/v1 evidence vector
+// TestEvidenceConfigVectors loads every gateway-config/v2 evidence vector
 // through Load: a valid case must produce exactly the corpus's effective
 // values after defaults, and a refused case must be refused for its rule.
 func TestEvidenceConfigVectors(t *testing.T) {

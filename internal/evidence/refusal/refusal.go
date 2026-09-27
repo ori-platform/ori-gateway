@@ -8,8 +8,8 @@ package refusal
 import "net/http"
 
 // The refusal policy for the gateway-to-authority hop is the "Refusal policy"
-// table of ori-specs evidence-transport/v1.md, exercised by
-// evidence-transport/vectors/refusal-policy.json. Nothing about this hop is
+// table of ori-specs evidence-transport/v2.md, exercised by
+// evidence-transport/vectors/refusal-policy-v2.json. Nothing about this hop is
 // taken from gateway-api/v1, whose refusal and retirement semantics govern the
 // runtime-gateway return path only.
 
@@ -117,7 +117,7 @@ const (
 )
 
 // Policy is the only place a refusal's status and reason become an
-// action, and it is the evidence-transport/v1 refusal policy table. The
+// action, and it is the evidence-transport/v2 refusal policy table. The
 // response's retriable flag is not an input: it is never used to select a
 // well-formed refusal's class.
 //
@@ -132,8 +132,9 @@ const (
 //     pending_registration_limit without one is an unrecognised outcome,
 //     decided by the channel before this table.
 //
-// In the registration lane, every hold outcome is an archival (see
-// deliveryLane.archive).
+// A hold outcome holds in either lane; a terminal refusal leaves its lane only
+// by an archival on a verified retention, which the courier does not yet
+// verify.
 //
 // A reason outside its status's list is recorded as unrecognised and takes the
 // status's fail-closed action above. Any other status is an unrecognised

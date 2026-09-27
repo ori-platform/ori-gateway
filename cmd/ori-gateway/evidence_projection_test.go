@@ -547,7 +547,7 @@ func TestRealProjectionWithAStoreFault(t *testing.T) {
 		t.Fatalf("projection = %s", raw)
 	}
 	// The store recovers. A durable write leaves the fault raised; only the
-	// store's next successful probe clears it (gateway-api/v1).
+	// store's next successful probe clears it (gateway-evidence-carriage/v1).
 	_ = os.Chmod(dir, 0o700)
 	if _, err := q.Enqueue(courier.ArtifactCheckpoint, checkpointFor("dev-b", 1)); err != nil {
 		t.Fatal(err)

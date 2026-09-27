@@ -206,7 +206,7 @@ func unrecognised(detail string) error {
 }
 
 // refusedDeliveryResult checks that a non-200 response is well formed for its
-// status, then takes its class from refusal.Policy, the evidence-transport/v1
+// status, then takes its class from refusal.Policy, the evidence-transport/v2
 // refusal policy table. The reason is not part of the well-formedness check: a
 // missing or unadmitted reason is recorded as unrecognised and takes the
 // status's fail-closed action. The retriable flag is never used to select a
@@ -218,7 +218,7 @@ func refusedDeliveryResult(resp *http.Response, wire channelResponse, artifactDi
 	}
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusConflict, http.StatusUnprocessableEntity:
-		// A 400 may omit the digest: evidence-transport/v1 refuses malformed
+		// A 400 may omit the digest: evidence-transport/v2 refuses malformed
 		// requests before authentication, and unauthenticated responses omit
 		// it. Every other refusal here is authenticated and bound to the digest.
 		digestBound := wire.ArtifactDigest == artifactDigest ||

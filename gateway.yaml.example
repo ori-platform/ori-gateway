@@ -40,25 +40,33 @@ evidence:
   # max_items/N records and max_bytes/N bytes across its anchor registrations
   # and its other artifacts, so one device cannot exhaust another's capacity.
   # Each share reserves one item and one maximum-size registration record for
-  # registrations only, so each share must be at least 2 items and 2,796,604
-  # bytes (one maximum-size registration record plus one maximum-size
-  # evidence record). Archived registration refusals are outside this
-  # capacity.
+  # registrations only. When a device declares gateway-evidence-carriage/v1
+  # below, each share must be at least 2 items and 2,796,604 bytes (one
+  # maximum-size registration record plus one maximum-size evidence record).
   max_items: 10000
   max_bytes: 268435456
   retry_interval_s: 5
   # Back-off for refusals that back off and for unrecognised outcomes: starts at
-  # backoff_base_s, doubles up to backoff_max_s. Must satisfy
+  # backoff_base_s, doubles up to backoff_max_s. When a device declares
+  # gateway-evidence-carriage/v1, must satisfy
   # backoff_max_s >= backoff_base_s >= retry_interval_s.
   backoff_base_s: 5
   backoff_max_s: 300
-  # Each durable store is probed at start and then on this interval, 300-900.
+  # Each durable store is probed at start and then on this interval; 300-900
+  # when a device declares gateway-evidence-carriage/v1.
   store_probe_interval_s: 900
   # Names only. The endpoint and credential values are provisioned outside this
   # operator-readable file and must be distinct from fleet, MQTT, and custody.
   endpoint_env: "ORI_EVIDENCE_ENDPOINT"
   client_id_env: "ORI_EVIDENCE_CLIENT_ID"
   secret_env: "ORI_EVIDENCE_INGEST_SECRET"
+  # Each device's declared inbound evidence carriage, gateway-api/v1 when a
+  # device is not named. Declaring gateway-evidence-carriage/v1 activates that
+  # carriage's load-time rules above. This gateway implements it partially:
+  # stopped custody, incidents and archival on a verified retention are not yet
+  # implemented, and a response carrying them is kept and backed off.
+  # device_carriage:
+  #   site-a-edge-01: gateway-evidence-carriage/v1
 
 provider:
   name: "echo" # echo | llama_cpp | cloud_llm

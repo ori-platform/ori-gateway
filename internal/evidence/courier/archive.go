@@ -30,7 +30,7 @@ const (
 var errArchivedNotRetired = errors.New("evidence: registration archived but its active record was not retired")
 
 // ArchiveRecord is a terminal anchor-registration refusal moved out of the
-// active registration lane (evidence-transport/v1, refusal policy). It keeps
+// active registration lane (evidence-transport/v2, refusal policy). It keeps
 // the exact bytes and is never delivered again. It is outside active capacity.
 type ArchiveRecord struct {
 	V              int          `json:"v"`

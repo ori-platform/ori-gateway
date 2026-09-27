@@ -114,7 +114,7 @@ func TestStoreFaultIsActiveUntilTheStoreRecovers(t *testing.T) {
 	restore()
 	// A later successful admission clears admission_failed but never
 	// store_unavailable: only a successful probe of the store clears it
-	// (gateway-api/v1).
+	// (gateway-evidence-carriage/v1).
 	if err := f.handoff(t, "checkpoint", deviceCheckpoint("dev-a", 2)); err != nil {
 		t.Fatal(err)
 	}

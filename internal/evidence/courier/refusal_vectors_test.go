@@ -837,7 +837,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 	}
 }
 
-// vectorHolds is the evidence-transport/v1 table's hold rows, written from the
+// vectorHolds is the evidence-transport/v2 table's hold rows, written from the
 // contract and not from the code under test.
 func vectorHolds(r refusalVectorResponse) bool {
 	switch r.Status {

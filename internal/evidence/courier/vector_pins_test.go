@@ -25,6 +25,9 @@ type vectorPin struct {
 
 var pinRequirement = regexp.MustCompile(`^missing_requirement:[a-z0-9]+(-[a-z0-9]+)*$`)
 
+// pinIssue is the one form a pin's tracking issue takes.
+var pinIssue = regexp.MustCompile(`^https://github\.com/ori-platform/ori-gateway/issues/[1-9][0-9]*$`)
+
 // checkPin settles a vector case once its behaviour has been observed:
 // observed is "" when the case conforms, and otherwise the deviation.
 func checkPin(t *testing.T, pins map[string]vectorPin, name, observed string) {
@@ -55,8 +58,8 @@ func checkPinsExist(t *testing.T, pins map[string]vectorPin, names []string) {
 		if !have[name] {
 			t.Errorf("pin %q names no case in the corpus", name)
 		}
-		if !pinRequirement.MatchString(pin.Requirement) || pin.Issue == "" || pin.Observed == "" {
-			t.Errorf("pin %q needs a missing_requirement:<id>, its tracking issue and the observed deviation", name)
+		if !pinRequirement.MatchString(pin.Requirement) || !pinIssue.MatchString(pin.Issue) || pin.Observed == "" {
+			t.Errorf("pin %q needs a missing_requirement:<id>, its tracking issue's full URL and the observed deviation", name)
 		}
 	}
 }

@@ -20,6 +20,9 @@ type configPin struct {
 
 var configPinRequirement = regexp.MustCompile(`^missing_requirement:[a-z0-9]+(-[a-z0-9]+)*$`)
 
+// configPinIssue is the one form a pin's tracking issue takes.
+var configPinIssue = regexp.MustCompile(`^https://github\.com/ori-platform/ori-gateway/issues/[1-9][0-9]*$`)
+
 // evidenceConfigPins are the evidence-config cases the loader does not yet
 // satisfy.
 var evidenceConfigPins = map[string]configPin{
@@ -121,8 +124,8 @@ func checkConfigPinsExist(t *testing.T, names []string) {
 		if !have[name] {
 			t.Errorf("pin %q names no case in the corpus", name)
 		}
-		if !configPinRequirement.MatchString(pin.Requirement) || pin.Issue == "" || pin.Observed == "" {
-			t.Errorf("pin %q needs a missing_requirement:<id>, its tracking issue and the observed deviation", name)
+		if !configPinRequirement.MatchString(pin.Requirement) || !configPinIssue.MatchString(pin.Issue) || pin.Observed == "" {
+			t.Errorf("pin %q needs a missing_requirement:<id>, its tracking issue's full URL and the observed deviation", name)
 		}
 	}
 }

@@ -144,7 +144,7 @@ type DurableQueue struct {
 
 // noteStore records the outcome of one durable-store operation: a failure
 // raises the store's store_unavailable, and a success leaves it as it is.
-// Only a successful probe of the store clears it (gateway-api/v1; see Probe).
+// Only a successful probe of the store clears it (gateway-evidence-carriage/v1; see Probe).
 func (q *DurableQueue) noteStore(err error) {
 	if err != nil {
 		q.faults.Note(faults.StoreUnavailable, q.faultSource, err)
@@ -241,7 +241,7 @@ func recordDevice(payload []byte) string {
 	return routing.DeviceID
 }
 
-// Lane is one of a device's two delivery orders (evidence-transport/v1,
+// Lane is one of a device's two delivery orders (evidence-transport/v2,
 // refusal policy): its anchor registrations, and every other artifact it
 // delivers.
 type Lane string
@@ -376,7 +376,7 @@ func (q *DurableQueue) enqueue(kind ArtifactType, payload []byte) (QueuedArtifac
 }
 
 // laneShareRefusalLocked is the only place a lane's admission is refused for
-// capacity (evidence-transport/v1). Capacity is reserved per device. With
+// capacity (evidence-transport/v2). Capacity is reserved per device. With
 // configured devices, every share reserves one anchor_registration slot and
 // the maximum encoded registration record for registrations only: evidence
 // admission may never take that reserve, so an evidence lane waiting on an

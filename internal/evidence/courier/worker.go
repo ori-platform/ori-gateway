@@ -25,7 +25,7 @@ const (
 // DeliveryWorker drains the durable queue through the independent evidence
 // channel. Each device has two delivery lanes, its anchor registrations and
 // every other artifact it delivers, and order, retry state, back-off and holds
-// are kept per device and lane (evidence-transport/v1, refusal policy): a hold
+// are kept per device and lane (evidence-transport/v2, refusal policy): a hold
 // or back-off in one lane never delays the device's other lane or another
 // device. Within a lane, failure leaves the head intact and refusal.Policy
 // decides whether it is held, retried on the device's next handoff, or backed
@@ -53,7 +53,7 @@ type DeliveryWorkerOptions struct {
 	// any back-off waits.
 	RetryInterval time.Duration
 	// BackoffBase is the first back-off delay; it doubles per consecutive
-	// back-off, up to MaxBackoff. evidence-transport/v1 requires
+	// back-off, up to MaxBackoff. evidence-transport/v2 requires
 	// MaxBackoff >= BackoffBase >= RetryInterval; configuration refuses
 	// anything else, and the worker raises a smaller value to meet it.
 	BackoffBase time.Duration
@@ -716,7 +716,7 @@ func (l *deliveryLane) clearFailure() {
 	}
 }
 
-// Device delivery states, as gateway-api/v1 projects them.
+// Device delivery states, as gateway-evidence-carriage/v1 projects them.
 const (
 	DeviceHeld           = "held"
 	DeviceWaitingHandoff = "waiting_handoff"

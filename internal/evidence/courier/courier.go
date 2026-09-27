@@ -19,7 +19,7 @@ import (
 const (
 	defaultDeliveryRetry   = 5 * time.Second
 	defaultBlockedReminder = 15 * time.Minute
-	// maxArtifactBytes is the evidence-transport/v1 artifact size limit. A
+	// maxArtifactBytes is the evidence-transport/v2 artifact size limit. A
 	// larger artifact is refused at admission, before custody.
 	maxArtifactBytes = 1 << 20
 	// maxQueueRecordBytes is the exact encoded size of the largest outbound
@@ -44,7 +44,7 @@ const (
 	// MinDeviceShareItems and MinDeviceShareBytes are the least one device's
 	// share may hold: the registration reserve (one anchor_registration slot
 	// and one maximum encoded registration record) plus one maximum encoded
-	// evidence record (evidence-transport/v1, gateway-config/v1).
+	// evidence record (evidence-transport/v2, gateway-config/v2).
 	MinDeviceShareItems = 2
 	MinDeviceShareBytes = maxQueueRecordBytes + maxEvidenceRecordBytes
 )
@@ -139,7 +139,7 @@ func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
 	if !validOutboundArtifactType(kind) {
 		return fmt.Errorf("evidence: unsupported outbound artifact type %q", kind)
 	}
-	// Courier opacity (evidence-transport/v1): only the stable routing
+	// Courier opacity (evidence-transport/v2): only the stable routing
 	// projection is read — device_id, and local_seq for an envelope. The
 	// artifact's declared v is never read, so an artifact version the courier
 	// does not know is admitted and delivered; the evidence authority alone

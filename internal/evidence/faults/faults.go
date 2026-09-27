@@ -11,7 +11,7 @@ import (
 	"sync"
 )
 
-// Courier-level faults, the closed vocabulary gateway-api/v1 projects in
+// Courier-level faults, the closed vocabulary gateway-evidence-carriage/v1 projects in
 // evidence_delivery.faults.
 const (
 	// StoreUnavailable: the courier cannot read, write, or atomically

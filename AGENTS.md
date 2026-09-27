@@ -198,7 +198,7 @@ acknowledgement, or failure status with fleet management, and transport errors
 must be reduced before reaching logs or status so the evidence authority's
 identity and endpoint cannot leak.
 
-Delivery order is per device and lane (`evidence-transport/v1`, refusal
+Delivery order is per device and lane (`evidence-transport/v2`, refusal
 policy). Each device has two lanes, its anchor registrations and every other
 artifact it delivers; a record's lane is derived from its carriage artifact
 type and never stored, so queue directories need no migration. Order, retry
@@ -215,18 +215,17 @@ share reserves one item and one maximum encoded registration record for
 registrations only; the evidence lane is refused `queue_full` before it would
 take that reserve. Each share must hold two items and one maximum encoded
 registration record plus one maximum encoded evidence record, refused at load
-otherwise. A hold in the registration lane is an
-archival: the refused registration is moved, atomically and archive first, to
-`.ori-evidence-archive-<queue_record>`, outside active capacity, never resent,
-and projected in `archived_registrations`; if the archive cannot commit the
-registration stays held and `store_unavailable` is raised. Lane capacity, lane
-head selection, archival and the retirement handoff are each decided in one
-place (`laneShareRefusalLocked`, `deliveryLane.head`, `deliveryLane.archive`,
-`deliveryLane.retired`). A `gateway.device_ids` entry carrying a control
-character (Cc, NUL among them) is always refused at load; with the courier
-enabled, every entry must also be in the evidence routing domain. A failing
-archive move holds `store_unavailable` under its own source, so only the move
-completing clears it, never another successful write or probe. A carriage whose topic names an unconfigured
+when a device declares `gateway-evidence-carriage/v1` in
+`evidence.device_carriage`; a site that declares none keeps the courier's own
+validation (`gateway-config/v2`). A terminal refusal is held in either lane:
+without a verified retention nothing is archived (`evidence-transport/v2`).
+Verified-retention archival, incidents and stopped custody are not implemented;
+their contract cases run as pinned expected failures. Lane capacity, lane head
+selection and the retirement handoff are each decided in one place
+(`laneShareRefusalLocked`, `deliveryLane.head`, `deliveryLane.retired`). A
+`gateway.device_ids` entry carrying a control character (Cc, NUL among them) is
+always refused at load; an entry that declares `gateway-evidence-carriage/v1`
+must also be in the evidence routing domain. A carriage whose topic names an unconfigured
 device is rejected before admission: nothing is admitted, no custody is issued
 and no acknowledgement is published, so the runtime keeps its bytes and
 retries; `queue_full` is only ever a configured device's full share. An artifact over 1,048,576 bytes is refused
@@ -248,8 +247,8 @@ hold is durably written, no later start sends it. A back-off is persisted the
 same way, so a restart never resends a backed-off head early. Evidence is never
 discarded in any case.
 
-What a refusal does is decided in one place, `refusalPolicy`, which is the
-refusal policy table of `ori-specs/evidence-transport/v1.md`; nothing about
+What a refusal does is decided in one place, `refusal.Policy`, which is the
+refusal policy table of `ori-specs/evidence-transport/v2.md`; nothing about
 this hop is taken from `gateway-api/v1`. The `retriable` flag is never used to
 select a well-formed refusal's class. `400` holds; `409` holds, except
 `409 pending_registration_conflict`, which is retained and backed off; `401` and `403` are
@@ -258,8 +257,11 @@ retried on the next handoff only, never on a timer; `422` holds for
 is handoff-only for `unrecognised_version` and `unknown_key` (`422 malformed`
 is invalid authority output and holds as `unrecognised`); `429` and `503` back
 off, and a `429 rate_limited` or `429 pending_registration_limit` waits no
-less than its `Retry-After`. Back-off is configured as `backoff_max_s >= backoff_base_s >=
-retry_interval_s`, refused at load otherwise; every wait is at least the
+less than its `Retry-After`. A `refused_retained` response and a `507` are not
+yet handled and back off as unrecognised; their cases run as pinned expected
+failures. Back-off is configured as `backoff_max_s >= backoff_base_s >=
+retry_interval_s`, refused at load when a device declares
+`gateway-evidence-carriage/v1`; every wait is at least the
 delivery interval, and a `Retry-After` is an additional floor. Each
 status admits only its own closed reason list: a reason outside it is recorded
 as `unrecognised` and takes the status's fail-closed action. Anything else — a
@@ -270,19 +272,17 @@ unrecognised outcome: retained, recorded `unrecognised`, reported degraded and
 backed off exponentially within a bound, never retired, never held, never
 resent immediately. Only an admitted reason reaches a log or status.
 
-Site health projects `evidence_delivery.devices` exactly as `gateway-api/v1`
+Site health projects `evidence_delivery.devices` exactly as `gateway-evidence-carriage/v1`
 states: one entry per device and lane that is not clean (`held`,
 `waiting_handoff`, `backing_off`), each carrying its `lane`, no two sharing a
 `device_id` and `lane`, `held` present exactly when the state is `held`,
 `blocked` true exactly when pending is positive, every pending artifact is in a
 listed lane and every listed lane is held, and `degraded` true exactly when
-`faults`, `devices` or `archived_registrations` is not empty.
-`archived_registrations` is always carried, one entry per archived registration
-refusal, never in `devices`, `pending` or `blocked`. `faults` is always carried, and a fault never makes `blocked` true:
+`faults` or `devices` is not empty. `incidents` and `stopped_custody` are not
+yet projected. `faults` is always carried, and a fault never makes `blocked` true:
 `store_unavailable` per durable store, raised by any failed store operation and
 by a failed store probe, and cleared only by that store's next successful
-probe, never by a successful operation (a failing archive move keeps its own
-source until the move completes); `admission_failed` per admission form (durable outbound queueing, and
+probe, never by a successful operation; `admission_failed` per admission form (durable outbound queueing, and
 the durable staging of an envelope's custody return), cleared only by a later
 completed admission of the same form and never by a probe, and never raised by
 a failure to publish the acknowledgement after durable admission;
@@ -298,7 +298,7 @@ summary.
 Every stall that is not a hold is logged once on entry and again on the
 reminder interval.
 
-Verified by the tests in `internal/evidence`, including
+Verified by the tests in `internal/evidence/courier`, including
 `TestTerminalRefusalIsAttemptedOnceHoldsTheQueueAndIsLoggedOnce`,
 `TestReceiverStateRefusalRetriesOnNextHandoffAndNeverBlocks`,
 `TestHoldOnOneDeviceNeverDelaysAnother`,
@@ -311,10 +311,27 @@ Verified by the tests in `internal/evidence`, including
 `TestInvalidHoldRefusesTheQueueAndKeepsTheRecord`,
 `TestEachProcessWithoutADurableHoldSendsOnceUntilOneIsWritten`,
 `TestEveryNonAcceptingOutcomeIsLogged`, the
-`evidence-transport/vectors/refusal-policy.json` corpus through
+`evidence-transport/vectors/refusal-policy-v2.json` corpus through
 `TestRefusalPolicyVectorCases` and `TestRefusalPolicyVectorSequences`, and in
 `cmd/ori-gateway` by `TestRealProjectionsSatisfyTheContract` and
 `TestProjectionOracleAgreesWithTheVectors`.
+
+20. `GW-20` Contract vectors are vendored, and an unmet case is pinned, never skipped.
+Every `ori-specs` vector a test reads is vendored in `internal/specvectors`,
+pinned to one `ori-specs` commit by its `MANIFEST.json` and read through
+`specvectors.Read`; no code, script, build file or workflow reads an `ori-specs`
+checkout. A contract case this gateway does not yet satisfy runs as an expected
+failure, satisfied only by its exact observed deviation, and names a stable
+`missing_requirement:<id>` and the issue that owns it; a pinned case that now
+conforms fails until its pin is removed. No issue or pull request number
+appears in production code, comments, test prose, documentation, error
+messages or any string, with one exception: the structured `Issue` field of a
+pin, a full `https://github.com/ori-platform/ori-gateway/issues/<n>` URL,
+because a new pin must not acquire a requirement without an owned disposition.
+Verified offline by `TestEveryVendoredFileMatchesTheManifest`,
+`TestNoTestReadsASiblingCheckout` and `TestPinsLinkEachRequirementToOneIssue`:
+one issue per requirement, each issue serving only the requirements its
+registry entry lists, and no issue URL anywhere but that field.
 
 ## Layout
 

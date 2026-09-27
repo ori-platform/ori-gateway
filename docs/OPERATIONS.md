@@ -18,23 +18,13 @@ under *The hold survives a restart*. The gateway reports `blocked` only when
 every pending artifact is in a held lane; one held lane beside others still
 delivering is reported `degraded`.
 
-A registration refused for good is **archived** instead of held, because a
-registration's order decides nothing at the evidence authority: a refused
-registration never blocks a later one. The courier first commits an archive
-record beside the queue — `.ori-evidence-archive-<queue_record>`, holding the
-exact registration bytes, digest, refusal status, reason, refusal time and
-`acknowledged: false` — and only then retires the active record and releases
-its capacity. The archive is never sent again, survives restarts, and does not
-count toward capacity. If the archive cannot be written, the registration
-stays held in its lane (`state: held`), `store_unavailable` is raised and stays
-raised until the archive commits (another successful write or probe does not
-clear it), the gateway retries the archival every reminder interval without
-resending, and a
-restart before it succeeds sends the registration once more. An archived
-refusal appears in `archived_registrations`, never in `devices`, `pending` or
-`blocked`, and keeps delivery `degraded` until an acknowledgement surface
-exists. A later handoff of the same bytes by the runtime is a new admission,
-sent again, and the same refusal keeps its first refusal time.
+A registration refused for good is **held** in its lane, like evidence: the
+evidence authority's refusal is terminal, and without a retention the authority
+has verifiably kept, nothing leaves the gateway's custody
+(`evidence-transport/v2`). A held registration blocks later registrations of the
+same device until it is resolved, and never the device's evidence lane or
+another device. Archiving a refusal the authority retained, and reporting it
+as an incident, are not implemented yet.
 
 ### Capacity and admission
 
@@ -78,7 +68,7 @@ be parsed.
 ### Which refusals block
 
 A refusal is classified in one place in the code, from the refusal policy
-table in `ori-specs` `evidence-transport/v1.md`. Each status admits only its own
+table in `ori-specs` `evidence-transport/v2.md`. Each status admits only its own
 closed list of reasons. A reason the status does not admit, including none, is
 recorded as `unrecognised` and takes that status's fail-closed action, so an
 invalid pair never shows as a valid-looking reason. The `retriable` flag the
@@ -86,15 +76,19 @@ evidence authority sends is never used to select a well-formed refusal's class.
 
 | Status | Reasons the status admits | Action | Any other reason |
 | --- | --- | --- | --- |
-| `400` | `malformed` | Hold (a registration is archived) | Hold, recorded `unrecognised` |
+| `400` | `malformed` | Hold | Hold, recorded `unrecognised` |
 | `401` | `malformed`, `unknown_key`, `bad_authenticator`, `stale`, `replay` | Retry on the device's next handoff only | Same, recorded `unrecognised` |
 | `403` | `not_authorized` | Retry on the device's next handoff only | Same, recorded `unrecognised` |
-| `409` | `conflict` | Hold (a registration is archived) | Hold, recorded `unrecognised` |
+| `409` | `conflict` | Hold | Hold, recorded `unrecognised` |
 | `409` | `pending_registration_conflict` | Back off, in the registration lane only | — |
-| `422` | `bad_authenticator`, `binding_mismatch`, `commissioning_digest_mismatch` | Hold (a registration is archived) | Hold, recorded `unrecognised` |
+| `422` | `bad_authenticator`, `binding_mismatch`, `commissioning_digest_mismatch` | Hold | Hold, recorded `unrecognised` |
 | `422` | `unrecognised_version`, `unknown_key` | Retry on the device's next handoff only | — |
 | `429` | `rate_limited`, `pending_registration_limit` | Back off, never sooner than `Retry-After` | Back off, never sooner than a parseable `Retry-After`, recorded `unrecognised` |
 | `503` | `unavailable` | Back off | Same, recorded `unrecognised` |
+
+A `refused_retained` response, a `507`, and a `503 retention_capacity_unavailable`
+are not handled yet: each is treated as an unrecognised outcome, kept and backed
+off, never retired or discarded.
 
 `400 unknown_key`, `409 unknown_key` and `422 malformed` are invalid output
 from the evidence authority — malformed bytes are a `400` — so they hold and are
@@ -154,7 +148,7 @@ artifacts in that lane wait until it is delivered. A `400` refused before
 authentication carries no artifact digest and is classified the same way as one
 that does.
 
-`evidence-transport/v1` defines `409 conflict` as a real conflict with state the
+`evidence-transport/v2` defines `409 conflict` as a real conflict with state the
 evidence authority holds, never its own storage failure, which is
 `503 unavailable`. An authority that answers `409` for a failure on its own side
 is not conformant. Before quarantining a `409`, confirm with the evidence
@@ -200,7 +194,7 @@ or `malformed_channel_response`), `reason`, `retry` (`backoff`, or
 log.
 
 With `site_health` enabled, `gateway.evidence_delivery` reports the courier per
-device and lane, as `gateway-api/v1` defines it:
+device and lane, as `gateway-evidence-carriage/v1` defines it:
 
 - `devices` lists one entry for each device and lane whose delivery is not
   clean, with its `device_id`, `lane` (`registration` or `evidence`),
@@ -238,14 +232,8 @@ device and lane, as `gateway-api/v1` defines it:
     reports `devices` in full;
 - `blocked` is true only when every pending artifact is in a listed lane and
   every listed lane is held; a fault never makes it true;
-- `archived_registrations` lists one entry for each archived terminal
-  registration refusal, with its `device_id`, `artifact_digest`,
-  `refusal_status`, `reason`, `refused_at_ms` and `acknowledged` (always
-  `false`), and never the archived bytes; it is always carried, empty when
-  there is none, and an archived refusal is never in `devices`, never counted
-  in `pending`, and never makes `blocked` true;
-- `degraded` is true whenever `faults`, `devices` or `archived_registrations`
-  is not empty.
+- `degraded` is true whenever `faults` or `devices` is not empty;
+- `incidents` and `stopped_custody` are not projected yet.
 
 It also keeps `last_error` and `last_failure_at_ms`, a one-event summary of the
 most recent delivery failure on any device. `last_error` is not the fault state:
