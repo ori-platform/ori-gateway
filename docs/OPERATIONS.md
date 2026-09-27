@@ -128,14 +128,17 @@ type, body, fields, digest binding or outcome is invalid or absent, a
 and any `2xx` that is not a clean
 `200` acceptance — including a `200` marked `retriable: true` or missing the
 receipt an envelope requires. The artifact is kept, recorded `unrecognised`,
-reported degraded, and retried after a back-off that starts at
-`evidence.backoff_base_s` and doubles up to `evidence.backoff_max_s`. It is
+reported degraded, and retried after a back-off that doubles from its base up
+to its bound. It is
 never retired, never held, and never resent immediately.
 
-Back-off is configured by `evidence.backoff_base_s` (default: the delivery
-interval, `retry_interval_s`) and `evidence.backoff_max_s` (default: 300, or the
-base if that is longer). The configuration is refused at startup unless
-`backoff_max_s >= backoff_base_s >= retry_interval_s`. Every back-off waits at
+Once a device declares `gateway-evidence-carriage/v1`, the base and bound are
+`evidence.backoff_base_s` (default: the delivery interval, `retry_interval_s`)
+and `evidence.backoff_max_s` (default: 300, or the base if that is longer), and
+the configuration is refused at startup unless
+`backoff_max_s >= backoff_base_s >= retry_interval_s`. A site that declares
+nothing does not consume those keys: its base is the delivery interval and its
+bound 300 seconds, or the delivery interval if longer. Every back-off waits at
 least the delivery interval, and a `Retry-After` is an additional floor.
 
 Back-offs are persisted beside the queue record
@@ -208,8 +211,10 @@ device and lane, as `gateway-evidence-carriage/v1` defines it:
   - `store_unavailable` while a durable store (outbound or return) cannot be
     read, written or atomically updated. Each store is probed right after it
     opens and then every `evidence.store_probe_interval_s` (300 to 900 seconds,
-    default 900), even when nothing is being delivered, so an idle store that
-    has become unwritable is reported within that interval. The probe reads the
+    default 900) once a device declares `gateway-evidence-carriage/v1`, or every
+    900 seconds on a site that declares nothing, even when nothing is being
+    delivered, so an idle store that has become unwritable is reported within
+    that interval. The probe reads the
     directory and atomically replaces `.ori-evidence-probe` in it; it never
     touches a queue record. A failed probe or a failed store operation raises
     it; only that store's next successful probe clears it, so after the store

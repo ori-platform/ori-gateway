@@ -159,18 +159,28 @@ func (c EvidenceConfig) VersionedDevices() []string {
 }
 
 // StoreProbeInterval is the interval each durable evidence store is probed
-// at. A site that declares no gateway-evidence-carriage/v1 keeps whatever
-// store_probe_interval_s it carries, unvalidated; a non-positive value probes
-// at the default, and one past the range at its upper edge, so the value can
-// neither stop the probe nor overflow a duration.
+// at. store_probe_interval_s is consumed only once a device declares
+// gateway-evidence-carriage/v1, when the loader has held it to its range; a
+// site that declares nothing probes at the default, whatever it carries
+// (gateway-config/v2: the key is a design target for such a site).
 func (c EvidenceConfig) StoreProbeInterval() time.Duration {
-	switch {
-	case c.StoreProbeIntervalS <= 0:
+	if !c.DeclaresVersionedCarriage() {
 		return DefaultEvidenceStoreProbeIntervalS * time.Second
-	case c.StoreProbeIntervalS > MaxEvidenceStoreProbeIntervalS:
-		return MaxEvidenceStoreProbeIntervalS * time.Second
 	}
 	return time.Duration(c.StoreProbeIntervalS) * time.Second
+}
+
+// Backoff is the courier's back-off base and bound. backoff_base_s and
+// backoff_max_s are consumed only once a device declares
+// gateway-evidence-carriage/v1, when the loader has held them to their
+// ordering; a site that declares nothing backs off from its delivery interval
+// to the default bound, whatever it carries.
+func (c EvidenceConfig) Backoff() (base, bound time.Duration) {
+	if !c.DeclaresVersionedCarriage() {
+		base = time.Duration(c.RetryIntervalS) * time.Second
+		return base, max(DefaultEvidenceBackoffMaxS*time.Second, base)
+	}
+	return time.Duration(c.BackoffBaseS) * time.Second, time.Duration(c.BackoffMaxS) * time.Second
 }
 
 type ProviderConfig struct {

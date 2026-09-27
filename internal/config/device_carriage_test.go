@@ -8,6 +8,7 @@ import (
 	"maps"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestDeviceCarriageActivatesTheVersionedRulesOnlyWhenDeclared loads, through
@@ -84,6 +85,56 @@ evidence:
 			}
 			if got := cfg.Evidence.DeclaresVersionedCarriage(); got != want {
 				t.Fatalf("DeclaresVersionedCarriage = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestTimingKeysAreConsumedOnlyWhenDeclared holds the courier's use of
+// store_probe_interval_s and the back-off keys to gateway-config/v2: a site
+// that declares no gateway-evidence-carriage/v1 carries them as design
+// targets, unvalidated and unconsumed, and runs at the defaults; a site that
+// declares it runs at the values the loader validated.
+func TestTimingKeysAreConsumedOnlyWhenDeclared(t *testing.T) {
+	const site = `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+evidence:
+  enabled: true
+  queue_directory: /var/lib/ori/evidence-out
+  return_queue_directory: /var/lib/ori/evidence-return
+  endpoint_env: ORI_EVIDENCE_ENDPOINT
+  client_id_env: ORI_EVIDENCE_CLIENT_ID
+  secret_env: ORI_EVIDENCE_INGEST_SECRET
+  retry_interval_s: %d
+  backoff_base_s: %d
+  backoff_max_s: %d
+  store_probe_interval_s: %d
+%s`
+	const optIn = "  device_carriage:\n    dev-01: gateway-evidence-carriage/v1\n"
+	for _, tc := range []struct {
+		name                      string
+		retry, base, bound, probe int
+		carriage                  string
+		wantProbe                 time.Duration
+		wantBase, wantBound       time.Duration
+	}{
+		{"legacy values outside every rule", 5, 60, 30, 60, "", 900 * time.Second, 5 * time.Second, 300 * time.Second},
+		{"legacy non-positive values", 5, -1, 0, 0, "", 900 * time.Second, 5 * time.Second, 300 * time.Second},
+		{"a legacy delivery interval past the default bound", 600, 1, 1, 1, "", 900 * time.Second, 600 * time.Second, 600 * time.Second},
+		{"declared values", 5, 10, 30, 300, optIn, 300 * time.Second, 10 * time.Second, 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, fmt.Sprintf(site, tc.retry, tc.base, tc.bound, tc.probe, tc.carriage)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			base, bound := cfg.Evidence.Backoff()
+			if probe := cfg.Evidence.StoreProbeInterval(); probe != tc.wantProbe || base != tc.wantBase || bound != tc.wantBound {
+				t.Fatalf("probe %v, back-off %v to %v; want %v, %v to %v", probe, base, bound, tc.wantProbe, tc.wantBase, tc.wantBound)
 			}
 		})
 	}

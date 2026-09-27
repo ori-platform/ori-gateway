@@ -221,12 +221,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct independent evidence channel")
 		}
+		backoffBase, backoffBound := cfg.Evidence.Backoff()
 		evidenceWorker, err = courier.NewDeliveryWorker(
 			evidenceQueue, channel, authoritySink,
 			courier.DeliveryWorkerOptions{
 				RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second,
-				BackoffBase:   time.Duration(cfg.Evidence.BackoffBaseS) * time.Second,
-				MaxBackoff:    time.Duration(cfg.Evidence.BackoffMaxS) * time.Second,
+				BackoffBase:   backoffBase,
+				MaxBackoff:    backoffBound,
 				Faults:        evidenceFaults,
 				Logger:        deps.logger,
 			},

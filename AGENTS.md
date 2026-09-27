@@ -259,9 +259,11 @@ is invalid authority output and holds as `unrecognised`); `429` and `503` back
 off, and a `429 rate_limited` or `429 pending_registration_limit` waits no
 less than its `Retry-After`. A `refused_retained` response and a `507` are not
 yet handled and back off as unrecognised; their cases run as pinned expected
-failures. Back-off is configured as `backoff_max_s >= backoff_base_s >=
-retry_interval_s`, refused at load when a device declares
-`gateway-evidence-carriage/v1`; every wait is at least the
+failures. When a device declares `gateway-evidence-carriage/v1`, back-off
+runs from `backoff_base_s` to `backoff_max_s`, refused at load unless
+`backoff_max_s >= backoff_base_s >= retry_interval_s`; a site that declares
+nothing does not consume those keys and backs off from the delivery interval
+to 300 seconds (or the delivery interval, if longer). Every wait is at least the
 delivery interval, and a `Retry-After` is an additional floor. Each
 status admits only its own closed reason list: a reason outside it is recorded
 as `unrecognised` and takes the status's fail-closed action. Anything else — a
@@ -291,7 +293,9 @@ without the device ID ever being projected, and cleared only when that device
 is configured and a later handoff for it is admitted. `delivery_impaired` is
 never raised, because `devices` is always projected and complete. Each store is
 probed right after opening and then every `store_probe_interval_s` (300 to 900,
-default 900, refused outside the range at load): the probe reads the directory
+refused outside the range at load) once a device declares
+`gateway-evidence-carriage/v1`, and every 900 seconds on a site that declares
+nothing, which does not consume the key: the probe reads the directory
 and atomically replaces the fixed private file `.ori-evidence-probe`, which the
 loader ignores; it never touches a queue record. `last_error` stays a one-event
 summary.

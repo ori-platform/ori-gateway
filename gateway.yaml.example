@@ -47,13 +47,15 @@ evidence:
   max_bytes: 268435456
   retry_interval_s: 5
   # Back-off for refusals that back off and for unrecognised outcomes: starts at
-  # backoff_base_s, doubles up to backoff_max_s. When a device declares
-  # gateway-evidence-carriage/v1, must satisfy
-  # backoff_max_s >= backoff_base_s >= retry_interval_s.
+  # backoff_base_s, doubles up to backoff_max_s, and must satisfy
+  # backoff_max_s >= backoff_base_s >= retry_interval_s. Consumed only once a
+  # device declares gateway-evidence-carriage/v1; otherwise the base is
+  # retry_interval_s and the bound 300 seconds.
   backoff_base_s: 5
   backoff_max_s: 300
-  # Each durable store is probed at start and then on this interval; 300-900
-  # when a device declares gateway-evidence-carriage/v1.
+  # Each durable store is probed at start and then on this interval, 300-900.
+  # Consumed only once a device declares gateway-evidence-carriage/v1;
+  # otherwise every 900 seconds.
   store_probe_interval_s: 900
   # Names only. The endpoint and credential values are provisioned outside this
   # operator-readable file and must be distinct from fleet, MQTT, and custody.
