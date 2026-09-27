@@ -243,7 +243,7 @@ func recordDevice(payload []byte) string {
 	var routing struct {
 		DeviceID string `json:"device_id"`
 	}
-	if err := json.Unmarshal(payload, &routing); err != nil {
+	if err := decodeRouting(payload, &routing); err != nil {
 		return ""
 	}
 	return routing.DeviceID

@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/custody"
@@ -115,7 +114,7 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 	}
 	// validateArtifactRoutingFields already decoded these exact bytes. This
 	// second decode is local routing only and never changes queued.Payload.
-	if err := json.Unmarshal(payload, &envelope); err != nil {
+	if err := decodeRouting(payload, &envelope); err != nil {
 		return Admission{}, fmt.Errorf("evidence: decode queued envelope routing fields: %w", err)
 	}
 	digest := sha256.Sum256(payload)
@@ -148,7 +147,7 @@ func validateArtifactRoutingFields(kind ArtifactType, payload []byte) error {
 		DeviceID string `json:"device_id"`
 		LocalSeq int64  `json:"local_seq"`
 	}
-	if err := json.Unmarshal(payload, &routing); err != nil {
+	if err := decodeRouting(payload, &routing); err != nil {
 		return fmt.Errorf("evidence: artifact routing fields are missing or unparseable: %w", err)
 	}
 	if !validRoutingDeviceID(routing.DeviceID) {
@@ -184,7 +183,7 @@ type authorityRouting struct {
 // delivery receipt, each present with its v1 type. The version is never read.
 func authorityRoutingProjection(kind AuthorityArtifactType, payload []byte) (authorityRouting, error) {
 	var routing authorityRouting
-	if err := json.Unmarshal(payload, &routing); err != nil || !validRoutingDeviceID(routing.DeviceID) {
+	if err := decodeRouting(payload, &routing); err != nil || !validRoutingDeviceID(routing.DeviceID) {
 		return authorityRouting{}, fmt.Errorf("invalid authority routing fields")
 	}
 	if kind != AuthorityDeliveryReceipt {
@@ -267,7 +266,7 @@ func validateAuthorityRouting(queued QueuedArtifact, artifact AuthorityArtifact)
 		DeviceID string `json:"device_id"`
 		LocalSeq int64  `json:"local_seq"`
 	}
-	if err := json.Unmarshal(queued.Payload, &outbound); err != nil || outbound.DeviceID == "" {
+	if err := decodeRouting(queued.Payload, &outbound); err != nil || outbound.DeviceID == "" {
 		return "", false, fmt.Errorf("invalid queued routing fields")
 	}
 	authority, err := authorityRoutingProjection(artifact.Type, artifact.Payload)
@@ -296,7 +295,7 @@ func artifactDeviceID(payload []byte) string {
 	}
 	// The device is the one the admission path bound to its topic and the
 	// configured device list; the log handler escapes it.
-	if err := json.Unmarshal(payload, &routing); err != nil || routing.DeviceID == "" {
+	if err := decodeRouting(payload, &routing); err != nil || routing.DeviceID == "" {
 		return "unrecognised"
 	}
 	return routing.DeviceID

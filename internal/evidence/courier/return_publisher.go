@@ -243,7 +243,7 @@ func authorityQueueRouting(queued QueuedArtifact) (string, AuthorityArtifactType
 	var value struct {
 		DeviceID string `json:"device_id"`
 	}
-	if err := json.Unmarshal(queued.Payload, &value); err != nil || value.DeviceID == "" {
+	if err := decodeRouting(queued.Payload, &value); err != nil || value.DeviceID == "" {
 		return "", "", fmt.Errorf("evidence: invalid queued authority artifact")
 	}
 	switch queued.Type {

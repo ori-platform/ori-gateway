@@ -5,7 +5,6 @@ package courier
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -49,7 +48,7 @@ func (s *DurableAuthoritySink) Store(_ context.Context, artifact AuthorityArtifa
 	var routing struct {
 		DeviceID string `json:"device_id"`
 	}
-	if err := json.Unmarshal(artifact.Payload, &routing); err != nil || routing.DeviceID == "" || routing.DeviceID != artifact.DeviceID {
+	if err := decodeRouting(artifact.Payload, &routing); err != nil || routing.DeviceID == "" || routing.DeviceID != artifact.DeviceID {
 		return fmt.Errorf("evidence: authority artifact routing mismatch")
 	}
 	_, err := s.queue.enqueue(kind, artifact.Payload)

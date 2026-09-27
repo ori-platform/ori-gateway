@@ -103,7 +103,7 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 	var artifactRouting struct {
 		DeviceID string `json:"device_id"`
 	}
-	if err := json.Unmarshal(artifactBytes, &artifactRouting); err != nil || artifactRouting.DeviceID == "" {
+	if err := decodeRouting(artifactBytes, &artifactRouting); err != nil || artifactRouting.DeviceID == "" {
 		return h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "refused", "malformed", h.now().UnixMilli())
 	}
 	if artifactRouting.DeviceID != deviceID {

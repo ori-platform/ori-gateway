@@ -217,6 +217,54 @@ func TestRuntimeIngressRejectsTopicWrapperAndArtifactBindingMismatch(t *testing.
 	}
 }
 
+// TestRuntimeIngressRefusesAnAmbiguousRoutingMember holds admission to
+// routing members spelled exactly and named once (evidence-exchange/v2): an
+// artifact naming device_id twice, or by a case variant, is refused as
+// malformed whichever spelling or position matches the topic, and nothing is
+// queued or given custody.
+func TestRuntimeIngressRefusesAnAmbiguousRoutingMember(t *testing.T) {
+	const seq = `"local_seq":1,"anchor_epoch_id":"sha256:7f1b65b8b24f69807441d80c8901207cf22657a9630b12901418a99efbd36f0a"`
+	for name, artifact := range map[string]string{
+		"the topic's device last":          `{"v":1,"device_id":"site-b-edge-09","device_id":"site-a-edge-01",` + seq + `}`,
+		"the topic's device first":         `{"v":1,"device_id":"site-a-edge-01","device_id":"site-b-edge-09",` + seq + `}`,
+		"a case variant alone":             `{"v":1,"Device_ID":"site-a-edge-01",` + seq + `}`,
+		"a case variant beside the member": `{"v":1,"device_id":"site-a-edge-01","DEVICE_ID":"site-b-edge-09",` + seq + `}`,
+		"local_seq named twice":            `{"v":1,"device_id":"site-a-edge-01","local_seq":2,` + seq + `}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			courier, q := testCourier(t, 10)
+			var published []publishedEvidenceMessage
+			handler, err := NewRuntimeIngress(courier, testReturnSink(t, time.Now()), testAckClock(t, time.Now), func(_ context.Context, topic string, qos byte, retained bool, payload []byte) error {
+				published = append(published, publishedEvidenceMessage{topic, qos, retained, append([]byte(nil), payload...)})
+				return nil
+			}, "runtime-gateway-envelope-secret", time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			carriage, err := json.Marshal(map[string]any{
+				"device_id": "site-a-edge-01", "artifact_type": "delivery_envelope",
+				"artifact_b64": base64.StdEncoding.EncodeToString([]byte(artifact)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := handler.Handle(context.Background(), "ori/site-a-edge-01/evidence/outbound", carriage); err != nil {
+				t.Fatal(err)
+			}
+			if len(published) != 1 {
+				t.Fatalf("published %d messages, want the one refusal", len(published))
+			}
+			var ack outboundAck
+			if err := json.Unmarshal(published[0].payload, &ack); err != nil {
+				t.Fatal(err)
+			}
+			if ack.Outcome != "refused" || ack.Reason != "malformed" || q.Len() != 0 {
+				t.Fatalf("ack %#v with %d queued; want refused malformed and nothing queued", ack, q.Len())
+			}
+		})
+	}
+}
+
 func TestRuntimeIngressSignsExplicitQueueFullRefusalWithoutCustody(t *testing.T) {
 	courier, _ := testCourier(t, 1)
 	if _, err := courier.Admit(ArtifactDeliveryEnvelope, validEnvelopeBytes(1)); err != nil {

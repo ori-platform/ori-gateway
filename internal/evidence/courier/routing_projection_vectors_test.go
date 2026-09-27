@@ -17,47 +17,37 @@ var routingProjectionPins = map[string]vectorPin{
 	"a anchor_registration without anchor_epoch_id": {
 		Requirement: "missing_requirement:routing-anchor-epoch",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
+		Observed:    "routable true, corpus says false for missing \"anchor_epoch_id\"",
 	},
 	"a checkpoint whose anchor_epoch_id is uppercase hex": {
 		Requirement: "missing_requirement:routing-anchor-epoch",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
+		Observed:    "routable true, corpus says false for missing \"anchor_epoch_id\"",
 	},
 	"a checkpoint whose anchor_epoch_id member differs only in case": {
 		Requirement: "missing_requirement:routing-anchor-epoch",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
+		Observed:    "routable true, corpus says false for missing \"anchor_epoch_id\"",
 	},
 	"a checkpoint without anchor_epoch_id": {
 		Requirement: "missing_requirement:routing-anchor-epoch",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
+		Observed:    "routable true, corpus says false for missing \"anchor_epoch_id\"",
 	},
 	"a delivery_envelope without anchor_epoch_id": {
 		Requirement: "missing_requirement:routing-anchor-epoch",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
+		Observed:    "routable true, corpus says false for missing \"anchor_epoch_id\"",
 	},
 	"a v1 evidence disposition": {
 		Requirement: "missing_requirement:disposition-carriage",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
 		Observed:    "artifact type evidence_disposition is not carried",
 	},
-	"an envelope naming device_id twice": {
-		Requirement: "missing_requirement:routing-anchor-epoch",
-		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
-	},
 	"an envelope whose anchor_epoch_id is not a digest": {
 		Requirement: "missing_requirement:routing-anchor-epoch",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
-	},
-	"an envelope whose device_id member differs only in case": {
-		Requirement: "missing_requirement:routing-anchor-epoch",
-		Issue:       "https://github.com/ori-platform/ori-gateway/issues/104",
-		Observed:    "routable true, corpus says false",
+		Observed:    "routable true, corpus says false for missing \"anchor_epoch_id\"",
 	},
 	"an evidence disposition naming device_id twice": {
 		Requirement: "missing_requirement:disposition-carriage",
@@ -125,8 +115,10 @@ func TestRoutingProjectionVectors(t *testing.T) {
 				return
 			}
 			observed := ""
+			// The corpus's missing member is part of the observation, so a pin
+			// binds the reason a case is unroutable and not only its outcome.
 			if routable := err == nil; routable != tc.Routable {
-				observed = fmt.Sprintf("routable %v, corpus says %v", routable, tc.Routable)
+				observed = fmt.Sprintf("routable %v, corpus says %v for missing %q", routable, tc.Routable, tc.Missing)
 			}
 			checkPin(t, routingProjectionPins, tc.Name, observed)
 		})
