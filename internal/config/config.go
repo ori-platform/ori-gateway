@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -144,6 +143,21 @@ func (c EvidenceConfig) DeclaresVersionedCarriage() bool {
 		}
 	}
 	return false
+}
+
+// StoreProbeInterval is the interval each durable evidence store is probed
+// at. A site that declares no gateway-evidence-carriage/v1 keeps whatever
+// store_probe_interval_s it carries, unvalidated; a non-positive value probes
+// at the default, and one past the range at its upper edge, so the value can
+// neither stop the probe nor overflow a duration.
+func (c EvidenceConfig) StoreProbeInterval() time.Duration {
+	switch {
+	case c.StoreProbeIntervalS <= 0:
+		return DefaultEvidenceStoreProbeIntervalS * time.Second
+	case c.StoreProbeIntervalS > MaxEvidenceStoreProbeIntervalS:
+		return MaxEvidenceStoreProbeIntervalS * time.Second
+	}
+	return time.Duration(c.StoreProbeIntervalS) * time.Second
 }
 
 type ProviderConfig struct {
@@ -495,8 +509,9 @@ func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
 // versioned carriage's rules only when at least one configured device declares
 // gateway-evidence-carriage/v1. A site that declares nothing keeps exactly the
 // courier's own validation, so an upgrade refuses no configuration it accepted.
-// A declaration is validated whenever it is supplied: an invalid one is
-// refused, never read as legacy.
+// With the courier enabled, a supplied declaration is validated even when it
+// declares nothing: an invalid one is refused, never read as legacy. A disabled
+// courier validates none of its keys, the declaration included.
 func validateEvidence(cfg *EvidenceConfig, deviceIDs []string) error {
 	if !cfg.Enabled {
 		cfg.DeviceCarriage = nil
@@ -624,14 +639,6 @@ func validateGatewayDeviceID(deviceID string) error {
 	}
 	if strings.ContainsAny(deviceID, "/+#|") {
 		return fmt.Errorf("device_id %q must not contain MQTT separators, wildcards, or auth delimiters", deviceID)
-	}
-	// Control characters (general category Cc, NUL among them, which an MQTT
-	// topic cannot carry) are refused whether or not the courier is enabled
-	// (gateway-config/v2).
-	for _, r := range deviceID {
-		if unicode.Is(unicode.Cc, r) {
-			return fmt.Errorf("device_id %q must not contain control characters", deviceID)
-		}
 	}
 	return nil
 }

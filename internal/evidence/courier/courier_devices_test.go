@@ -173,7 +173,7 @@ func TestHandoffForOneDeviceNeverRetriesAnother(t *testing.T) {
 func TestPerDeviceCapacityRefusesOnlyTheExhaustedDevice(t *testing.T) {
 	q, err := OpenDurableQueue(QueueOptions{
 		Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: 4, MaxBytes: 4 * maxQueueRecordBytes,
-		Devices: []string{"dev-a", "dev-b"},
+		Devices: []string{"dev-a", "dev-b"}, ReserveDeviceShares: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestPerDeviceCapacityRefusesOnlyTheExhaustedDevice(t *testing.T) {
 func TestPerDeviceByteShareRefusesOnlyTheExhaustedDevice(t *testing.T) {
 	q, err := OpenDurableQueue(QueueOptions{
 		Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: 100, MaxBytes: 2 * MinDeviceShareBytes,
-		Devices: []string{"dev-a", "dev-b"},
+		Devices: []string{"dev-a", "dev-b"}, ReserveDeviceShares: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -252,7 +252,7 @@ func TestQueueRefusesAShareWithoutRoomForTheReserveAndOneRecord(t *testing.T) {
 		"one item per share": {3, 2 * MinDeviceShareBytes, false},
 	} {
 		_, err := OpenDurableQueue(QueueOptions{
-			Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: tc.items, MaxBytes: tc.bytes, Devices: devices,
+			Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: tc.items, MaxBytes: tc.bytes, Devices: devices, ReserveDeviceShares: true,
 		})
 		if tc.opens != (err == nil) || (err != nil && !strings.Contains(err.Error(), "per-device queue share")) {
 			t.Fatalf("%s: open = %v", name, err)
@@ -348,7 +348,7 @@ func TestGatewayWideQueueOpensPerDevice(t *testing.T) {
 
 	// Reopened with per-device shares of 3 items: dev-a already holds 5.
 	q, err := OpenDurableQueue(QueueOptions{
-		Directory: dir, MaxItems: 6, MaxBytes: 2 * maxQueueRecordBytes * 3, Devices: []string{"dev-a", "dev-b"},
+		Directory: dir, MaxItems: 6, MaxBytes: 2 * maxQueueRecordBytes * 3, Devices: []string{"dev-a", "dev-b"}, ReserveDeviceShares: true,
 	})
 	if err != nil {
 		t.Fatalf("a gateway-wide queue over a device's share refused to open: %v", err)

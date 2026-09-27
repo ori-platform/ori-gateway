@@ -194,12 +194,15 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return err
 		}
-		// Capacity is reserved per configured device: each holds an equal share
-		// of max_items and max_bytes, so one device cannot exhaust another's.
+		// Once any device declares gateway-evidence-carriage/v1, capacity is
+		// reserved per configured device: each holds an equal share of
+		// max_items and max_bytes, so one device cannot exhaust another's. A
+		// site that declares nothing keeps one gateway-wide share.
 		evidenceFaults = faults.NewRecorder()
 		evidenceQueue, err = courier.OpenDurableQueue(courier.QueueOptions{
 			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
-			Devices: cfg.Gateway.DeviceIDs, Faults: evidenceFaults, FaultSource: "outbound", Now: deps.now,
+			Devices: cfg.Gateway.DeviceIDs, ReserveDeviceShares: cfg.Evidence.DeclaresVersionedCarriage(),
+			Faults: evidenceFaults, FaultSource: "outbound", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence outbound queue: %w", err)
@@ -406,7 +409,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		runners.start("evidence delivery worker", evidenceWorker.Run)
 		// Each durable store was probed when it opened; these keep probing it,
 		// independently of admissions and of health publication.
-		probeInterval := time.Duration(cfg.Evidence.StoreProbeIntervalS) * time.Second
+		probeInterval := cfg.Evidence.StoreProbeInterval()
 		runners.start("evidence outbound store probe", func(ctx context.Context) error {
 			return evidenceQueue.ProbeLoop(ctx, probeInterval)
 		})

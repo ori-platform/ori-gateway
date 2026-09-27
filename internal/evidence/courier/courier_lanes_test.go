@@ -397,7 +397,7 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 func TestTwoLanesShareTheDevicesCapacity(t *testing.T) {
 	q, err := OpenDurableQueue(QueueOptions{
 		Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: 4, MaxBytes: 4 * maxQueueRecordBytes,
-		Devices: []string{"dev-a", "dev-b"},
+		Devices: []string{"dev-a", "dev-b"}, ReserveDeviceShares: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -432,7 +432,7 @@ func TestTwoLanesShareTheDevicesCapacity(t *testing.T) {
 func TestEvidenceNeverTakesTheRegistrationReserve(t *testing.T) {
 	q, err := OpenDurableQueue(QueueOptions{
 		Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: 8, MaxBytes: 2 * MinDeviceShareBytes,
-		Devices: []string{"dev-a", "dev-b"},
+		Devices: []string{"dev-a", "dev-b"}, ReserveDeviceShares: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -449,7 +449,7 @@ func TestEvidenceNeverTakesTheRegistrationReserve(t *testing.T) {
 	// Registrations first: the evidence lane still gets its three items.
 	q2, err := OpenDurableQueue(QueueOptions{
 		Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: 8, MaxBytes: 2 * MinDeviceShareBytes,
-		Devices: []string{"dev-a", "dev-b"},
+		Devices: []string{"dev-a", "dev-b"}, ReserveDeviceShares: true,
 	})
 	if err != nil {
 		t.Fatal(err)

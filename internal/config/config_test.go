@@ -1361,12 +1361,9 @@ provider:
 // declaring (gateway-config/v2). Every device is held to gateway.device_ids'
 // own rule: no MQTT separator, wildcard, auth delimiter or control character.
 func TestDeviceIDsMustBeInTheEvidenceRoutingDomain(t *testing.T) {
-	// The rows whose identifier carries a control character: refused at load
-	// whether or not the courier is enabled.
-	controlRows := map[string]bool{
-		"inner tab": true, "next line": true, "NUL": true, "information separator": true,
-		"DEL": true, "C1 control": true,
-	}
+	// Only a device that declares gateway-evidence-carriage/v1 is held to the
+	// routing domain; every other is held to the gateway.device_ids rule alone,
+	// control characters included (gateway-config/v2).
 	for _, tc := range []struct {
 		name  string
 		id    string // a YAML double-quoted scalar body
@@ -1421,7 +1418,7 @@ evidence:
 %s`, tc.id, enabled, carriage))
 				cfg, err := Load(path)
 				mqtt := strings.ContainsAny(tc.id, "/+#")
-				refused := mqtt || controlRows[tc.name] || (mode == "subject declares" && !tc.valid)
+				refused := mqtt || (mode == "subject declares" && !tc.valid)
 				if !refused {
 					if err != nil {
 						t.Fatalf("refused: %v", err)

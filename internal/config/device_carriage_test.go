@@ -15,9 +15,9 @@ import (
 // queue shared by two devices, a back-off bound below its base, a store probe
 // outside its range, and a device ID outside the evidence routing domain. It
 // loads while no device declares gateway-evidence-carriage/v1, whatever shape
-// the absence takes, and each rule refuses it once one does. A supplied map is
-// validated even when it declares nothing, and an invalid one is refused
-// rather than read as legacy.
+// the absence takes, and each rule refuses it once one does. With the courier
+// enabled, a supplied map is validated even when it declares nothing, and an
+// invalid one is refused rather than read as legacy.
 func TestDeviceCarriageActivatesTheVersionedRulesOnlyWhenDeclared(t *testing.T) {
 	const site = `
 gateway:

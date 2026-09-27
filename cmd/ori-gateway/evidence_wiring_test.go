@@ -158,6 +158,7 @@ func TestRunningGatewayReservesARegistrationSlotPerDevice(t *testing.T) {
 		ReturnQueueDirectory: filepath.Join(t.TempDir(), "returned"), MaxItems: 4,
 		MaxBytes: 8 << 20, RetryIntervalS: 60, BackoffBaseS: 60, BackoffMaxS: 60, StoreProbeIntervalS: 900,
 		EndpointEnv: "EVIDENCE_ENDPOINT", ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
+		DeviceCarriage: map[string]string{"dev-01": config.CarriageEvidenceCarriageV1, "dev-02": config.CarriageGatewayAPIV1},
 	}
 	mainBroker := newFakeBroker()
 	evidenceBroker := newFakeBroker()

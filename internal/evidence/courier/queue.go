@@ -88,12 +88,16 @@ type QueueOptions struct {
 	Directory string
 	MaxItems  int
 	MaxBytes  int64
-	// Devices, when set, reserves capacity per device: each named device may
-	// hold at most MaxItems/len(Devices) records and MaxBytes/len(Devices)
-	// bytes, so one device exhausting its share cannot refuse another's
-	// admissions. A device not named has no share. Left empty, one share is the
-	// whole queue.
+	// Devices, when set, is the configured device set: a device not named is
+	// refused admission. Left empty, every device is admitted.
 	Devices []string
+	// ReserveDeviceShares reserves capacity per named device: each may hold at
+	// most MaxItems/len(Devices) records and MaxBytes/len(Devices) bytes, so one
+	// device exhausting its share cannot refuse another's admissions
+	// (gateway-config/v2, once a device declares gateway-evidence-carriage/v1).
+	// Unset, the queue is one gateway-wide share, as a site that declares
+	// nothing has always had.
+	ReserveDeviceShares bool
 	// Faults, when set, records store_unavailable under FaultSource while a
 	// durable write, removal or directory sync fails, and clears it on the
 	// next that succeeds.
@@ -110,6 +114,8 @@ type DurableQueue struct {
 	dir      string
 	maxItems int
 	maxBytes int64
+	// reserved is whether capacity is reserved per configured device.
+	reserved bool
 	now      func() time.Time
 	entries  map[string]queueRecord
 	holds    map[string]HoldRecord
@@ -210,6 +216,12 @@ func openDurableQueue(opts QueueOptions) (*DurableQueue, error) {
 		for _, device := range opts.Devices {
 			q.configured[device] = true
 		}
+	}
+	if opts.ReserveDeviceShares {
+		if len(q.configured) == 0 {
+			return nil, fmt.Errorf("evidence: per-device queue shares require the configured devices")
+		}
+		q.reserved = true
 		q.shareItems = opts.MaxItems / len(q.configured)
 		q.shareBytes = opts.MaxBytes / int64(len(q.configured))
 		if q.shareItems < MinDeviceShareItems || q.shareBytes < MinDeviceShareBytes {
@@ -378,11 +390,11 @@ func (q *DurableQueue) enqueue(kind ArtifactType, payload []byte) (QueuedArtifac
 // admission may never take that reserve, so an evidence lane waiting on an
 // unconfirmed epoch can never refuse the registration that would confirm it:
 // the evidence lane holds at most the share less the reserve, and both lanes
-// together at most the share. Without configured devices the queue is one
+// together at most the share. Without reserved shares the queue is one
 // unreserved share. With size 0 it checks items; with a record's encoded size
 // it checks bytes.
 func (q *DurableQueue) laneShareRefusalLocked(key LaneKey, size int64) error {
-	reserved := q.configured != nil && key.Lane != LaneRegistration
+	reserved := q.reserved && key.Lane != LaneRegistration
 	if size == 0 {
 		if q.deviceItems[key.Device] >= q.shareItems ||
 			(reserved && q.laneItems[key] >= q.shareItems-1) {
