@@ -23,6 +23,14 @@ repos:
         pass_filenames: false
         files: \.go$
 
+      - id: lint
+        name: staticcheck, modernize and gopls
+        language: system
+        entry: scripts/lint.sh
+        pass_filenames: false
+        files: \.go$
+        stages: [pre-push]
+
       - id: license-header
         name: Apache-2.0 license header
         language: system

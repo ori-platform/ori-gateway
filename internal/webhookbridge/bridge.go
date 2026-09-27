@@ -159,8 +159,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBodyBytes))
 	if err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -227,7 +226,7 @@ func (s *Server) sourceAllowed(remoteAddr string) bool {
 
 func signBody(body []byte, secret string, signedAtMS int64, nonce string) string {
 	signed := bytes.Join([][]byte{
-		[]byte(fmt.Sprintf("%d", signedAtMS)),
+		fmt.Appendf(nil, "%d", signedAtMS),
 		[]byte(nonce),
 		body,
 	}, []byte("\n"))

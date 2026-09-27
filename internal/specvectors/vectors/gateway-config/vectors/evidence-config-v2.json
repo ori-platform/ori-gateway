@@ -1,0 +1,766 @@
+{
+  "contract": "gateway-config/v2 evidence",
+  "note": "Each case is a gateway.device_ids list and an evidence block. A valid case names the effective values after defaults, or null for a disabled courier; a refused case names the rule it breaks. A valid case's effective values include each configured device's declared inbound carriage contract, `gateway-api/v1` where none is declared, and the stopped-custody bounds, whose per-device defaults divide the totals equally across the configured devices. The routing domain, the back-off inequality, the share rule, the store-probe range and the stopped-custody bounds apply only when a configured device declares gateway-evidence-carriage/v1; a site declaring none is validated by the courier's own rules alone, and every such refusal disappears with the declaration.",
+  "cases": [
+    {
+      "name": "a disabled courier is accepted without validation",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "relative"
+      },
+      "valid": true,
+      "effective": null
+    },
+    {
+      "name": "every default applied",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456
+      }
+    },
+    {
+      "name": "a back-off base defaults to the delivery interval and the bound to five minutes",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "retry_interval_s": 20
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 20,
+        "backoff_base_s": 20,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456
+      }
+    },
+    {
+      "name": "a back-off base above five minutes raises the default bound to it",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "backoff_base_s": 600
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 600,
+        "backoff_max_s": 600,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456
+      }
+    },
+    {
+      "name": "the store probe at its lower edge",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "store_probe_interval_s": 300,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 300
+      }
+    },
+    {
+      "name": "a non-ASCII device ID in the routing domain",
+      "device_ids": [
+        "sít-a-édge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "sít-a-édge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "sít-a-édge-01": "gateway-evidence-carriage/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900
+      }
+    },
+    {
+      "name": "a relative queue directory",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": false,
+      "rule": "directories"
+    },
+    {
+      "name": "the same directory for both queues",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-outbound/",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": false,
+      "rule": "directories"
+    },
+    {
+      "name": "a zero delivery interval",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "retry_interval_s": 0
+      },
+      "valid": false,
+      "rule": "bounds"
+    },
+    {
+      "name": "a negative item bound",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "max_items": -1
+      },
+      "valid": false,
+      "rule": "bounds"
+    },
+    {
+      "name": "a store probe below 300 seconds",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "store_probe_interval_s": 299,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "probe"
+    },
+    {
+      "name": "a store probe above 900 seconds",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "store_probe_interval_s": 901,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "probe"
+    },
+    {
+      "name": "a back-off bound below its base",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "backoff_base_s": 60,
+        "backoff_max_s": 30,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "backoff"
+    },
+    {
+      "name": "a back-off base below the delivery interval",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "retry_interval_s": 30,
+        "backoff_base_s": 10,
+        "backoff_max_s": 300,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "backoff"
+    },
+    {
+      "name": "one item per device leaves no room beside the registration reserve",
+      "device_ids": [
+        "dev-a",
+        "dev-b"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "max_items": 3,
+        "device_carriage": {
+          "dev-a": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "share"
+    },
+    {
+      "name": "a byte share smaller than two maximum artifacts",
+      "device_ids": [
+        "dev-a",
+        "dev-b"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "max_bytes": 3145728,
+        "device_carriage": {
+          "dev-a": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "share"
+    },
+    {
+      "name": "an environment variable value instead of a name",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "s3cret=value"
+      },
+      "valid": false,
+      "rule": "env"
+    },
+    {
+      "name": "a missing endpoint variable",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": false,
+      "rule": "env"
+    },
+    {
+      "name": "a device ID with a topic separator",
+      "device_ids": [
+        "site-a/edge"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": false,
+      "rule": "device_id"
+    },
+    {
+      "name": "a device ID carrying a control character",
+      "device_ids": [
+        "site-a\u001cedge"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "site-a\u001cedge": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "device_id"
+    },
+    {
+      "name": "a mixed site declares one device and defaults the other to gateway-api/v1",
+      "device_ids": [
+        "site-a-edge-01",
+        "site-b-edge-02"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "site-b-edge-02": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1",
+          "site-b-edge-02": "gateway-evidence-carriage/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 5000,
+        "stopped_device_max_bytes": 134217728
+      }
+    },
+    {
+      "name": "stopped-custody bounds set per device and in total",
+      "device_ids": [
+        "site-a-edge-01",
+        "site-b-edge-02"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "stopped_max_items": 400,
+        "stopped_max_bytes": 8388608,
+        "stopped_device_max_items": 300,
+        "stopped_device_max_bytes": 4194304,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1",
+          "site-b-edge-02": "gateway-api/v1"
+        },
+        "stopped_max_items": 400,
+        "stopped_max_bytes": 8388608,
+        "stopped_device_max_items": 300,
+        "stopped_device_max_bytes": 4194304,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900
+      }
+    },
+    {
+      "name": "a carriage declared for a device the gateway does not serve",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "site-z-edge-99": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "carriage"
+    },
+    {
+      "name": "a carriage value outside the two contracts",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v2"
+        }
+      },
+      "valid": false,
+      "rule": "carriage"
+    },
+    {
+      "name": "a per-device stopped bound above the total",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "stopped_max_items": 100,
+        "stopped_device_max_items": 101,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "stopped"
+    },
+    {
+      "name": "a zero stopped byte bound",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "stopped_max_bytes": 0,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "stopped"
+    },
+    {
+      "name": "a legacy site keeps a one-item queue",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "max_items": 1
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "max_items": 1,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900
+      }
+    },
+    {
+      "name": "a legacy site keeps a back-off bound below its base",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "backoff_base_s": 60,
+        "backoff_max_s": 30
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 60,
+        "backoff_max_s": 30,
+        "store_probe_interval_s": 900
+      }
+    },
+    {
+      "name": "a legacy site keeps a store probe outside the range",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "store_probe_interval_s": 60
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 60
+      }
+    },
+    {
+      "name": "a legacy device outside the routing domain beside an opted-in device",
+      "device_ids": [
+        "site a edge 01",
+        "site-b-edge-02"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "site-b-edge-02": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site a edge 01": "gateway-api/v1",
+          "site-b-edge-02": "gateway-evidence-carriage/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 5000,
+        "stopped_device_max_bytes": 134217728,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900
+      }
+    },
+    {
+      "name": "an empty carriage map is the absent map",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {}
+      },
+      "valid": true,
+      "effective": {
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900
+      }
+    },
+    {
+      "name": "an opted-in device outside the routing domain",
+      "device_ids": [
+        "site a edge 01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "device_carriage": {
+          "site a edge 01": "gateway-evidence-carriage/v1"
+        }
+      },
+      "valid": false,
+      "rule": "device_id"
+    }
+  ]
+}

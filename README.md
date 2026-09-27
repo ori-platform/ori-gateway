@@ -67,7 +67,7 @@ Implemented in this repository:
 - Tier C enrichment contracts and handler, with the runtime-gateway HMAC envelope verified on requests and applied to responses when gateway auth is enabled
 - Durable outbound evidence and authority-return queues, authenticated custody,
   an isolated persistent evidence MQTT session, and the independent authority
-  HTTPS channel defined by `gateway-api/v1` and `evidence-transport/v1`
+  HTTPS channel defined by `evidence-transport/v2`
 - SIM and fleet optional-module stubs with disabled-path safety guarantees
 - CI, repository invariants, and contribution guardrails
 
@@ -85,6 +85,11 @@ Deferred implementation:
   report service — the log, file, and HTTPS cloud deliverers exist; wiring to
   the production service is pending
 
+## Operations
+
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) covers what to do when evidence
+delivery is blocked behind an artifact the evidence authority refused.
+
 ## Invariant
 
 The gateway is never in the Tier D path. Tier D fires locally in the
@@ -100,6 +105,20 @@ interfaces.
 pre-commit install
 go test ./...
 go vet ./...
+```
+
+The evidence courier's contract tests read the `ori-specs` vectors vendored in
+`internal/specvectors`, pinned to one `ori-specs` commit by its `MANIFEST.json`;
+no test reads an `ori-specs` checkout. A case the gateway does not yet satisfy
+runs as an expected failure that names its missing requirement and tracking
+issue.
+
+An integration test drives the real courier against a running evidence
+authority ingest service. It is outside the default run, behind a build tag:
+
+```bash
+ORI_EVIDENCE_INGEST_BIN=/path/to/the/built/ingest/service \
+  go test -tags evidence_integration -run TestAgainstTheEvidenceAuthority -v ./internal/evidence/courier
 ```
 
 ## Versioning and releases

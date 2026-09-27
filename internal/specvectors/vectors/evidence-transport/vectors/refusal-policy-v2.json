@@ -1,0 +1,363 @@
+{
+  "contract": "evidence-transport/v1 refusal policy",
+  "note": "Each case is one authority response and the gateway action it must produce. `class` is retire, archive, hold, handoff, retry_after or backoff. `reason` is what the gateway records: the response reason when its status admits it, otherwise `unrecognised`. `media` is the response media type, `outcome` the response body's outcome, `digest` whether it carries `artifact_digest`, `complete` whether a 200 carries every artifact the acceptance requires, `staged` whether the gateway durably staged every authority artifact the response carried, `retention` the result of the gateway's retention checks (`verified`, or the defect that failed them) and present exactly when the response carries a retention or claims `refused_retained`, and `retriable` the response flag, which never changes the class. `min_wait_s` is the least wait a back-off must honour. In a sequence, `archive_persisted: false` is an archive whose commit failed, and `then` is the state an attempt leaves.",
+  "cases": [
+    {"name": "200 clean acceptance", "status": 200, "media": "json", "outcome": "accepted", "reason": "", "digest": true, "retriable": false, "complete": true, "expected": {"class": "retire", "reason": ""}, "staged": true},
+    {"name": "200 acceptance missing its receipt", "status": 200, "media": "json", "outcome": "accepted", "reason": "", "digest": true, "retriable": false, "complete": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "200 acceptance marked retriable", "status": 200, "media": "json", "outcome": "accepted", "reason": "", "digest": true, "retriable": true, "complete": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "200 carrying a refusal", "status": 200, "media": "json", "outcome": "refused", "reason": "conflict", "digest": true, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "202 is not a clean acceptance", "status": 202, "media": "json", "outcome": "accepted", "reason": "", "digest": true, "retriable": false, "complete": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "200 acceptance without its digest", "status": 200, "media": "json", "outcome": "accepted", "reason": "", "digest": false, "retriable": false, "complete": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "200 acceptance carrying a reason", "status": 200, "media": "json", "outcome": "accepted", "reason": "conflict", "digest": true, "retriable": false, "complete": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "200 with no outcome", "status": 200, "media": "json", "reason": "", "digest": true, "retriable": false, "complete": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "400 malformed, unauthenticated, no digest", "status": 400, "media": "json", "outcome": "refused", "reason": "malformed", "digest": false, "retriable": false, "expected": {"class": "hold", "reason": "malformed"}, "staged": true},
+    {"name": "400 malformed with digest", "status": 400, "media": "json", "outcome": "refused", "reason": "malformed", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "malformed"}, "staged": true},
+    {"name": "400 malformed marked retriable", "status": 400, "media": "json", "outcome": "refused", "reason": "malformed", "digest": false, "retriable": true, "expected": {"class": "hold", "reason": "malformed"}, "staged": true},
+    {"name": "400 unknown_key is invalid server output", "status": 400, "media": "json", "outcome": "refused", "reason": "unknown_key", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "400 unknown reason", "status": 400, "media": "json", "outcome": "refused", "reason": "authority.internal", "digest": false, "retriable": true, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "400 with no reason", "status": 400, "media": "json", "outcome": "refused", "reason": "", "digest": false, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "400 as plain text", "status": 400, "media": "text", "outcome": "", "reason": "", "digest": false, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "401 malformed transport header", "status": 401, "media": "json", "outcome": "refused", "reason": "malformed", "digest": false, "retriable": false, "expected": {"class": "handoff", "reason": "malformed"}, "staged": true},
+    {"name": "401 malformed from a body-digest mismatch", "status": 401, "media": "json", "outcome": "refused", "reason": "malformed", "digest": false, "retriable": false, "expected": {"class": "handoff", "reason": "malformed"}, "staged": true},
+    {"name": "401 unknown_key", "status": 401, "media": "json", "outcome": "refused", "reason": "unknown_key", "digest": false, "retriable": false, "expected": {"class": "handoff", "reason": "unknown_key"}, "staged": true},
+    {"name": "401 bad_authenticator", "status": 401, "media": "json", "outcome": "refused", "reason": "bad_authenticator", "digest": false, "retriable": false, "expected": {"class": "handoff", "reason": "bad_authenticator"}, "staged": true},
+    {"name": "401 stale", "status": 401, "media": "json", "outcome": "refused", "reason": "stale", "digest": false, "retriable": false, "expected": {"class": "handoff", "reason": "stale"}, "staged": true},
+    {"name": "401 replay", "status": 401, "media": "json", "outcome": "refused", "reason": "replay", "digest": false, "retriable": false, "expected": {"class": "handoff", "reason": "replay"}, "staged": true},
+    {"name": "401 replay marked retriable", "status": 401, "media": "json", "outcome": "refused", "reason": "replay", "digest": false, "retriable": true, "expected": {"class": "handoff", "reason": "replay"}, "staged": true},
+    {"name": "401 unknown reason", "status": 401, "media": "json", "outcome": "refused", "reason": "sk_live_0123456789abcdef", "digest": false, "retriable": true, "expected": {"class": "handoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "401 carrying a digest", "status": 401, "media": "json", "outcome": "refused", "reason": "stale", "digest": true, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "403 not_authorized", "status": 403, "media": "json", "outcome": "refused", "reason": "not_authorized", "digest": true, "retriable": false, "expected": {"class": "handoff", "reason": "not_authorized"}, "staged": true},
+    {"name": "403 not_authorized marked retriable", "status": 403, "media": "json", "outcome": "refused", "reason": "not_authorized", "digest": true, "retriable": true, "expected": {"class": "handoff", "reason": "not_authorized"}, "staged": true},
+    {"name": "403 unknown reason", "status": 403, "media": "json", "outcome": "refused", "reason": "forbidden", "digest": true, "retriable": false, "expected": {"class": "handoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "409 conflict", "status": 409, "media": "json", "outcome": "refused", "reason": "conflict", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "conflict"}, "staged": true},
+    {"name": "409 conflict marked retriable", "status": 409, "media": "json", "outcome": "refused", "reason": "conflict", "digest": true, "retriable": true, "expected": {"class": "hold", "reason": "conflict"}, "staged": true},
+    {"name": "409 pending_registration_conflict", "status": 409, "media": "json", "outcome": "refused", "reason": "pending_registration_conflict", "digest": true, "retriable": true, "expected": {"class": "backoff", "reason": "pending_registration_conflict"}, "staged": true},
+    {"name": "409 pending_registration_conflict not marked retriable", "status": 409, "media": "json", "outcome": "refused", "reason": "pending_registration_conflict", "digest": true, "retriable": false, "expected": {"class": "backoff", "reason": "pending_registration_conflict"}, "staged": true},
+    {"name": "409 unknown_key is invalid server output", "status": 409, "media": "json", "outcome": "refused", "reason": "unknown_key", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 malformed is invalid authority output", "status": 422, "media": "json", "outcome": "refused", "reason": "malformed", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 bad_authenticator", "status": 422, "media": "json", "outcome": "refused", "reason": "bad_authenticator", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "bad_authenticator"}, "staged": true},
+    {"name": "422 binding_mismatch", "status": 422, "media": "json", "outcome": "refused", "reason": "binding_mismatch", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "binding_mismatch"}, "staged": true},
+    {"name": "422 commissioning_digest_mismatch", "status": 422, "media": "json", "outcome": "refused", "reason": "commissioning_digest_mismatch", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "commissioning_digest_mismatch"}, "staged": true},
+    {"name": "422 byte reason marked retriable", "status": 422, "media": "json", "outcome": "refused", "reason": "bad_authenticator", "digest": true, "retriable": true, "expected": {"class": "hold", "reason": "bad_authenticator"}, "staged": true},
+    {"name": "422 unrecognised_version", "status": 422, "media": "json", "outcome": "refused", "reason": "unrecognised_version", "digest": true, "retriable": false, "expected": {"class": "handoff", "reason": "unrecognised_version"}, "staged": true},
+    {"name": "422 unknown_key", "status": 422, "media": "json", "outcome": "refused", "reason": "unknown_key", "digest": true, "retriable": false, "expected": {"class": "handoff", "reason": "unknown_key"}, "staged": true},
+    {"name": "422 receiver-state reason marked retriable", "status": 422, "media": "json", "outcome": "refused", "reason": "unknown_key", "digest": true, "retriable": true, "expected": {"class": "handoff", "reason": "unknown_key"}, "staged": true},
+    {"name": "422 wrong_purpose is not a reason on this hop", "status": 422, "media": "json", "outcome": "refused", "reason": "wrong_purpose", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 retired_key is not a reason on this hop", "status": 422, "media": "json", "outcome": "refused", "reason": "retired_key", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 unknown_sequence is not a reason on this hop", "status": 422, "media": "json", "outcome": "refused", "reason": "unknown_sequence", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 non_contiguous_range is not a reason on this hop", "status": 422, "media": "json", "outcome": "refused", "reason": "non_contiguous_range", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 unsupported is not in the vocabulary", "status": 422, "media": "json", "outcome": "refused", "reason": "unsupported", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 with no reason", "status": 422, "media": "json", "outcome": "refused", "reason": "", "digest": true, "retriable": false, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 unknown reason", "status": 422, "media": "json", "outcome": "refused", "reason": "ingest-01.evidence.example.net:8443", "digest": true, "retriable": true, "expected": {"class": "hold", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 authenticated refusal without its digest", "status": 422, "media": "json", "outcome": "refused", "reason": "bad_authenticator", "digest": false, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "422 with no outcome", "status": 422, "media": "json", "reason": "bad_authenticator", "digest": true, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "429 rate_limited", "status": 429, "media": "json", "outcome": "pending", "reason": "rate_limited", "digest": true, "retriable": true, "retry_after_s": 60, "expected": {"class": "retry_after", "reason": "rate_limited"}, "staged": true},
+    {"name": "429 pending_registration_limit", "status": 429, "media": "json", "outcome": "pending", "reason": "pending_registration_limit", "digest": true, "retriable": true, "retry_after_s": 300, "expected": {"class": "retry_after", "reason": "pending_registration_limit"}, "staged": true},
+    {"name": "429 pending_registration_limit without Retry-After", "status": 429, "media": "json", "outcome": "pending", "reason": "pending_registration_limit", "digest": true, "retriable": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "429 rate_limited without Retry-After", "status": 429, "media": "json", "outcome": "pending", "reason": "rate_limited", "digest": true, "retriable": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "429 rate_limited with a negative Retry-After", "status": 429, "media": "json", "outcome": "pending", "reason": "rate_limited", "digest": true, "retriable": true, "retry_after_s": -5, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "429 rate_limited with a boolean Retry-After", "status": 429, "media": "json", "outcome": "pending", "reason": "rate_limited", "digest": true, "retriable": true, "retry_after_s": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "429 unknown reason honours Retry-After as a floor", "status": 429, "media": "json", "outcome": "pending", "reason": "slow_down", "digest": true, "retriable": false, "retry_after_s": 60, "expected": {"class": "backoff", "reason": "unrecognised", "min_wait_s": 60}, "staged": true},
+    {"name": "503 unavailable", "status": 503, "media": "json", "outcome": "pending", "reason": "unavailable", "digest": false, "retriable": true, "expected": {"class": "backoff", "reason": "unavailable"}, "staged": true},
+    {"name": "503 unavailable not marked retriable", "status": 503, "media": "json", "outcome": "pending", "reason": "unavailable", "digest": true, "retriable": false, "expected": {"class": "backoff", "reason": "unavailable"}, "staged": true},
+    {"name": "503 unknown reason", "status": 503, "media": "json", "outcome": "pending", "reason": "10.0.4.17", "digest": false, "retriable": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "503 carrying a refusal", "status": 503, "media": "json", "outcome": "refused", "reason": "unavailable", "digest": false, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "413 plain text from a body limit", "status": 413, "media": "text", "outcome": "", "reason": "", "digest": false, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "404 plain text", "status": 404, "media": "text", "outcome": "", "reason": "", "digest": false, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "405 plain text", "status": 405, "media": "text", "outcome": "", "reason": "", "digest": false, "retriable": false, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "500 json", "status": 500, "media": "json", "outcome": "refused", "reason": "internal", "digest": false, "retriable": true, "expected": {"class": "backoff", "reason": "unrecognised"}, "staged": true},
+    {"name": "400 malformed retained", "status": 400, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "malformed", "retention": "verified", "expected": {"class": "archive", "reason": "malformed"}},
+    {"name": "409 conflict retained", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "verified", "expected": {"class": "archive", "reason": "conflict"}},
+    {"name": "409 conflict retained marked retriable", "status": 409, "media": "json", "digest": true, "retriable": true, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "verified", "expected": {"class": "archive", "reason": "conflict"}},
+    {"name": "422 bad_authenticator retained", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "bad_authenticator", "retention": "verified", "expected": {"class": "archive", "reason": "bad_authenticator"}},
+    {"name": "422 binding_mismatch retained", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "binding_mismatch", "retention": "verified", "expected": {"class": "archive", "reason": "binding_mismatch"}},
+    {"name": "422 commissioning_digest_mismatch retained", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "commissioning_digest_mismatch", "retention": "verified", "expected": {"class": "archive", "reason": "commissioning_digest_mismatch"}},
+    {"name": "409 conflict retained with no retention", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "absent", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained whose MAC does not verify", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "bad_mac", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained under another digest", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "digest_mismatch", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained under another artifact type", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "type_mismatch", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained for another device", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "device_mismatch", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "422 binding_mismatch retained under another status", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "binding_mismatch", "retention": "status_mismatch", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "422 binding_mismatch retained under another reason", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "binding_mismatch", "retention": "reason_mismatch", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained carrying a field the retention does not define", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "extra_field", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained under another retention version", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "wrong_version", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict retained naming an epoch that is not a digest", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "conflict", "retention": "malformed_epoch", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "422 unknown_key cannot be retained", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "unknown_key", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 pending_registration_conflict cannot be retained", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "pending_registration_conflict", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "422 unknown reason retained", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "wrong_purpose", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "403 claiming retention", "status": 403, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "not_authorized", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "507 claiming retention", "status": 507, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "retention_capacity_exhausted", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "400 malformed retained without its digest", "status": 400, "media": "json", "digest": false, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "malformed", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "409 conflict refused carrying a retention", "status": 409, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused", "reason": "conflict", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "422 unknown_key whose returned artifacts were not staged", "status": 422, "media": "json", "digest": true, "retriable": false, "staged": false, "outcome": "refused", "reason": "unknown_key", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "200 acceptance whose returned artifacts were not staged", "status": 200, "media": "json", "digest": true, "retriable": false, "staged": false, "outcome": "accepted", "reason": "", "complete": true, "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "503 retention_capacity_unavailable", "status": 503, "media": "json", "digest": true, "retriable": true, "staged": true, "outcome": "pending", "reason": "retention_capacity_unavailable", "expected": {"class": "backoff", "reason": "retention_capacity_unavailable"}},
+    {"name": "503 retention_capacity_unavailable not marked retriable", "status": 503, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "pending", "reason": "retention_capacity_unavailable", "expected": {"class": "backoff", "reason": "retention_capacity_unavailable"}},
+    {"name": "503 retention_capacity_unavailable claiming retention", "status": 503, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused_retained", "reason": "retention_capacity_unavailable", "retention": "verified", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "507 retention_capacity_exhausted", "status": 507, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused", "reason": "retention_capacity_exhausted", "expected": {"class": "hold", "reason": "retention_capacity_exhausted"}},
+    {"name": "507 retention_capacity_exhausted marked retriable", "status": 507, "media": "json", "digest": true, "retriable": true, "staged": true, "outcome": "refused", "reason": "retention_capacity_exhausted", "expected": {"class": "hold", "reason": "retention_capacity_exhausted"}},
+    {"name": "507 unknown reason", "status": 507, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "refused", "reason": "insufficient_storage", "expected": {"class": "hold", "reason": "unrecognised"}},
+    {"name": "507 without its digest", "status": 507, "media": "json", "digest": false, "retriable": false, "staged": true, "outcome": "refused", "reason": "retention_capacity_exhausted", "expected": {"class": "backoff", "reason": "unrecognised"}},
+    {"name": "507 as pending", "status": 507, "media": "json", "digest": true, "retriable": false, "staged": true, "outcome": "pending", "reason": "retention_capacity_exhausted", "expected": {"class": "backoff", "reason": "unrecognised"}}
+  ],
+  "sequences": [
+    {
+      "name": "422 unknown_key is retried on the next handoff, never on a timer, and accepted once the key is active",
+      "steps": [
+        {"event": "deliver", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "timer_elapsed", "expect": "no_attempt"},
+        {"event": "handoff", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "an unsupported artifact version is retried on the next handoff and accepted after an upgrade",
+      "steps": [
+        {"event": "deliver", "response": {"status": 422, "reason": "unrecognised_version"}, "expect": "retained"},
+        {"event": "timer_elapsed", "expect": "no_attempt"},
+        {"event": "restart", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "a durable hold stays held across handoffs, timers and restarts",
+      "steps": [
+        {"event": "deliver", "response": {"status": 422, "reason": "bad_authenticator"}, "expect": "held"},
+        {"event": "handoff", "expect": "no_attempt"},
+        {"event": "timer_elapsed", "expect": "no_attempt"},
+        {"event": "restart", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "429 is retried no earlier than Retry-After, across a restart",
+      "steps": [
+        {"event": "deliver", "response": {"status": 429, "reason": "rate_limited", "retry_after_s": 60}, "expect": "retained"},
+        {"event": "handoff", "expect": "no_attempt_before_retry_after"},
+        {"event": "timer_elapsed", "expect": "no_attempt_before_retry_after"},
+        {"event": "restart", "expect": "no_attempt_before_retry_after"},
+        {"event": "retry_after_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "every retry carries a fresh transport envelope over unchanged artifact bytes",
+      "steps": [
+        {"event": "deliver", "response": {"status": 401, "reason": "stale"}, "expect": "retained"},
+        {"event": "handoff", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "a courier restart is a handoff",
+      "steps": [
+        {"event": "deliver", "response": {"status": 403, "reason": "not_authorized"}, "expect": "retained"},
+        {"event": "timer_elapsed", "expect": "no_attempt"},
+        {"event": "restart", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "a handoff or a restart never brings a back-off forward",
+      "steps": [
+        {"event": "deliver", "response": {"status": 503, "reason": "unavailable"}, "expect": "retained"},
+        {"event": "handoff", "expect": "no_attempt_before_backoff"},
+        {"event": "restart", "expect": "no_attempt_before_backoff"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "an unrecognised outcome backs off and never retires",
+      "steps": [
+        {"event": "deliver", "response": {"status": 413}, "expect": "retained"},
+        {"event": "handoff", "expect": "no_attempt_before_backoff"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 413}},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "a registration conflict backs off in its own lane and resolves once commissioning does",
+      "steps": [
+        {"event": "deliver", "lane": "registration", "response": {"status": 409, "reason": "pending_registration_conflict"}, "expect": "retained"},
+        {"event": "deliver", "lane": "evidence", "response": {"status": 200}, "expect": "retired"},
+        {"event": "handoff", "lane": "registration", "expect": "no_attempt_before_backoff"},
+        {"event": "backoff_elapsed", "lane": "registration", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "pending_registration_conflict"}},
+        {"event": "backoff_elapsed", "lane": "registration", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 422, "reason": "commissioning_digest_mismatch", "outcome": "refused_retained"}, "then": "archived"},
+        {"event": "deliver", "lane": "registration", "response": {"status": 200}, "expect": "retired"}
+      ]
+    },
+    {
+      "name": "a retired registration is a handoff for the device's evidence lane",
+      "steps": [
+        {"event": "deliver", "lane": "evidence", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "deliver", "lane": "registration", "response": {"status": 409, "reason": "pending_registration_conflict"}, "expect": "retained"},
+        {"event": "timer_elapsed", "lane": "evidence", "expect": "no_attempt"},
+        {"event": "backoff_elapsed", "lane": "registration", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}},
+        {"event": "registration_retired", "lane": "evidence", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "a new artifact in one lane is a handoff for the device's other lane",
+      "steps": [
+        {"event": "deliver", "lane": "evidence", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "timer_elapsed", "lane": "evidence", "expect": "no_attempt"},
+        {"event": "artifact_handed_off_in_other_lane", "lane": "evidence", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}}
+      ]
+    },
+    {
+      "name": "a terminal registration refusal is archived and never blocks a later registration",
+      "steps": [
+        {"event": "deliver", "lane": "registration", "response": {"status": 422, "reason": "commissioning_digest_mismatch", "outcome": "refused_retained"}, "expect": "archived"},
+        {"event": "deliver", "lane": "registration", "response": {"status": 200}, "expect": "retired"}
+      ]
+    },
+    {
+      "name": "a registration refusal answered without retention is held, and a hold not yet durable is sent once more after a restart",
+      "steps": [
+        {"event": "deliver", "lane": "registration", "response": {"status": 400, "reason": "malformed"}, "hold_persisted": false, "expect": "held"},
+        {"event": "restart", "lane": "registration", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 400, "reason": "malformed"}}
+      ]
+    },
+    {
+      "name": "an evidence-lane hold stays at the head of its lane",
+      "steps": [
+        {"event": "deliver", "lane": "evidence", "response": {"status": 409, "reason": "conflict"}, "expect": "held"},
+        {"event": "handoff", "lane": "evidence", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "a registration accepted pending is re-offered as a new admission only while the runtime holds neither a confirmation nor a disposition",
+      "steps": [
+        {"event": "deliver", "lane": "registration", "response": {"status": 200}, "expect": "retired"},
+        {"event": "deliver", "lane": "registration", "response": {"status": 200}, "expect": "retired"}
+      ]
+    },
+    {
+      "name": "one device's hold never delays another device",
+      "steps": [
+        {"event": "deliver", "device": "device-a", "response": {"status": 409, "reason": "conflict"}, "expect": "held"},
+        {"event": "deliver", "device": "device-b", "response": {"status": 200}, "expect": "retired"},
+        {"event": "handoff", "device": "device-a", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "a hold not yet durable is sent once more per process that starts without it",
+      "steps": [
+        {"event": "deliver", "response": {"status": 409, "reason": "conflict"}, "hold_persisted": false, "expect": "held"},
+        {"event": "handoff", "expect": "no_attempt"},
+        {"event": "restart", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict"}, "hold_persisted": false},
+        {"event": "restart", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict"}},
+        {"event": "restart", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "a retained checkpoint rollback is archived and the next envelope is delivered",
+      "steps": [
+        {"event": "deliver", "response": {"status": 200}, "expect": "retired"},
+        {"event": "deliver", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained"}, "expect": "archived"},
+        {"event": "deliver", "response": {"status": 200}, "expect": "retired"}
+      ]
+    },
+    {
+      "name": "an archive survives a restart and is never re-sent",
+      "steps": [
+        {"event": "deliver", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained"}, "expect": "archived"},
+        {"event": "restart", "expect": "no_attempt"},
+        {"event": "handoff", "expect": "no_attempt"},
+        {"event": "timer_elapsed", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "an archive that cannot commit leaves the head held, and the identical retry after a restart archives it",
+      "steps": [
+        {"event": "deliver", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained"}, "archive_persisted": false, "expect": "held"},
+        {"event": "handoff", "expect": "no_attempt"},
+        {"event": "timer_elapsed", "expect": "no_attempt"},
+        {"event": "restart", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained"}, "then": "archived"},
+        {"event": "restart", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "a terminal refusal answered without retention is held in either lane",
+      "steps": [
+        {"event": "deliver", "lane": "evidence", "response": {"status": 422, "reason": "binding_mismatch"}, "expect": "held"},
+        {"event": "deliver", "lane": "registration", "response": {"status": 422, "reason": "commissioning_digest_mismatch"}, "expect": "held"},
+        {"event": "restart", "lane": "evidence", "expect": "no_attempt"},
+        {"event": "restart", "lane": "registration", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "a retention that does not bind never releases the gateway copy, and the verified retry archives it",
+      "steps": [
+        {"event": "deliver", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained", "retention": "digest_mismatch"}, "expect": "retained"},
+        {"event": "handoff", "expect": "no_attempt_before_backoff"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained", "retention": "device_mismatch"}, "then": "retained"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained", "retention": "bad_mac"}, "then": "retained"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained"}, "then": "archived"}
+      ]
+    },
+    {
+      "name": "a 507 holds only that device's lane while its other lane and another device deliver",
+      "steps": [
+        {"event": "deliver", "device": "device-a", "lane": "evidence", "response": {"status": 507, "reason": "retention_capacity_exhausted"}, "expect": "held"},
+        {"event": "deliver", "device": "device-a", "lane": "registration", "response": {"status": 200}, "expect": "retired"},
+        {"event": "deliver", "device": "device-b", "lane": "evidence", "response": {"status": 200}, "expect": "retired"},
+        {"event": "handoff", "device": "device-a", "lane": "evidence", "expect": "no_attempt"},
+        {"event": "restart", "device": "device-a", "lane": "evidence", "expect": "no_attempt"}
+      ]
+    },
+    {
+      "name": "non-terminal refusals stay active and are delivered once their condition changes",
+      "steps": [
+        {"event": "deliver", "device": "device-a", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "deliver", "device": "device-b", "lane": "registration", "response": {"status": 409, "reason": "pending_registration_conflict"}, "expect": "retained"},
+        {"event": "deliver", "device": "device-c", "lane": "registration", "response": {"status": 429, "reason": "pending_registration_limit", "retry_after_s": 300}, "expect": "retained"},
+        {"event": "deliver", "device": "device-d", "response": {"status": 503, "reason": "unavailable"}, "expect": "retained"},
+        {"event": "handoff", "device": "device-a", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"},
+        {"event": "backoff_elapsed", "device": "device-b", "lane": "registration", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"},
+        {"event": "retry_after_elapsed", "device": "device-c", "lane": "registration", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"},
+        {"event": "backoff_elapsed", "device": "device-d", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"}
+      ]
+    },
+    {
+      "name": "an authenticated queue_full for a configured device is a handoff for its waiting head",
+      "steps": [
+        {"event": "deliver", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "timer_elapsed", "expect": "no_attempt"},
+        {"event": "queue_full", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 422, "reason": "unknown_key"}, "then": "retained"},
+        {"event": "queue_full", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"}
+      ]
+    },
+    {
+      "name": "a pending registration's confirmation returns through a queue_full handoff on a minimum share",
+      "steps": [
+        {"event": "deliver", "lane": "registration", "response": {"status": 200}, "expect": "retired"},
+        {"event": "deliver", "lane": "evidence", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "timer_elapsed", "lane": "evidence", "expect": "no_attempt"},
+        {"event": "queue_full", "lane": "evidence", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"}
+      ]
+    },
+    {
+      "name": "a queue_full from an unconfigured device or an unauthenticated admission is no handoff",
+      "steps": [
+        {"event": "deliver", "response": {"status": 422, "reason": "unknown_key"}, "expect": "retained"},
+        {"event": "queue_full_unconfigured_device", "expect": "no_attempt"},
+        {"event": "admission_unauthenticated", "expect": "no_attempt"},
+        {"event": "restart", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"}
+      ]
+    },
+    {
+      "name": "a queue_full handoff never brings a back-off or a Retry-After forward",
+      "steps": [
+        {"event": "deliver", "device": "device-a", "response": {"status": 503, "reason": "unavailable"}, "expect": "retained"},
+        {"event": "queue_full", "device": "device-a", "expect": "no_attempt_before_backoff"},
+        {"event": "deliver", "device": "device-b", "response": {"status": 429, "reason": "rate_limited", "retry_after_s": 60}, "expect": "retained"},
+        {"event": "queue_full", "device": "device-b", "expect": "no_attempt_before_retry_after"},
+        {"event": "backoff_elapsed", "device": "device-a", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 200}, "then": "retired"}
+      ]
+    },
+    {
+      "name": "a 503 retention_capacity_unavailable backs off without custody until capacity is restored, never by eviction",
+      "steps": [
+        {"event": "deliver", "response": {"status": 503, "reason": "retention_capacity_unavailable"}, "expect": "retained"},
+        {"event": "handoff", "expect": "no_attempt_before_backoff"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 503, "reason": "retention_capacity_unavailable"}, "then": "retained"},
+        {"event": "backoff_elapsed", "expect": "attempt_fresh_envelope_same_bytes", "response": {"status": 409, "reason": "conflict", "outcome": "refused_retained"}, "then": "archived"}
+      ]
+    }
+  ]
+}

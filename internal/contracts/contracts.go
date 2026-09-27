@@ -6,6 +6,8 @@ package contracts
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -259,6 +261,24 @@ func ExportResponseTopicFilter(deviceID string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("ori/%s/export/response/+", deviceID), nil
+}
+
+// ValidEvidenceRoutingDeviceID applies the routing domain of an evidence
+// artifact's device_id (evidence-exchange/v1, gateway-api/v1): 1 to 128
+// Unicode scalar values, none of them a control character (general category
+// Cc), a character with the Unicode White_Space property, "/", "+" or "#".
+// The admission path, the store, and configuration share this one rule.
+func ValidEvidenceRoutingDeviceID(deviceID string) bool {
+	if deviceID == "" || !utf8.ValidString(deviceID) || utf8.RuneCountInString(deviceID) > 128 {
+		return false
+	}
+	for _, r := range deviceID {
+		// unicode.IsSpace is the Unicode White_Space property.
+		if unicode.Is(unicode.Cc, r) || unicode.IsSpace(r) || r == '/' || r == '+' || r == '#' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateMQTTDeviceID(deviceID string) error {

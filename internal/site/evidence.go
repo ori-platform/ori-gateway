@@ -3,6 +3,8 @@
 
 package site
 
+import "slices"
+
 // NodeEvidence is the registry's view of one node's evidence-chain signal,
 // enriched with the gateway-side integrity observations that a single
 // heartbeat cannot carry.
@@ -59,12 +61,7 @@ func (t *evidenceTrack) sawHeadBeforeCurrent(head string) bool {
 	if len(t.recentHeads) < 2 {
 		return false
 	}
-	for _, h := range t.recentHeads[:len(t.recentHeads)-1] {
-		if h == head {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(t.recentHeads[:len(t.recentHeads)-1], head)
 }
 
 func (t *evidenceTrack) recordHead(head string) {

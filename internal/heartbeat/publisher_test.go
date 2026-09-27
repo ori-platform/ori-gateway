@@ -89,8 +89,7 @@ func TestHeartbeatPublishes(t *testing.T) {
 	brokerURL, stop := startTestBroker(t)
 	defer stop()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	client, err := broker.New(broker.Options{
 		BrokerURL: brokerURL,
@@ -176,8 +175,7 @@ func TestHeartbeatPublishesHealthyAfterFirst(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval: 10 * time.Millisecond,
@@ -223,8 +221,7 @@ func TestHeartbeatRestartOnPanic(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval: time.Hour,
@@ -252,8 +249,7 @@ func TestHeartbeatFailureLimit(t *testing.T) {
 		return errors.New("publish failed")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval:     1 * time.Millisecond,
@@ -290,8 +286,7 @@ func TestHeartbeatPublishesImmediately(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	started := time.Now()
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
@@ -333,8 +328,7 @@ func TestHeartbeatProviderDegradedStatus(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "llama_cpp", healthy: false}, SIMStatus{}, Options{
 		Interval: 20 * time.Millisecond,
@@ -421,8 +415,7 @@ func TestHeartbeatTimestampsMonotonic(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval:  1 * time.Millisecond,
@@ -469,8 +462,7 @@ func TestHeartbeatUptimeIsFloat64(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	startedAt := time.Unix(0, 0)
 	now := startedAt.Add(2500 * time.Millisecond)
@@ -513,8 +505,7 @@ func TestHeartbeatUnsignedWhenAuthDisabled(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval: time.Hour,
@@ -546,8 +537,7 @@ func TestHeartbeatSignedWhenAuthEnabled(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	startedAt := time.Unix(1_700_000_000, 0)
 	now := startedAt.Add(2500 * time.Millisecond)
@@ -593,8 +583,7 @@ func TestSignedHeartbeatIncludesWebhookBridgeInCanonicalPayload(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	startedAt := time.Unix(1_700_000_000, 0)
 	now := startedAt.Add(time.Second)
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
@@ -675,8 +664,7 @@ func TestHeartbeatIncludesWebhookBridgePosture(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
 		Interval: time.Hour,

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"sync"
 	"time"
@@ -276,7 +277,7 @@ func (c *MQTTClient) exportAll(ctx context.Context, base exportRequest) ([]map[s
 	var all []map[string]any
 	pageToken := ""
 	seenPageTokens := make(map[string]bool)
-	for page := 0; page < maxExportPages; page++ {
+	for range maxExportPages {
 		base.PageToken = pageToken
 		resp, err := c.requestPage(ctx, base)
 		if err != nil {
@@ -964,8 +965,6 @@ func mapValue(m map[string]any, key string) map[string]any {
 		return nil
 	}
 	out := make(map[string]any, len(raw))
-	for k, v := range raw {
-		out[k] = v
-	}
+	maps.Copy(out, raw)
 	return out
 }

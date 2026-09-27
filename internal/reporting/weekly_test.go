@@ -213,8 +213,9 @@ func TestWeeklyReportBuildsInputFromRuntimeExports(t *testing.T) {
 	}
 }
 
+//go:fix inline
 func int64Pointer(value int64) *int64 {
-	return &value
+	return new(value)
 }
 
 func TestWeeklyReportCallsReportingProvider(t *testing.T) {

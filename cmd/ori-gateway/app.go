@@ -8,6 +8,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/ori-platform/ori-gateway/internal/evidence/custody"
+	"github.com/ori-platform/ori-gateway/internal/evidence/faults"
+	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
 	"log/slog"
 	"os"
@@ -24,7 +27,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/dispatcher"
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
-	"github.com/ori-platform/ori-gateway/internal/evidence"
+	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -171,17 +174,18 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// acknowledgements that can never arrive is the failure mode this ordering
 	// removes. It is held rather than used: nothing routes an acknowledgement
 	// outbound until the inbound path lands.
-	var custodySigner *evidence.CustodySigner
+	var custodySigner *custody.Signer
 	if custodySecret != "" {
-		custodySigner, err = evidence.NewCustodySigner(custodySecret)
+		custodySigner, err = custody.NewSigner(custodySecret)
 		if err != nil {
 			return fmt.Errorf("construct custody signer: %w", err)
 		}
 	}
 
-	var evidenceQueue *evidence.DurableQueue
-	var evidenceWorker *evidence.DeliveryWorker
-	var authoritySink *evidence.DurableAuthoritySink
+	var evidenceQueue *courier.DurableQueue
+	var evidenceFaults *faults.Recorder
+	var evidenceWorker *courier.DeliveryWorker
+	var authoritySink *courier.DurableAuthoritySink
 	if cfg.Evidence.Enabled {
 		if !gatewaySecrets.Enabled || custodySigner == nil {
 			return fmt.Errorf("evidence courier requires gateway auth and dedicated custody configuration")
@@ -190,27 +194,43 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return err
 		}
-		evidenceQueue, err = evidence.OpenDurableQueue(evidence.QueueOptions{
-			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes, Now: deps.now,
+		// Once any device declares gateway-evidence-carriage/v1, capacity is
+		// reserved per configured device: each holds an equal share of
+		// max_items and max_bytes, so one device cannot exhaust another's. A
+		// site that declares nothing keeps one gateway-wide share.
+		evidenceFaults = faults.NewRecorder()
+		evidenceQueue, err = courier.OpenDurableQueue(courier.QueueOptions{
+			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
+			Devices: cfg.Gateway.DeviceIDs, ReserveDeviceShares: cfg.Evidence.DeclaresVersionedCarriage(),
+			VersionedDevices: cfg.Evidence.VersionedDevices(),
+			Faults:           evidenceFaults, FaultSource: "outbound", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence outbound queue: %w", err)
 		}
-		authoritySink, err = evidence.OpenDurableAuthoritySink(evidence.QueueOptions{
-			Directory: cfg.Evidence.ReturnQueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes, Now: deps.now,
+		authoritySink, err = courier.OpenDurableAuthoritySink(courier.QueueOptions{
+			Directory: cfg.Evidence.ReturnQueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
+			Faults: evidenceFaults, FaultSource: "return", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence return queue: %w", err)
 		}
-		channel, err := evidence.NewHTTPChannel(evidence.HTTPChannelOptions{
+		channel, err := courier.NewHTTPChannel(courier.HTTPChannelOptions{
 			Endpoint: channelConfig.endpoint, ClientID: channelConfig.clientID, Secret: channelConfig.secret, Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("construct independent evidence channel")
 		}
-		evidenceWorker, err = evidence.NewDeliveryWorker(
+		backoffBase, backoffBound := cfg.Evidence.Backoff()
+		evidenceWorker, err = courier.NewDeliveryWorker(
 			evidenceQueue, channel, authoritySink,
-			evidence.DeliveryWorkerOptions{RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second},
+			courier.DeliveryWorkerOptions{
+				RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second,
+				BackoffBase:   backoffBase,
+				MaxBackoff:    backoffBound,
+				Faults:        evidenceFaults,
+				Logger:        deps.logger,
+			},
 		)
 		if err != nil {
 			return fmt.Errorf("construct evidence delivery worker: %w", err)
@@ -348,21 +368,21 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if weeklyReport != nil {
 		runners.start("weekly report runner", weeklyReport.Run)
 	}
-	var evidenceIngress *evidence.RuntimeIngress
-	var returnPublisher *evidence.ReturnPublisher
+	var evidenceIngress *courier.RuntimeIngress
+	var returnPublisher *courier.ReturnPublisher
 	if evidenceWorker != nil {
-		courier, err := evidence.NewCourier(evidenceQueue, custodySigner)
+		evidenceCourier, err := courier.NewCourier(evidenceQueue, custodySigner)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("construct evidence courier: %w", err)
 		}
-		ackClock, err := evidence.OpenAckSigningClock(cfg.Evidence.QueueDirectory, deps.now)
+		ackClock, err := signingclock.OpenAck(cfg.Evidence.QueueDirectory, deps.now)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("open evidence acknowledgement clock: %w", err)
 		}
-		evidenceIngress, err = evidence.NewRuntimeIngress(
-			courier,
+		evidenceIngress, err = courier.NewRuntimeIngress(
+			evidenceCourier,
 			authoritySink,
 			ackClock,
 			evidenceBroker.Publish,
@@ -373,12 +393,12 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence runtime ingress: %w", err)
 		}
-		returnClock, err := evidence.OpenReturnSigningClock(cfg.Evidence.ReturnQueueDirectory, deps.now)
+		returnClock, err := signingclock.OpenReturn(cfg.Evidence.ReturnQueueDirectory, deps.now)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("open evidence return signing clock: %w", err)
 		}
-		returnPublisher, err = evidence.NewReturnPublisher(
+		returnPublisher, err = courier.NewReturnPublisher(
 			authoritySink, returnClock, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
 			deps.now, time.Duration(cfg.Evidence.RetryIntervalS)*time.Second,
 		)
@@ -387,7 +407,17 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			return fmt.Errorf("construct evidence return publisher: %w", err)
 		}
 		evidenceIngress.SetReturnNotifier(returnPublisher.Notify)
+		evidenceIngress.SetFaultRecorder(evidenceFaults)
 		runners.start("evidence delivery worker", evidenceWorker.Run)
+		// Each durable store was probed when it opened; these keep probing it,
+		// independently of admissions and of health publication.
+		probeInterval := cfg.Evidence.StoreProbeInterval()
+		runners.start("evidence outbound store probe", func(ctx context.Context) error {
+			return evidenceQueue.ProbeLoop(ctx, probeInterval)
+		})
+		runners.start("evidence return store probe", func(ctx context.Context) error {
+			return authoritySink.ProbeLoop(ctx, probeInterval)
+		})
 		runners.start("evidence return publisher", returnPublisher.Run)
 	}
 	if webhookBridge != nil {
@@ -490,15 +520,27 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 		if err := evidenceBroker.Subscribe(runCtx, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 			deviceID, parseErr := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
-			if parseErr != nil || !allowedDevices[deviceID] {
+			if parseErr != nil {
 				deps.logger.Warn("evidence outbound transport refused")
+				return
+			}
+			// An unconfigured device is rejected before admission: nothing is
+			// admitted, no custody is issued and no acknowledgement is
+			// published, so the runtime keeps its bytes and retries
+			// (gateway-api/v1). The observation raises device_unconfigured,
+			// which never carries the device ID.
+			if !allowedDevices[deviceID] {
+				_ = evidenceQueue.NoteUnconfiguredDevice(deviceID)
+				deps.logger.Warn("evidence outbound carriage for an unconfigured device refused")
 				return
 			}
 			if err := evidenceIngress.Handle(runCtx, topic, payload); err != nil {
 				deps.logger.Warn("evidence outbound transport refused")
 				return
 			}
-			evidenceWorker.Notify()
+			// A handoff for both of this device's lanes only: it retries
+			// their handoff-only refusals and never touches another device's.
+			evidenceWorker.NotifyDevice(deviceID)
 			// A newly observed runtime artifact can repair receiver-state
 			// refusals such as unknown_sequence, and commonly follows a runtime
 			// release that installs an authority key or version. Retry retained
@@ -642,7 +684,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}
 }
 
-func evidenceDeliveryView(worker *evidence.DeliveryWorker) *site.GatewayEvidenceDeliveryView {
+func evidenceDeliveryView(worker *courier.DeliveryWorker) *site.GatewayEvidenceDeliveryView {
 	if worker == nil {
 		return nil
 	}
@@ -655,6 +697,22 @@ func evidenceDeliveryView(worker *evidence.DeliveryWorker) *site.GatewayEvidence
 	}
 	if !status.LastFailureAt.IsZero() {
 		view.LastFailureAtMS = status.LastFailureAt.UnixMilli()
+	}
+	view.Faults = append([]string{}, status.Faults...)
+	view.Devices = make([]site.GatewayEvidenceDeliveryDevice, 0, len(status.Devices))
+	for _, device := range status.Devices {
+		entry := site.GatewayEvidenceDeliveryDevice{
+			DeviceID: device.DeviceID, Lane: string(device.Lane), Pending: device.Pending, State: device.State,
+		}
+		if device.Held != nil {
+			entry.Held = &site.GatewayEvidenceDeliveryHeld{
+				QueueRecord: device.Held.QueueRecord, ArtifactDigest: device.Held.ArtifactDigest,
+				ArtifactType: string(device.Held.ArtifactType), RefusalStatus: device.Held.RefusalStatus,
+				Reason: device.Held.Reason, FirstHeldAtMS: device.Held.FirstHeldAt.UnixMilli(),
+				Acknowledged: device.Held.Acknowledged,
+			}
+		}
+		view.Devices = append(view.Devices, entry)
 	}
 	return view
 }
@@ -852,7 +910,7 @@ func resolveCustodySecret(
 	}
 	// Read exactly as provisioned. The custody MAC keys from these bytes, so
 	// trimming would key from bytes the operator did not set and derive an
-	// identifier no conforming peer reproduces; evidence.NewCustodySigner
+	// identifier no conforming peer reproduces; custody.NewSigner
 	// refuses surrounding whitespace instead.
 	secret := os.Getenv(envName)
 	if secret == "" {

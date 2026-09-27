@@ -66,8 +66,7 @@ func DegradationVerdict(err error) string {
 	if err == nil {
 		return ""
 	}
-	var de *DegradationError
-	if errors.As(err, &de) {
+	if de, ok := errors.AsType[*DegradationError](err); ok {
 		return de.Verdict
 	}
 	return ""

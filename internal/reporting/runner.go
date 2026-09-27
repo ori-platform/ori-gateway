@@ -100,10 +100,7 @@ func (r *WeeklyReportRunner) Run(ctx context.Context) error {
 	for {
 		now := r.now()
 		next := NextRun(now, r.schedule)
-		wait := next.Sub(now)
-		if wait < 0 {
-			wait = 0
-		}
+		wait := max(next.Sub(now), 0)
 		r.logger.Info("weekly report scheduled", "next_run", next.Format(time.RFC3339), "device_id", r.request.DeviceID)
 		select {
 		case <-ctx.Done():

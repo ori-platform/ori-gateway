@@ -10,10 +10,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 )
 
 const (
@@ -22,7 +26,12 @@ const (
 	DefaultGatewayAuthSecretEnv = "GATEWAY_SHARED_SECRET"
 	DefaultEvidenceMaxItems     = 10000
 	DefaultEvidenceMaxBytes     = int64(256 << 20)
-	DefaultEvidenceRetryS       = 5
+	DefaultEvidenceBackoffMaxS  = 300
+
+	DefaultEvidenceStoreProbeIntervalS = 900
+	MinEvidenceStoreProbeIntervalS     = 300
+	MaxEvidenceStoreProbeIntervalS     = 900
+	DefaultEvidenceRetryS              = 5
 
 	DefaultWebhookBridgeListenAddr       = "127.0.0.1:8090"
 	DefaultSiteHealthListenAddr          = "127.0.0.1:8765"
@@ -99,9 +108,79 @@ type EvidenceConfig struct {
 	MaxItems             int    `yaml:"max_items"`
 	MaxBytes             int64  `yaml:"max_bytes"`
 	RetryIntervalS       int    `yaml:"retry_interval_s"`
-	EndpointEnv          string `yaml:"endpoint_env"`
-	ClientIDEnv          string `yaml:"client_id_env"`
-	SecretEnv            string `yaml:"secret_env"`
+	// BackoffBaseS and BackoffMaxS are the courier's back-off base and bound.
+	// evidence-transport/v2 requires bound >= base >= delivery interval, which
+	// the loader enforces when a device declares gateway-evidence-carriage/v1.
+	BackoffBaseS int `yaml:"backoff_base_s"`
+	BackoffMaxS  int `yaml:"backoff_max_s"`
+	// StoreProbeIntervalS is how often each durable evidence store is probed,
+	// 300 through 900 seconds when a device declares gateway-evidence-carriage/v1
+	// (gateway-config/v2).
+	StoreProbeIntervalS int    `yaml:"store_probe_interval_s"`
+	EndpointEnv         string `yaml:"endpoint_env"`
+	ClientIDEnv         string `yaml:"client_id_env"`
+	SecretEnv           string `yaml:"secret_env"`
+	// DeviceCarriage is each configured device's declared inbound evidence
+	// carriage, every configured device named, after defaults
+	// (gateway-config/v2). Nil while the courier is disabled.
+	DeviceCarriage map[string]string
+}
+
+// The two evidence-carriage contracts a device may declare in
+// evidence.device_carriage.
+const (
+	CarriageGatewayAPIV1       = "gateway-api/v1"
+	CarriageEvidenceCarriageV1 = "gateway-evidence-carriage/v1"
+)
+
+// DeclaresVersionedCarriage reports whether any configured device declares
+// gateway-evidence-carriage/v1, the condition that activates the versioned
+// carriage's rules.
+func (c EvidenceConfig) DeclaresVersionedCarriage() bool {
+	for _, carriage := range c.DeviceCarriage {
+		if carriage == CarriageEvidenceCarriageV1 {
+			return true
+		}
+	}
+	return false
+}
+
+// VersionedDevices lists the configured devices that declare
+// gateway-evidence-carriage/v1.
+func (c EvidenceConfig) VersionedDevices() []string {
+	var out []string
+	for device, carriage := range c.DeviceCarriage {
+		if carriage == CarriageEvidenceCarriageV1 {
+			out = append(out, device)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// StoreProbeInterval is the interval each durable evidence store is probed
+// at. store_probe_interval_s is consumed only once a device declares
+// gateway-evidence-carriage/v1, when the loader has held it to its range; a
+// site that declares nothing probes at the default, whatever it carries
+// (gateway-config/v2: the key is a design target for such a site).
+func (c EvidenceConfig) StoreProbeInterval() time.Duration {
+	if !c.DeclaresVersionedCarriage() {
+		return DefaultEvidenceStoreProbeIntervalS * time.Second
+	}
+	return time.Duration(c.StoreProbeIntervalS) * time.Second
+}
+
+// Backoff is the courier's back-off base and bound. backoff_base_s and
+// backoff_max_s are consumed only once a device declares
+// gateway-evidence-carriage/v1, when the loader has held them to their
+// ordering; a site that declares nothing backs off from its delivery interval
+// to the default bound, whatever it carries.
+func (c EvidenceConfig) Backoff() (base, bound time.Duration) {
+	if !c.DeclaresVersionedCarriage() {
+		base = time.Duration(c.RetryIntervalS) * time.Second
+		return base, max(DefaultEvidenceBackoffMaxS*time.Second, base)
+	}
+	return time.Duration(c.BackoffBaseS) * time.Second, time.Duration(c.BackoffMaxS) * time.Second
 }
 
 type ProviderConfig struct {
@@ -251,9 +330,15 @@ type fileEvidenceConfig struct {
 	MaxItems             *int   `yaml:"max_items"`
 	MaxBytes             *int64 `yaml:"max_bytes"`
 	RetryIntervalS       *int   `yaml:"retry_interval_s"`
+	BackoffBaseS         *int   `yaml:"backoff_base_s"`
+	BackoffMaxS          *int   `yaml:"backoff_max_s"`
+	StoreProbeIntervalS  *int   `yaml:"store_probe_interval_s"`
 	EndpointEnv          string `yaml:"endpoint_env"`
 	ClientIDEnv          string `yaml:"client_id_env"`
 	SecretEnv            string `yaml:"secret_env"`
+	// DeviceCarriage is decoded as supplied; a value that is not a map of
+	// strings fails the decode rather than reading as legacy.
+	DeviceCarriage map[string]string `yaml:"device_carriage"`
 }
 
 // Load reads and validates gateway configuration from path.
@@ -391,7 +476,7 @@ func (f *fileConfig) normalize() (Config, error) {
 	if err := validateSiteHealth(cfg.SiteHealth); err != nil {
 		return Config{}, err
 	}
-	if err := validateEvidence(cfg.Evidence); err != nil {
+	if err := validateEvidence(&cfg.Evidence, cfg.Gateway.DeviceIDs); err != nil {
 		return Config{}, err
 	}
 
@@ -411,7 +496,24 @@ func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
 	if raw.RetryIntervalS != nil {
 		retry = *raw.RetryIntervalS
 	}
+	// Unset, the base is the delivery interval and the bound is five minutes
+	// or the base, whichever is longer; set, they are validated as given.
+	base := retry
+	if raw.BackoffBaseS != nil {
+		base = *raw.BackoffBaseS
+	}
+	bound := max(DefaultEvidenceBackoffMaxS, base)
+	if raw.BackoffMaxS != nil {
+		bound = *raw.BackoffMaxS
+	}
+	probe := DefaultEvidenceStoreProbeIntervalS
+	if raw.StoreProbeIntervalS != nil {
+		probe = *raw.StoreProbeIntervalS
+	}
 	return EvidenceConfig{
+		StoreProbeIntervalS:  probe,
+		BackoffBaseS:         base,
+		BackoffMaxS:          bound,
 		Enabled:              raw.Enabled,
 		QueueDirectory:       strings.TrimSpace(raw.QueueDirectory),
 		ReturnQueueDirectory: strings.TrimSpace(raw.ReturnQueueDirectory),
@@ -421,11 +523,21 @@ func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
 		EndpointEnv:          strings.TrimSpace(raw.EndpointEnv),
 		ClientIDEnv:          strings.TrimSpace(raw.ClientIDEnv),
 		SecretEnv:            strings.TrimSpace(raw.SecretEnv),
+		DeviceCarriage:       raw.DeviceCarriage,
 	}
 }
 
-func validateEvidence(cfg EvidenceConfig) error {
+// validateEvidence checks the evidence courier. Two rule sets apply
+// (gateway-config/v2): the courier's own keys whenever it is enabled, and the
+// versioned carriage's rules only when at least one configured device declares
+// gateway-evidence-carriage/v1. A site that declares nothing keeps exactly the
+// courier's own validation, so an upgrade refuses no configuration it accepted.
+// With the courier enabled, a supplied declaration is validated even when it
+// declares nothing: an invalid one is refused, never read as legacy. A disabled
+// courier validates none of its keys, the declaration included.
+func validateEvidence(cfg *EvidenceConfig, deviceIDs []string) error {
 	if !cfg.Enabled {
+		cfg.DeviceCarriage = nil
 		return nil
 	}
 	if !filepath.IsAbs(cfg.QueueDirectory) || !filepath.IsAbs(cfg.ReturnQueueDirectory) {
@@ -446,7 +558,66 @@ func validateEvidence(cfg EvidenceConfig) error {
 			return err
 		}
 	}
+	carriage, err := resolveDeviceCarriage(cfg.DeviceCarriage, deviceIDs)
+	if err != nil {
+		return err
+	}
+	cfg.DeviceCarriage = carriage
+	if !cfg.DeclaresVersionedCarriage() {
+		return nil
+	}
+	// The versioned carriage's rules, refused at load before any lane opens.
+	for _, deviceID := range deviceIDs {
+		if carriage[deviceID] != CarriageEvidenceCarriageV1 {
+			continue
+		}
+		if err := validateEvidenceDeviceID(deviceID); err != nil {
+			return err
+		}
+	}
+	if cfg.BackoffMaxS < cfg.BackoffBaseS || cfg.BackoffBaseS < cfg.RetryIntervalS {
+		return fmt.Errorf("evidence back-off must satisfy backoff_max_s >= backoff_base_s >= retry_interval_s (got %d, %d, %d)",
+			cfg.BackoffMaxS, cfg.BackoffBaseS, cfg.RetryIntervalS)
+	}
+	// Capacity is shared across every configured device, legacy lanes
+	// included: each consumes its share.
+	devices := len(deviceIDs)
+	if devices > 0 && (cfg.MaxItems/devices < courier.MinDeviceShareItems || cfg.MaxBytes/int64(devices) < courier.MinDeviceShareBytes) {
+		return fmt.Errorf("evidence.max_items and evidence.max_bytes are shared equally across %d devices; each share must be at least %d items and %d bytes (a registration reserve and one evidence record)",
+			devices, courier.MinDeviceShareItems, courier.MinDeviceShareBytes)
+	}
+	if cfg.StoreProbeIntervalS < MinEvidenceStoreProbeIntervalS || cfg.StoreProbeIntervalS > MaxEvidenceStoreProbeIntervalS {
+		return fmt.Errorf("evidence.store_probe_interval_s must be %d through %d seconds (got %d)",
+			MinEvidenceStoreProbeIntervalS, MaxEvidenceStoreProbeIntervalS, cfg.StoreProbeIntervalS)
+	}
 	return nil
+}
+
+// resolveDeviceCarriage validates a supplied evidence.device_carriage and
+// returns every configured device's carriage, gateway-api/v1 where the map does
+// not name it. An absent or empty map declares nothing.
+func resolveDeviceCarriage(declared map[string]string, deviceIDs []string) (map[string]string, error) {
+	configured := make(map[string]bool, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		configured[deviceID] = true
+	}
+	for deviceID, carriage := range declared {
+		if !configured[deviceID] {
+			return nil, fmt.Errorf("evidence.device_carriage names device_id %q, which gateway.device_ids does not configure", deviceID)
+		}
+		if carriage != CarriageGatewayAPIV1 && carriage != CarriageEvidenceCarriageV1 {
+			return nil, fmt.Errorf("evidence.device_carriage[%q] must be %q or %q (got %q)",
+				deviceID, CarriageGatewayAPIV1, CarriageEvidenceCarriageV1, carriage)
+		}
+	}
+	out := make(map[string]string, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		out[deviceID] = CarriageGatewayAPIV1
+		if carriage, ok := declared[deviceID]; ok {
+			out[deviceID] = carriage
+		}
+	}
+	return out, nil
 }
 
 func normalizeSiteHealth(cfg SiteHealthConfig) SiteHealthConfig {
@@ -491,6 +662,15 @@ func validateGatewayDeviceID(deviceID string) error {
 	}
 	if strings.ContainsAny(deviceID, "/+#|") {
 		return fmt.Errorf("device_id %q must not contain MQTT separators, wildcards, or auth delimiters", deviceID)
+	}
+	return nil
+}
+
+// validateEvidenceDeviceID holds a device that declares
+// gateway-evidence-carriage/v1 to the evidence routing domain.
+func validateEvidenceDeviceID(deviceID string) error {
+	if !contracts.ValidEvidenceRoutingDeviceID(deviceID) {
+		return fmt.Errorf("gateway.device_ids: device_id %q declares gateway-evidence-carriage/v1, so it must be 1 to 128 Unicode characters with no control character, whitespace, \"/\", \"+\" or \"#\"", deviceID)
 	}
 	return nil
 }
@@ -760,10 +940,8 @@ func validateReporting(reporting ReportingConfig) error {
 		if len(reporting.WeeklyReport.SensorIDs) == 0 {
 			return fmt.Errorf("reporting.weekly_report.sensor_ids must not be empty")
 		}
-		for _, sensorID := range reporting.WeeklyReport.SensorIDs {
-			if sensorID == "" {
-				return fmt.Errorf("reporting.weekly_report.sensor_ids must not contain empty values")
-			}
+		if slices.Contains(reporting.WeeklyReport.SensorIDs, "") {
+			return fmt.Errorf("reporting.weekly_report.sensor_ids must not contain empty values")
 		}
 		if reporting.WeeklyReport.Delivery.File.Enabled {
 			path := reporting.WeeklyReport.Delivery.File.Path
@@ -773,10 +951,8 @@ func validateReporting(reporting ReportingConfig) error {
 			if !filepath.IsAbs(path) {
 				return fmt.Errorf("reporting.weekly_report.delivery.file.path must be an absolute path")
 			}
-			for _, segment := range strings.Split(path, "/") {
-				if segment == ".." {
-					return fmt.Errorf("reporting.weekly_report.delivery.file.path must not contain path traversal segments")
-				}
+			if slices.Contains(strings.Split(path, "/"), "..") {
+				return fmt.Errorf("reporting.weekly_report.delivery.file.path must not contain path traversal segments")
 			}
 		}
 		if reporting.WeeklyReport.Delivery.Cloud.Enabled {
