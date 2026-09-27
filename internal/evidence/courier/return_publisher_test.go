@@ -322,3 +322,62 @@ func TestAnAmbiguousRuntimeDecisionRetiresNothing(t *testing.T) {
 		t.Fatal("an ambiguous decision retired the authority artifact")
 	}
 }
+
+// TestADecisionWithAnAmbiguousAuthenticatorRetiresNothing sends the runtime's
+// applied decision with a correct authenticator whose envelope also names
+// signature a second time. A map decode keeps the correct one and would verify
+// it; the verifier refuses the ambiguity, and the authority artifact stays
+// queued.
+func TestADecisionWithAnAmbiguousAuthenticatorRetiresNothing(t *testing.T) {
+	now := time.UnixMilli(1787000003000)
+	sink, err := OpenDurableAuthoritySink(QueueOptions{
+		Directory: filepath.Join(t.TempDir(), "return"), MaxItems: 10, MaxBytes: 1 << 20,
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := validReceiptBytes("site-a-edge-01", 1, 1)
+	if err := sink.Store(context.Background(), AuthorityArtifact{
+		Type: AuthorityDeliveryReceipt, DeviceID: "site-a-edge-01", Payload: artifact,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewReturnPublisher(sink, testAckClock(t, func() time.Time { return now }),
+		func(context.Context, string, byte, bool, []byte) error { return nil },
+		"runtime-gateway-envelope-secret", "", func() time.Time { return now }, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.publishHead(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(artifact)
+	ack := inboundAck{
+		DeviceID: "site-a-edge-01", ArtifactType: "delivery_receipt",
+		ArtifactDigest: "sha256:" + hex.EncodeToString(digest[:]),
+		Outcome:        "applied", AcknowledgedAtMS: now.UnixMilli(),
+	}
+	auth, err := mqttauth.Sign(ack, contracts.EvidenceInboundAckMessageType, ack.DeviceID, "", now.UnixMilli(), "runtime-gateway-envelope-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack.Auth = &auth
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambiguous := bytes.Replace(payload, []byte(`"signature":`), []byte(`"signature":"hmac-sha256:00","signature":`), 1)
+	if bytes.Equal(ambiguous, payload) {
+		t.Fatal("the decision carries no signature member to duplicate")
+	}
+	if err := publisher.HandleAck("ori/site-a-edge-01/evidence/inbound/ack", ambiguous); err == nil {
+		t.Fatal("a decision with an ambiguous authenticator was accepted")
+	}
+	if sink.Len() != 1 {
+		t.Fatal("a decision with an ambiguous authenticator retired the authority artifact")
+	}
+	if err := publisher.HandleAck("ori/site-a-edge-01/evidence/inbound/ack", payload); err != nil || sink.Len() != 0 {
+		t.Fatalf("the exact decision = %v with %d queued; want it applied", err, sink.Len())
+	}
+}

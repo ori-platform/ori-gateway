@@ -106,6 +106,9 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	if err := canonicaljson.ValidateWireUnicode(payload); err != nil {
 		return nil, err
 	}
+	if err := refuseAmbiguousMembers(payload); err != nil {
+		return nil, err
+	}
 	var envelope map[string]any
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
@@ -115,6 +118,9 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	authValue, ok := envelope["auth"]
 	if !ok {
 		return nil, fmt.Errorf("missing auth envelope")
+	}
+	if err := refuseInexactAuthMembers(authValue); err != nil {
+		return nil, err
 	}
 	authBytes, err := json.Marshal(authValue)
 	if err != nil {
@@ -253,5 +259,84 @@ func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requ
 		return fmt.Errorf("mqtt auth replay detected")
 	}
 	v.seenKeys[key] = now.Add(v.replayTTL)
+	return nil
+}
+
+// maxAmbiguityDepth bounds the nesting refuseAmbiguousMembers walks, the same
+// bound encoding/json applies.
+const maxAmbiguityDepth = 10000
+
+// refuseAmbiguousMembers refuses a payload holding, in any object at any
+// depth, two members whose names are equal or differ only in case. The
+// authenticator covers each member as written, while encoding/json keeps the
+// last duplicate and matches a struct field without regard to case, so either
+// would let a verified message be read as something its signer did not write.
+func refuseAmbiguousMembers(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := walkMembers(decoder, 0); err != nil {
+		return fmt.Errorf("ambiguous mqtt auth payload: %w", err)
+	}
+	return nil
+}
+
+func walkMembers(decoder *json.Decoder, depth int) error {
+	if depth > maxAmbiguityDepth {
+		return fmt.Errorf("nested too deeply")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	switch token {
+	case json.Delim('{'):
+		var names []string
+		for decoder.More() {
+			key, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			name, _ := key.(string)
+			for _, seen := range names {
+				if strings.EqualFold(seen, name) {
+					return fmt.Errorf("member %q is named more than once", name)
+				}
+			}
+			names = append(names, name)
+			if err := walkMembers(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case json.Delim('['):
+		for decoder.More() {
+			if err := walkMembers(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	}
+	return nil
+}
+
+// authMembers are the auth envelope's member names, spelled exactly.
+var authMembers = []string{"scheme", "signed_at_ms", "signature"}
+
+// refuseInexactAuthMembers refuses an auth envelope member that differs from
+// one of its names only in case: encoding/json would read it as that member.
+func refuseInexactAuthMembers(authValue any) error {
+	auth, ok := authValue.(map[string]any)
+	if !ok {
+		return fmt.Errorf("auth envelope must be an object")
+	}
+	for name := range auth {
+		for _, member := range authMembers {
+			if name != member && strings.EqualFold(name, member) {
+				return fmt.Errorf("auth envelope member %q is misspelled by case", name)
+			}
+		}
+	}
 	return nil
 }
