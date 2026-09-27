@@ -25,7 +25,8 @@ echo "modernize"
 echo "gopls check"
 files=()
 while IFS= read -r file; do
-  files+=("$file")
+  # The index can still name a file a pending rename or removal took away.
+  [ -f "$file" ] && files+=("$file")
 done < <(git ls-files --cached --others --exclude-standard -- '*.go' ':!tools/**')
 findings="$(GOFLAGS="-tags=$TAGS" "${TOOL[@]}" gopls check "${files[@]}" 2>&1)" || status=1
 if [ -n "$findings" ]; then

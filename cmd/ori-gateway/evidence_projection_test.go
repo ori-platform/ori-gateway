@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/ori-platform/ori-gateway/internal/evidence/faults"
+	"github.com/ori-platform/ori-gateway/internal/specvectors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,37 +25,42 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/ori-platform/ori-gateway/internal/evidence"
+	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 )
 
-// siteHealthVectorPath is the draft projection corpus in a sibling ori-specs
-// checkout, read in place until the contract merges and it is vendored.
-var siteHealthVectorPath = filepath.Join("..", "..", "..", "ori-specs", "gateway-api", "vectors", "site-health-evidence-delivery.json")
-
-// projectionRefusal names the gateway-api/v1 rule a projection breaks.
+// projectionRefusal names the gateway-evidence-carriage/v1 rule a projection
+// breaks.
 type projectionRefusal struct{ rule, detail string }
 
 func (r *projectionRefusal) Error() string { return r.rule + ": " + r.detail }
 
-// The oracle below is written from gateway-api/v1 and the evidence-transport/v1
-// refusal policy, independently of the code under test.
+// The oracle below is written from gateway-evidence-carriage/v1's site-health
+// projection and the evidence-transport/v2 refusal policy, independently of the
+// code under test.
 var (
-	projectionStates    = map[string]bool{"held": true, "waiting_handoff": true, "backing_off": true}
-	projectionTypes     = map[string]bool{"anchor_registration": true, "delivery_envelope": true, "checkpoint": true}
-	projectionHeldAt    = map[int]map[string]bool{400: {"malformed": true, "unrecognised": true}, 409: {"conflict": true, "unrecognised": true}, 422: {"bad_authenticator": true, "binding_mismatch": true, "commissioning_digest_mismatch": true, "unrecognised": true}}
-	projectionEntryKeys = []string{"device_id", "lane", "pending", "state"}
-	projectionLanes     = map[string]bool{"registration": true, "evidence": true}
-	projectionTopKeys   = map[string]bool{"pending": true, "degraded": true, "blocked": true, "last_failure_at_ms": true, "last_error": true, "faults": true, "devices": true, "archived_registrations": true}
-	// projectionArchivedKeys is an archived refusal's closed field set, sorted.
-	projectionArchivedKeys = []string{"acknowledged", "artifact_digest", "device_id", "reason", "refusal_status", "refused_at_ms"}
-	projectionFaults       = map[string]bool{
-		"store_unavailable": true, "admission_failed": true,
-		"delivery_impaired": true, "device_unconfigured": true,
+	projectionStates = map[string]bool{"held": true, "waiting_handoff": true, "backing_off": true}
+	projectionTypes  = map[string]bool{"anchor_registration": true, "delivery_envelope": true, "checkpoint": true}
+	projectionHeldAt = map[int]map[string]bool{400: {"malformed": true, "unrecognised": true}, 409: {"conflict": true, "unrecognised": true}, 422: {"bad_authenticator": true, "binding_mismatch": true, "commissioning_digest_mismatch": true, "unrecognised": true}, 507: {"retention_capacity_exhausted": true, "unrecognised": true}}
+	// projectionArchivedAt is where a retained terminal refusal archives:
+	// never an unrecognised reason, and never a 507.
+	projectionArchivedAt = map[int]map[string]bool{400: {"malformed": true}, 409: {"conflict": true}, 422: {"bad_authenticator": true, "binding_mismatch": true, "commissioning_digest_mismatch": true}}
+	projectionEntryKeys  = []string{"device_id", "lane", "pending", "state"}
+	projectionLanes      = map[string]bool{"registration": true, "evidence": true}
+	projectionTopKeys    = map[string]bool{"pending": true, "degraded": true, "blocked": true, "last_failure_at_ms": true, "last_error": true, "faults": true, "devices": true, "incidents": true, "stopped_custody": true}
+	// projectionIncidentKeys is an incident's closed field set, sorted.
+	projectionIncidentKeys = []string{"anchor_epoch_id", "artifact_type", "count", "device_id", "first_digest", "first_refused_at_ms", "last_refused_at_ms", "latest_digest", "reason", "refusal_status"}
+	// projectionStoppedKeys is a stopped-custody entry's closed field set, sorted.
+	projectionStoppedKeys = []string{"count", "device_id", "lane", "scope"}
+	projectionFaults      = map[string]bool{
+		"store_unavailable": true, "admission_failed": true, "delivery_impaired": true,
+		"device_unconfigured": true, "return_path_incompatible": true,
+		"reprovisioning_required": true, "stopped_custody_full": true,
 	}
 	projectionLastErrors = map[string]bool{
 		"channel_unavailable": true, "channel_refused": true, "channel_permanent_refusal": true,
 		"channel_receiver_state_refusal": true, "malformed_channel_response": true,
 		"runtime_sink_unavailable": true, "queue_retirement_failed": true, "delivery_pending": true,
+		"channel_capacity_exhausted": true, "authority_retention_capacity_unavailable": true,
 	}
 	projectionHeldKeys = []string{"acknowledged", "artifact_digest", "artifact_type", "first_held_at_ms", "queue_record", "reason", "refusal_status"}
 	projectionRecordRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -98,7 +105,8 @@ func intValue(v any, minimum int64) (int64, bool) {
 	return n, err == nil && n >= minimum
 }
 
-// validateProjection applies every gateway-api/v1 rule for evidence_delivery.
+// validateProjection applies every gateway-evidence-carriage/v1 rule for
+// evidence_delivery.
 func validateProjection(p map[string]any) error {
 	for _, key := range []string{"pending", "degraded", "blocked"} {
 		if _, ok := p[key]; !ok {
@@ -247,22 +255,44 @@ func validateProjection(p map[string]any) error {
 	if blocked != wantBlocked {
 		return refuse("blocked", "blocked must be %v", wantBlocked)
 	}
-	rawArchived, hasArchived := p["archived_registrations"]
-	var archived []any
-	if hasArchived {
-		list, ok := rawArchived.([]any)
+	rawIncidents, hasIncidents := p["incidents"]
+	var incidents []any
+	if hasIncidents {
+		list, ok := rawIncidents.([]any)
 		if !ok {
-			return refuse("archived", "archived_registrations is not a list")
+			return refuse("incident", "incidents is not a list")
 		}
-		archived = list
-		if err := validateArchived(archived); err != nil {
+		incidents = list
+		if err := validateIncidents(incidents); err != nil {
 			return err
 		}
 	}
-	// With faults, devices and archived_registrations all absent, degraded
+	rawStopped, hasStopped := p["stopped_custody"]
+	var stopped []any
+	if hasStopped {
+		list, ok := rawStopped.([]any)
+		if !ok {
+			return refuse("stopped_custody", "stopped_custody is not a list")
+		}
+		stopped = list
+		if err := validateStoppedCustody(stopped); err != nil {
+			return err
+		}
+	}
+	// reprovisioning_required is raised exactly when stopped custody is held.
+	if hasFaults && hasStopped {
+		reprovisioning := false
+		for _, f := range faults {
+			reprovisioning = reprovisioning || f == "reprovisioning_required"
+		}
+		if reprovisioning != (len(stopped) > 0) {
+			return refuse("reprovisioning", "reprovisioning_required must be raised exactly while stopped custody is held")
+		}
+	}
+	// With faults, devices, incidents and stopped_custody all absent, degraded
 	// keeps an older producer's advisory meaning and is not constrained.
-	if hasFaults || hasDevices || hasArchived {
-		want := len(faults) > 0 || len(devices) > 0 || len(archived) > 0
+	if hasFaults || hasDevices || hasIncidents || hasStopped {
+		want := len(faults) > 0 || len(devices) > 0 || len(incidents) > 0 || len(stopped) > 0
 		if degraded != want {
 			return refuse("degraded", "degraded must be %v", want)
 		}
@@ -270,41 +300,92 @@ func validateProjection(p map[string]any) error {
 	return nil
 }
 
-// validateArchived applies gateway-api/v1's archived_registrations rules: the
-// closed field set, the device_id domain, one entry per digest, a status and
-// reason at which the refusal policy holds, and acknowledged false. An
-// archived refusal's bytes are never projected.
-func validateArchived(archived []any) error {
+// validateIncidents applies the incident rules: the closed field set, the
+// device_id domain, an anchor_epoch_id that is a digest or empty, a status and
+// reason at which a retained refusal archives, a count of at least one whose
+// first and latest digests agree exactly when it is one, a last refusal no
+// earlier than the first, and no two incidents sharing the coalescing key.
+func validateIncidents(incidents []any) error {
 	seen := map[string]bool{}
-	for _, raw := range archived {
+	for _, raw := range incidents {
 		entry, ok := raw.(map[string]any)
-		if !ok || strings.Join(keysOf(entry), ",") != strings.Join(projectionArchivedKeys, ",") {
-			return refuse("archived", "archived entry fields %v", raw)
+		if !ok || strings.Join(keysOf(entry), ",") != strings.Join(projectionIncidentKeys, ",") {
+			return refuse("incident", "incident fields %v", raw)
 		}
-		if device, _ := entry["device_id"].(string); !projectionDeviceID(device) {
+		device, _ := entry["device_id"].(string)
+		if !projectionDeviceID(device) {
 			return refuse("device_id", "device_id %v", entry["device_id"])
 		}
-		digest, _ := entry["artifact_digest"].(string)
-		if !projectionDigestRE.MatchString(digest) {
-			return refuse("archived", "artifact_digest is not sha256 hex")
+		epoch, ok := entry["anchor_epoch_id"].(string)
+		if !ok || (epoch != "" && !projectionDigestRE.MatchString(epoch)) {
+			return refuse("incident", "anchor_epoch_id %v", entry["anchor_epoch_id"])
 		}
-		if seen[digest] {
-			return refuse("archived", "an archived refusal is listed twice")
+		kind, _ := entry["artifact_type"].(string)
+		if !projectionTypes[kind] {
+			return refuse("artifact_type", "artifact_type %v", entry["artifact_type"])
 		}
-		seen[digest] = true
 		status, ok := intValue(entry["refusal_status"], 0)
-		if !ok || projectionHeldAt[int(status)] == nil {
-			return refuse("refusal_status", "status %v never holds", entry["refusal_status"])
+		if !ok || projectionArchivedAt[int(status)] == nil {
+			return refuse("refusal_status", "status %v never archives", entry["refusal_status"])
 		}
-		if reason, _ := entry["reason"].(string); !projectionHeldAt[int(status)][reason] {
-			return refuse("reason", "%d does not hold at %v", status, entry["reason"])
+		reason, _ := entry["reason"].(string)
+		if !projectionArchivedAt[int(status)][reason] {
+			return refuse("reason", "%d does not archive at %v", status, entry["reason"])
 		}
-		if _, ok := intValue(entry["refused_at_ms"], 1); !ok {
-			return refuse("archived", "refused_at_ms is a positive integer")
+		count, ok := intValue(entry["count"], 1)
+		if !ok {
+			return refuse("incident", "count is an integer of at least one")
 		}
-		if ack, ok := entry["acknowledged"].(bool); !ok || ack {
-			return refuse("acknowledged", "acknowledged is false until an acknowledgement surface exists")
+		first, ok1 := intValue(entry["first_refused_at_ms"], 1)
+		last, ok2 := intValue(entry["last_refused_at_ms"], 1)
+		if !ok1 || !ok2 || last < first {
+			return refuse("incident", "refusal times are positive and the last is no earlier than the first")
 		}
+		firstDigest, _ := entry["first_digest"].(string)
+		latestDigest, _ := entry["latest_digest"].(string)
+		if !projectionDigestRE.MatchString(firstDigest) || !projectionDigestRE.MatchString(latestDigest) {
+			return refuse("incident", "member digests are sha256 hex")
+		}
+		if (firstDigest == latestDigest) != (count == 1) {
+			return refuse("incident", "first_digest equals latest_digest exactly when count is one")
+		}
+		key := strings.Join([]string{device, epoch, kind, fmt.Sprint(status), reason}, "\x00")
+		if seen[key] {
+			return refuse("incident", "two incidents share a coalescing key")
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+// validateStoppedCustody applies the stopped-custody rules: the closed field
+// set, the device_id and lane domains, a scope of epoch or identity, a count of
+// at least one, and no two entries sharing a device and lane.
+func validateStoppedCustody(stopped []any) error {
+	seen := map[string]bool{}
+	for _, raw := range stopped {
+		entry, ok := raw.(map[string]any)
+		if !ok || strings.Join(keysOf(entry), ",") != strings.Join(projectionStoppedKeys, ",") {
+			return refuse("stopped_custody", "stopped custody fields %v", raw)
+		}
+		device, _ := entry["device_id"].(string)
+		if !projectionDeviceID(device) {
+			return refuse("device_id", "device_id %v", entry["device_id"])
+		}
+		lane, _ := entry["lane"].(string)
+		if !projectionLanes[lane] {
+			return refuse("lane", "lane %v", entry["lane"])
+		}
+		if scope, _ := entry["scope"].(string); scope != "epoch" && scope != "identity" {
+			return refuse("stopped_custody", "scope %v", entry["scope"])
+		}
+		if _, ok := intValue(entry["count"], 1); !ok {
+			return refuse("stopped_custody", "count is an integer of at least one")
+		}
+		if seen[device+"\x00"+lane] {
+			return refuse("stopped_custody", "device %s lane %s listed twice", device, lane)
+		}
+		seen[device+"\x00"+lane] = true
 	}
 	return nil
 }
@@ -324,9 +405,9 @@ func decodeProjection(t *testing.T, raw []byte) map[string]any {
 // corpus: every accepted projection passes, every refused one fails for the
 // rule it names.
 func TestProjectionOracleAgreesWithTheVectors(t *testing.T) {
-	raw, err := os.ReadFile(siteHealthVectorPath)
+	raw, err := specvectors.Read("gateway-evidence-carriage/vectors/site-health-evidence-delivery.json")
 	if err != nil {
-		t.Fatalf("the gateway-api site-health vectors are required at %s: %v", siteHealthVectorPath, err)
+		t.Fatalf("the gateway-api site-health vectors are required at gateway-evidence-carriage/vectors/site-health-evidence-delivery.json: %v", err)
 	}
 	var doc struct {
 		Cases []struct {
@@ -407,7 +488,7 @@ func (a *projectionAuthority) RoundTrip(req *http.Request) (*http.Response, erro
 }
 
 func checkpointFor(device string, n int) []byte {
-	return []byte(fmt.Sprintf(`{"v":1,"device_id":%q,"high_water_seq":%d,"signature":"ed25519:opaque"}`, device, n))
+	return fmt.Appendf(nil, `{"v":1,"device_id":%q,"high_water_seq":%d,"signature":"ed25519:opaque"}`, device, n)
 }
 
 // TestRealProjectionWithAStoreFault drives a real store failure: the hold
@@ -416,15 +497,15 @@ func checkpointFor(device string, n int) []byte {
 // the store recovers the fault clears.
 func TestRealProjectionWithAStoreFault(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "queue")
-	faults := evidence.NewFaultRecorder()
-	q, err := evidence.OpenDurableQueue(evidence.QueueOptions{
+	faults := faults.NewRecorder()
+	q, err := courier.OpenDurableQueue(courier.QueueOptions{
 		Directory: dir, MaxItems: 100, MaxBytes: 1 << 26, Devices: []string{"dev-a", "dev-b"},
 		Faults: faults, FaultSource: "outbound",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Enqueue(evidence.ArtifactCheckpoint, checkpointFor("dev-a", 1)); err != nil {
+	if _, err := q.Enqueue(courier.ArtifactCheckpoint, checkpointFor("dev-a", 1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(dir, 0o500); err != nil {
@@ -436,14 +517,14 @@ func TestRealProjectionWithAStoreFault(t *testing.T) {
 		t.Skip("directory permissions do not stop writes here")
 	}
 	authority := &projectionAuthority{answer: map[string][3]any{"dev-a": {409, "refused", "conflict"}}}
-	channel, err := evidence.NewHTTPChannel(evidence.HTTPChannelOptions{
+	channel, err := courier.NewHTTPChannel(courier.HTTPChannelOptions{
 		Endpoint: "https://authority.invalid/v1/evidence/artifacts", ClientID: "site-a-gateway",
 		Secret: "evidence-ingest-secret-with-at-least-32-bytes", HTTPClient: &http.Client{Transport: authority},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := evidence.NewDeliveryWorker(q, channel, nil, evidence.DeliveryWorkerOptions{
+	worker, err := courier.NewDeliveryWorker(q, channel, nil, courier.DeliveryWorkerOptions{
 		RetryInterval: time.Hour, Faults: faults, Logger: slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
@@ -468,7 +549,7 @@ func TestRealProjectionWithAStoreFault(t *testing.T) {
 	// The store recovers. A durable write leaves the fault raised; only the
 	// store's next successful probe clears it (gateway-api/v1).
 	_ = os.Chmod(dir, 0o700)
-	if _, err := q.Enqueue(evidence.ArtifactCheckpoint, checkpointFor("dev-b", 1)); err != nil {
+	if _, err := q.Enqueue(courier.ArtifactCheckpoint, checkpointFor("dev-b", 1)); err != nil {
 		t.Fatal(err)
 	}
 	if faults := worker.Status().Faults; len(faults) != 1 || faults[0] != "store_unavailable" {
@@ -492,50 +573,50 @@ func TestRealProjectionsSatisfyTheContract(t *testing.T) {
 		queued      map[string]int
 		wantDevices int
 		wantBlocked bool
-		settle      func(evidence.DeliveryStatus) bool
+		settle      func(courier.DeliveryStatus) bool
 		// wantStates is each listed entry's state, keyed "<device>/<lane>".
 		wantStates map[string]string
 	}{
-		{"clean", nil, nil, map[string]int{}, 0, false, func(s evidence.DeliveryStatus) bool { return true }, nil},
+		{"clean", nil, nil, map[string]int{}, 0, false, func(s courier.DeliveryStatus) bool { return true }, nil},
 		{"one held beside one still delivering",
 			map[string][3]any{"dev-a": {409, "refused", "conflict"}}, []string{"dev-b"},
 			map[string]int{"dev-a": 3, "dev-b": 2}, 1, false,
-			func(s evidence.DeliveryStatus) bool { return len(s.Devices) == 1 },
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 1 },
 			map[string]string{"dev-a/evidence": "held"}},
 		{"every device with pending held",
 			map[string][3]any{"dev-a": {422, "refused", "bad_authenticator"}, "dev-b": {409, "refused", "conflict"}}, nil,
 			map[string]int{"dev-a": 2, "dev-b": 1}, 2, true,
-			func(s evidence.DeliveryStatus) bool { return len(s.Devices) == 2 }, nil},
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 2 }, nil},
 		{"waiting for a handoff and backing off",
 			map[string][3]any{"dev-a": {422, "refused", "unknown_key"}, "dev-b": {503, "pending", "unavailable"}}, nil,
 			map[string]int{"dev-a": 1, "dev-b": 3}, 2, false,
-			func(s evidence.DeliveryStatus) bool { return len(s.Devices) == 2 }, nil},
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 2 }, nil},
 		{"an unrecognised reason held",
 			map[string][3]any{"dev-a": {400, "refused", "authority.internal"}}, nil,
 			map[string]int{"dev-a": 1}, 1, true,
-			func(s evidence.DeliveryStatus) bool { return len(s.Devices) == 1 }, nil},
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 1 }, nil},
 		{"a registration backing off beside the same device's evidence still delivering",
 			map[string][3]any{"dev-a:registration": {409, "refused", "pending_registration_conflict"}}, []string{"dev-a"},
 			map[string]int{"dev-a": 2, "dev-a:registration": 1}, 1, false,
-			func(s evidence.DeliveryStatus) bool { return len(s.Devices) == 1 },
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 1 },
 			map[string]string{"dev-a/registration": "backing_off"}},
-		// A terminal registration refusal is archived: never in devices, never
-		// in pending, never blocking, always degrading.
-		{"an archived registration beside the same device's evidence still delivering",
+		// Without a verified retention a terminal registration refusal is held
+		// in its lane, like an evidence-lane hold (evidence-transport/v2).
+		{"a held registration beside the same device's evidence still delivering",
 			map[string][3]any{"dev-a:registration": {422, "refused", "commissioning_digest_mismatch"}}, []string{"dev-a"},
-			map[string]int{"dev-a": 2, "dev-a:registration": 1}, 0, false,
-			func(s evidence.DeliveryStatus) bool { return len(s.Archived) == 1 },
-			map[string]string{}},
-		{"an archived registration beside a held evidence lane covering everything is blocked",
-			map[string][3]any{"dev-a:registration": {422, "refused", "commissioning_digest_mismatch"}, "dev-a": {409, "refused", "conflict"}}, nil,
-			map[string]int{"dev-a": 2, "dev-a:registration": 1}, 1, true,
-			func(s evidence.DeliveryStatus) bool { return len(s.Archived) == 1 && s.Blocked },
-			map[string]string{"dev-a/evidence": "held"}},
-		{"an archived registration beside the same device's evidence backing off",
-			map[string][3]any{"dev-a:registration": {422, "refused", "commissioning_digest_mismatch"}, "dev-a": {503, "pending", "unavailable"}}, nil,
 			map[string]int{"dev-a": 2, "dev-a:registration": 1}, 1, false,
-			func(s evidence.DeliveryStatus) bool { return len(s.Archived) == 1 && len(s.Devices) == 1 },
-			map[string]string{"dev-a/evidence": "backing_off"}},
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 1 },
+			map[string]string{"dev-a/registration": "held"}},
+		{"a held registration beside a held evidence lane covering everything is blocked",
+			map[string][3]any{"dev-a:registration": {422, "refused", "commissioning_digest_mismatch"}, "dev-a": {409, "refused", "conflict"}}, nil,
+			map[string]int{"dev-a": 2, "dev-a:registration": 1}, 2, true,
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 2 && s.Blocked },
+			map[string]string{"dev-a/evidence": "held", "dev-a/registration": "held"}},
+		{"a held registration beside the same device's evidence backing off",
+			map[string][3]any{"dev-a:registration": {422, "refused", "commissioning_digest_mismatch"}, "dev-a": {503, "pending", "unavailable"}}, nil,
+			map[string]int{"dev-a": 2, "dev-a:registration": 1}, 2, false,
+			func(s courier.DeliveryStatus) bool { return len(s.Devices) == 2 },
+			map[string]string{"dev-a/evidence": "backing_off", "dev-a/registration": "held"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			authority := &projectionAuthority{answer: tc.answer, stalled: map[string]chan struct{}{}}
@@ -544,7 +625,7 @@ func TestRealProjectionsSatisfyTheContract(t *testing.T) {
 				authority.stalled[device] = release
 			}
 			defer close(release)
-			q, err := evidence.OpenDurableQueue(evidence.QueueOptions{
+			q, err := courier.OpenDurableQueue(courier.QueueOptions{
 				Directory: filepath.Join(t.TempDir(), "queue"), MaxItems: 100, MaxBytes: 1 << 26,
 				Devices: []string{"dev-a", "dev-b"},
 			})
@@ -554,24 +635,24 @@ func TestRealProjectionsSatisfyTheContract(t *testing.T) {
 			for key, n := range tc.queued {
 				device, registration := strings.CutSuffix(key, ":registration")
 				for i := 1; i <= n; i++ {
-					kind, payload := evidence.ArtifactCheckpoint, checkpointFor(device, i)
+					kind, payload := courier.ArtifactCheckpoint, checkpointFor(device, i)
 					if registration {
-						kind = evidence.ArtifactAnchorRegistration
-						payload = []byte(fmt.Sprintf(`{"v":1,"device_id":%q,"anchor_epoch_id":"epoch-%d"}`, device, i))
+						kind = courier.ArtifactAnchorRegistration
+						payload = fmt.Appendf(nil, `{"v":1,"device_id":%q,"anchor_epoch_id":"epoch-%d"}`, device, i)
 					}
 					if _, err := q.Enqueue(kind, payload); err != nil {
 						t.Fatal(err)
 					}
 				}
 			}
-			channel, err := evidence.NewHTTPChannel(evidence.HTTPChannelOptions{
+			channel, err := courier.NewHTTPChannel(courier.HTTPChannelOptions{
 				Endpoint: "https://authority.invalid/v1/evidence/artifacts", ClientID: "site-a-gateway",
 				Secret: "evidence-ingest-secret-with-at-least-32-bytes", HTTPClient: &http.Client{Transport: authority},
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			worker, err := evidence.NewDeliveryWorker(q, channel, nil, evidence.DeliveryWorkerOptions{
+			worker, err := courier.NewDeliveryWorker(q, channel, nil, courier.DeliveryWorkerOptions{
 				RetryInterval: time.Hour, Logger: slog.New(slog.DiscardHandler),
 			})
 			if err != nil {
@@ -613,24 +694,9 @@ func TestRealProjectionsSatisfyTheContract(t *testing.T) {
 					t.Fatalf("lane states = %v, want %v: %s", got, tc.wantStates, raw)
 				}
 			}
-			// Every registration answered with a hold is archived, and only those.
-			wantArchived := 0
-			for key, answer := range tc.answer {
-				status, reason := answer[0].(int), answer[2].(string)
-				holds := status == 400 || (status == 409 && reason != "pending_registration_conflict") ||
-					(status == 422 && reason != "unknown_key" && reason != "unrecognised_version")
-				if strings.HasSuffix(key, ":registration") && holds {
-					wantArchived += tc.queued[key]
-				}
-			}
-			if len(view.ArchivedRegistrations) != wantArchived {
-				t.Fatalf("archived_registrations = %d, want %d: %s", len(view.ArchivedRegistrations), wantArchived, raw)
-			}
-			if wantArchived > 0 && !view.Degraded {
-				t.Fatalf("an archived refusal did not degrade delivery: %s", raw)
-			}
-			if _, ok := projection["archived_registrations"].([]any); !ok {
-				t.Fatalf("projection omits archived_registrations: %s", raw)
+			// gateway-evidence-carriage/v1 defines no archived_registrations.
+			if _, ok := projection["archived_registrations"]; ok {
+				t.Fatalf("projection carries archived_registrations: %s", raw)
 			}
 			for _, forbidden := range []string{"authority.invalid", "authority.internal", "https"} {
 				if strings.Contains(string(raw), forbidden) {

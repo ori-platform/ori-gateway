@@ -21,7 +21,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
-	"github.com/ori-platform/ori-gateway/internal/evidence"
+	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -711,8 +711,7 @@ func TestMainEscalatesRepeatedRequestHandlerFailures(t *testing.T) {
 	fb.publishErr = errors.New("broker disconnected")
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	done := make(chan error, 1)
 
 	go func() {
@@ -727,7 +726,7 @@ func TestMainEscalatesRepeatedRequestHandlerFailures(t *testing.T) {
 	if handler == nil {
 		t.Fatal("missing subscription handler")
 	}
-	for i := 0; i < defaultRequestFailureLimit; i++ {
+	for range defaultRequestFailureLimit {
 		handler("ori/site-a/reasoning/request", validRequestPayload(t))
 	}
 
@@ -1076,8 +1075,7 @@ func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "future", Status: site.NodeStatusHealthy, LastSeenMS: 100_000})
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "fresh", Status: site.NodeStatusHealthy, LastSeenMS: 9999})
 	now := time.UnixMilli(10_000)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go evictStaleRuntimeNodes(ctx, registry, time.Millisecond, func() time.Time {
 		return now
@@ -1990,7 +1988,7 @@ func TestGatewaySiteHealthServerStartsWhenEnabled(t *testing.T) {
 		cancel()
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var health map[string]interface{}
+	var health map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
 		cancel()
 		t.Fatalf("invalid JSON from site health server: %v", err)
@@ -2027,13 +2025,13 @@ func TestGatewaySiteHealthIncludesEnabledEvidenceDelivery(t *testing.T) {
 
 	queueDirectory := filepath.Join(t.TempDir(), "outbound")
 	returnQueueDirectory := filepath.Join(t.TempDir(), "returned")
-	queue, err := evidence.OpenDurableQueue(evidence.QueueOptions{
+	queue, err := courier.OpenDurableQueue(courier.QueueOptions{
 		Directory: queueDirectory, MaxItems: 10, MaxBytes: 4 << 20,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := queue.Enqueue(evidence.ArtifactCheckpoint, []byte("checkpoint-wire-bytes")); err != nil {
+	if _, err := queue.Enqueue(courier.ArtifactCheckpoint, []byte("checkpoint-wire-bytes")); err != nil {
 		t.Fatal(err)
 	}
 

@@ -30,7 +30,7 @@ func evidenceBeat(deviceID, head string, gaps int, available bool) NodeHeartbeat
 
 func TestRegistryEvidenceNormalAdvanceRaisesNoFlags(t *testing.T) {
 	reg := NewRegistry()
-	for seed := byte(0); seed < 5; seed++ {
+	for seed := range byte(5) {
 		reg.Upsert(evidenceBeat("dev-01", headHash(seed), 0, true))
 	}
 	got := reg.Snapshot()[0].Evidence

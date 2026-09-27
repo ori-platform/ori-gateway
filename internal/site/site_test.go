@@ -137,7 +137,7 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(workers * 3)
 
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		go func(id int) {
 			defer wg.Done()
 			reg.Upsert(NodeHeartbeat{
@@ -148,13 +148,13 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 			})
 		}(i)
 	}
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			_ = reg.Snapshot()
 		}()
 	}
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			_ = reg.EvictStale(1000, 100)

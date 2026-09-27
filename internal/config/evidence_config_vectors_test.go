@@ -6,18 +6,14 @@ package config
 import (
 	"bytes"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"fmt"
+	"github.com/ori-platform/ori-gateway/internal/specvectors"
+	"maps"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
-
-// evidenceConfigVectorPath is the draft gateway-config evidence corpus in a
-// sibling ori-specs checkout, read in place until the contract merges and it
-// is vendored.
-var evidenceConfigVectorPath = filepath.Join("..", "..", "..", "ori-specs", "gateway-config", "vectors", "evidence-config.json")
 
 // evidenceRuleMessages names the refusal each corpus rule must produce. A
 // refusal for another rule's reason fails the case, so a vector cannot pass
@@ -30,15 +26,18 @@ var evidenceRuleMessages = map[string]string{
 	"share":       "shared equally across",
 	"env":         "must be an environment variable name",
 	"device_id":   "gateway.device_ids",
+	// The loader enforces neither rule yet; a refusal must name its key.
+	"carriage": "evidence.device_carriage",
+	"stopped":  "evidence.stopped",
 }
 
 // TestEvidenceConfigVectors loads every gateway-config/v1 evidence vector
 // through Load: a valid case must produce exactly the corpus's effective
 // values after defaults, and a refused case must be refused for its rule.
 func TestEvidenceConfigVectors(t *testing.T) {
-	raw, err := os.ReadFile(evidenceConfigVectorPath)
+	raw, err := specvectors.Read("gateway-config/vectors/evidence-config-v2.json")
 	if err != nil {
-		t.Fatalf("the gateway-config evidence vectors are required at %s: %v", evidenceConfigVectorPath, err)
+		t.Fatalf("the gateway-config evidence vectors are required at gateway-config/vectors/evidence-config-v2.json: %v", err)
 	}
 	var doc struct {
 		Contract string `json:"contract"`
@@ -56,6 +55,13 @@ func TestEvidenceConfigVectors(t *testing.T) {
 				BackoffBaseS        int   `json:"backoff_base_s"`
 				BackoffMaxS         int   `json:"backoff_max_s"`
 				StoreProbeIntervalS int   `json:"store_probe_interval_s"`
+				// gateway-config/v2's evidence-carriage and stopped-custody
+				// keys, which the loader does not yet produce.
+				DeviceCarriage        map[string]string `json:"device_carriage"`
+				StoppedMaxItems       int               `json:"stopped_max_items"`
+				StoppedMaxBytes       int64             `json:"stopped_max_bytes"`
+				StoppedDeviceMaxItems int               `json:"stopped_device_max_items"`
+				StoppedDeviceMaxBytes int64             `json:"stopped_device_max_bytes"`
 			} `json:"effective"`
 		} `json:"cases"`
 	}
@@ -68,8 +74,17 @@ func TestEvidenceConfigVectors(t *testing.T) {
 	if len(doc.Cases) == 0 {
 		t.Fatal("the corpus has no cases")
 	}
+	names := make([]string, 0, len(doc.Cases))
+	for _, tc := range doc.Cases {
+		names = append(names, tc.Name)
+	}
+	checkConfigPinsExist(t, names)
 	for _, tc := range doc.Cases {
 		t.Run(tc.Name, func(t *testing.T) {
+			report := func(format string, args ...any) {
+				t.Helper()
+				checkConfigPin(t, tc.Name, fmt.Sprintf(format, args...))
+			}
 			evidence := map[string]any{}
 			for k, v := range tc.Evidence {
 				if n, ok := v.(json.Number); ok {
@@ -95,18 +110,26 @@ func TestEvidenceConfigVectors(t *testing.T) {
 				if !ok {
 					t.Fatalf("rule %q has no expected refusal", tc.Rule)
 				}
-				if err == nil || !strings.Contains(err.Error(), want) {
-					t.Fatalf("rule %s: got %v, want a refusal containing %q", tc.Rule, err, want)
+				switch {
+				case err == nil:
+					report("accepted, rule %s expects a refusal", tc.Rule)
+				case !strings.Contains(err.Error(), want):
+					report("refused for another rule: %v", err)
+				default:
+					report("")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("refused: %v", err)
+				report("refused: %v", err)
+				return
 			}
 			if tc.Effective == nil {
 				if cfg.Evidence.Enabled {
-					t.Fatal("a case with no effective values enabled the courier")
+					report("a case with no effective values enabled the courier")
+					return
 				}
+				report("")
 				return
 			}
 			got := cfg.Evidence
@@ -114,8 +137,18 @@ func TestEvidenceConfigVectors(t *testing.T) {
 			if got.MaxItems != e.MaxItems || got.MaxBytes != e.MaxBytes || got.RetryIntervalS != e.RetryIntervalS ||
 				got.BackoffBaseS != e.BackoffBaseS || got.BackoffMaxS != e.BackoffMaxS ||
 				got.StoreProbeIntervalS != e.StoreProbeIntervalS {
-				t.Fatalf("effective = %+v, corpus = %+v", got, *e)
+				report("effective = %+v, corpus = %+v", got, *e)
+				return
 			}
+			if !maps.Equal(got.DeviceCarriage, e.DeviceCarriage) {
+				report("device_carriage = %v, corpus = %v", got.DeviceCarriage, e.DeviceCarriage)
+				return
+			}
+			if e.StoppedMaxItems != 0 || e.StoppedMaxBytes != 0 || e.StoppedDeviceMaxItems != 0 || e.StoppedDeviceMaxBytes != 0 {
+				report("the loader produces no stopped-custody bounds")
+				return
+			}
+			report("")
 		})
 	}
 }

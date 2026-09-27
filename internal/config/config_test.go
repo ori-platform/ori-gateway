@@ -83,8 +83,10 @@ provider:
 	}
 }
 
-// TestEvidenceBackoffRequiresBoundAtLeastBaseAtLeastInterval holds the
-// evidence-transport/v1 rule bound >= base >= delivery interval at load.
+// TestEvidenceBackoffRequiresBoundAtLeastBaseAtLeastInterval holds the rule
+// bound >= base >= delivery interval at load for a site that declares
+// gateway-evidence-carriage/v1, and applies no ordering to a site that
+// declares nothing (gateway-config/v2).
 func TestEvidenceBackoffRequiresBoundAtLeastBaseAtLeastInterval(t *testing.T) {
 	base := `
 gateway:
@@ -99,7 +101,7 @@ evidence:
   endpoint_env: ORI_EVIDENCE_ENDPOINT
   client_id_env: ORI_EVIDENCE_CLIENT_ID
   secret_env: ORI_EVIDENCE_INGEST_SECRET
-%s`
+%s%s`
 	for _, tc := range []struct {
 		name              string
 		extra             string
@@ -114,26 +116,34 @@ evidence:
 		{"bound below the base", "  backoff_base_s: 60\n  backoff_max_s: 30\n", true, 0, 0},
 		{"bound below the interval", "  retry_interval_s: 30\n  backoff_max_s: 10\n", true, 0, 0},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.extra)))
-			if tc.wantError {
-				if err == nil || !strings.Contains(err.Error(), "backoff_max_s >= backoff_base_s >= retry_interval_s") {
-					t.Fatalf("load = %v, want the back-off ordering refusal", err)
+		for _, declared := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/declared=%v", tc.name, declared), func(t *testing.T) {
+				carriage := ""
+				if declared {
+					carriage = "  device_carriage:\n    dev-01: gateway-evidence-carriage/v1\n"
 				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cfg.Evidence.BackoffBaseS != tc.wantBase || cfg.Evidence.BackoffMaxS != tc.wantMax {
-				t.Fatalf("base %d bound %d, want %d and %d", cfg.Evidence.BackoffBaseS, cfg.Evidence.BackoffMaxS, tc.wantBase, tc.wantMax)
-			}
-		})
+				cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.extra, carriage)))
+				if tc.wantError && declared {
+					if err == nil || !strings.Contains(err.Error(), "backoff_max_s >= backoff_base_s >= retry_interval_s") {
+						t.Fatalf("load = %v, want the back-off ordering refusal", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !tc.wantError && (cfg.Evidence.BackoffBaseS != tc.wantBase || cfg.Evidence.BackoffMaxS != tc.wantMax) {
+					t.Fatalf("base %d bound %d, want %d and %d", cfg.Evidence.BackoffBaseS, cfg.Evidence.BackoffMaxS, tc.wantBase, tc.wantMax)
+				}
+			})
+		}
 	}
 }
 
-// TestEvidenceStoreProbeIntervalIsBoundedAtLoad holds the gateway-api/v1 range
-// of 300 through 900 seconds, defaulting to 900.
+// TestEvidenceStoreProbeIntervalIsBoundedAtLoad holds the range of 300 through
+// 900 seconds, defaulting to 900, for a site that declares
+// gateway-evidence-carriage/v1; a site that declares nothing is not held to it
+// (gateway-config/v2).
 func TestEvidenceStoreProbeIntervalIsBoundedAtLoad(t *testing.T) {
 	base := `
 gateway:
@@ -148,7 +158,7 @@ evidence:
   endpoint_env: ORI_EVIDENCE_ENDPOINT
   client_id_env: ORI_EVIDENCE_CLIENT_ID
   secret_env: ORI_EVIDENCE_INGEST_SECRET
-%s`
+%s%s`
 	for _, tc := range []struct {
 		name  string
 		extra string
@@ -162,21 +172,27 @@ evidence:
 		{"explicit zero", "  store_probe_interval_s: 0\n", 0},
 		{"negative", "  store_probe_interval_s: -1\n", 0},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.extra)))
-			if tc.want == 0 {
-				if err == nil || !strings.Contains(err.Error(), "store_probe_interval_s must be 300 through 900") {
-					t.Fatalf("load = %v, want the probe interval refusal", err)
+		for _, declared := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/declared=%v", tc.name, declared), func(t *testing.T) {
+				carriage := ""
+				if declared {
+					carriage = "  device_carriage:\n    dev-01: gateway-evidence-carriage/v1\n"
 				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cfg.Evidence.StoreProbeIntervalS != tc.want {
-				t.Fatalf("store_probe_interval_s = %d, want %d", cfg.Evidence.StoreProbeIntervalS, tc.want)
-			}
-		})
+				cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.extra, carriage)))
+				if tc.want == 0 && declared {
+					if err == nil || !strings.Contains(err.Error(), "store_probe_interval_s must be 300 through 900") {
+						t.Fatalf("load = %v, want the probe interval refusal", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.want != 0 && cfg.Evidence.StoreProbeIntervalS != tc.want {
+					t.Fatalf("store_probe_interval_s = %d, want %d", cfg.Evidence.StoreProbeIntervalS, tc.want)
+				}
+			})
+		}
 	}
 }
 
@@ -1337,13 +1353,13 @@ provider:
 	}
 }
 
-// TestDeviceIDsMustBeInTheEvidenceRoutingDomain: with the courier enabled, a
-// configured device outside the routing domain would have every artifact
-// refused malformed at admission, so the configuration is refused at load. The
-// domain is 1 to 128 Unicode scalar values with no control character (Cc), no
-// White_Space character, "/", "+" or "#" (gateway-config/v1). With the courier
-// disabled only the MQTT separators, wildcards, auth delimiters and control
-// characters (Cc, NUL among them) are refused.
+// TestDeviceIDsMustBeInTheEvidenceRoutingDomain: a device that declares
+// gateway-evidence-carriage/v1 is held to the evidence routing domain, 1 to 128
+// Unicode scalar values with no control character (Cc), no White_Space
+// character, "/", "+" or "#"; no other device is, whether the courier is
+// disabled, enabled with nothing declared, or enabled with another device
+// declaring (gateway-config/v2). Every device is held to gateway.device_ids'
+// own rule: no MQTT separator, wildcard, auth delimiter or control character.
 func TestDeviceIDsMustBeInTheEvidenceRoutingDomain(t *testing.T) {
 	// The rows whose identifier carries a control character: refused at load
 	// whether or not the courier is enabled.
@@ -1376,8 +1392,19 @@ func TestDeviceIDsMustBeInTheEvidenceRoutingDomain(t *testing.T) {
 		{"C1 control", "dev\\x9f01", false},
 		{"zero-width space, not White_Space", "dev\\u200b01", true},
 	} {
-		for _, enabled := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s/courier_enabled=%v", tc.name, enabled), func(t *testing.T) {
+		for _, mode := range []string{"disabled", "legacy", "subject declares", "other declares"} {
+			t.Run(fmt.Sprintf("%s/%s", tc.name, mode), func(t *testing.T) {
+				enabled := mode != "disabled"
+				carriage := ""
+				switch mode {
+				case "subject declares":
+					// A raw line or paragraph separator ends a block key's line
+					// in YAML; its escape decodes to the same identifier.
+					key := strings.NewReplacer("\u2028", `\L`, "\u2029", `\P`).Replace(tc.id)
+					carriage = fmt.Sprintf("  device_carriage:\n    \"%s\": gateway-evidence-carriage/v1\n", key)
+				case "other declares":
+					carriage = "  device_carriage:\n    dev-00: gateway-evidence-carriage/v1\n"
+				}
 				path := writeConfig(t, fmt.Sprintf(`
 gateway:
   broker_url: "tcp://localhost:1883"
@@ -1391,12 +1418,11 @@ evidence:
   endpoint_env: ORI_EVIDENCE_ENDPOINT
   client_id_env: ORI_EVIDENCE_CLIENT_ID
   secret_env: ORI_EVIDENCE_INGEST_SECRET
-`, tc.id, enabled))
+%s`, tc.id, enabled, carriage))
 				cfg, err := Load(path)
-				// Disabled, only the MQTT topic characters and control
-				// characters are refused.
 				mqtt := strings.ContainsAny(tc.id, "/+#")
-				if tc.valid || (!enabled && !mqtt && !controlRows[tc.name]) {
+				refused := mqtt || controlRows[tc.name] || (mode == "subject declares" && !tc.valid)
+				if !refused {
 					if err != nil {
 						t.Fatalf("refused: %v", err)
 					}

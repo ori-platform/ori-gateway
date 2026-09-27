@@ -8,6 +8,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/ori-platform/ori-gateway/internal/evidence/custody"
+	"github.com/ori-platform/ori-gateway/internal/evidence/faults"
+	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
 	"log/slog"
 	"os"
@@ -24,7 +27,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/dispatcher"
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
-	"github.com/ori-platform/ori-gateway/internal/evidence"
+	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -171,18 +174,18 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// acknowledgements that can never arrive is the failure mode this ordering
 	// removes. It is held rather than used: nothing routes an acknowledgement
 	// outbound until the inbound path lands.
-	var custodySigner *evidence.CustodySigner
+	var custodySigner *custody.Signer
 	if custodySecret != "" {
-		custodySigner, err = evidence.NewCustodySigner(custodySecret)
+		custodySigner, err = custody.NewSigner(custodySecret)
 		if err != nil {
 			return fmt.Errorf("construct custody signer: %w", err)
 		}
 	}
 
-	var evidenceQueue *evidence.DurableQueue
-	var evidenceFaults *evidence.FaultRecorder
-	var evidenceWorker *evidence.DeliveryWorker
-	var authoritySink *evidence.DurableAuthoritySink
+	var evidenceQueue *courier.DurableQueue
+	var evidenceFaults *faults.Recorder
+	var evidenceWorker *courier.DeliveryWorker
+	var authoritySink *courier.DurableAuthoritySink
 	if cfg.Evidence.Enabled {
 		if !gatewaySecrets.Enabled || custodySigner == nil {
 			return fmt.Errorf("evidence courier requires gateway auth and dedicated custody configuration")
@@ -193,30 +196,30 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 		// Capacity is reserved per configured device: each holds an equal share
 		// of max_items and max_bytes, so one device cannot exhaust another's.
-		evidenceFaults = evidence.NewFaultRecorder()
-		evidenceQueue, err = evidence.OpenDurableQueue(evidence.QueueOptions{
+		evidenceFaults = faults.NewRecorder()
+		evidenceQueue, err = courier.OpenDurableQueue(courier.QueueOptions{
 			Directory: cfg.Evidence.QueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
 			Devices: cfg.Gateway.DeviceIDs, Faults: evidenceFaults, FaultSource: "outbound", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence outbound queue: %w", err)
 		}
-		authoritySink, err = evidence.OpenDurableAuthoritySink(evidence.QueueOptions{
+		authoritySink, err = courier.OpenDurableAuthoritySink(courier.QueueOptions{
 			Directory: cfg.Evidence.ReturnQueueDirectory, MaxItems: cfg.Evidence.MaxItems, MaxBytes: cfg.Evidence.MaxBytes,
 			Faults: evidenceFaults, FaultSource: "return", Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("open evidence return queue: %w", err)
 		}
-		channel, err := evidence.NewHTTPChannel(evidence.HTTPChannelOptions{
+		channel, err := courier.NewHTTPChannel(courier.HTTPChannelOptions{
 			Endpoint: channelConfig.endpoint, ClientID: channelConfig.clientID, Secret: channelConfig.secret, Now: deps.now,
 		})
 		if err != nil {
 			return fmt.Errorf("construct independent evidence channel")
 		}
-		evidenceWorker, err = evidence.NewDeliveryWorker(
+		evidenceWorker, err = courier.NewDeliveryWorker(
 			evidenceQueue, channel, authoritySink,
-			evidence.DeliveryWorkerOptions{
+			courier.DeliveryWorkerOptions{
 				RetryInterval: time.Duration(cfg.Evidence.RetryIntervalS) * time.Second,
 				BackoffBase:   time.Duration(cfg.Evidence.BackoffBaseS) * time.Second,
 				MaxBackoff:    time.Duration(cfg.Evidence.BackoffMaxS) * time.Second,
@@ -360,21 +363,21 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if weeklyReport != nil {
 		runners.start("weekly report runner", weeklyReport.Run)
 	}
-	var evidenceIngress *evidence.RuntimeIngress
-	var returnPublisher *evidence.ReturnPublisher
+	var evidenceIngress *courier.RuntimeIngress
+	var returnPublisher *courier.ReturnPublisher
 	if evidenceWorker != nil {
-		courier, err := evidence.NewCourier(evidenceQueue, custodySigner)
+		evidenceCourier, err := courier.NewCourier(evidenceQueue, custodySigner)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("construct evidence courier: %w", err)
 		}
-		ackClock, err := evidence.OpenAckSigningClock(cfg.Evidence.QueueDirectory, deps.now)
+		ackClock, err := signingclock.OpenAck(cfg.Evidence.QueueDirectory, deps.now)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("open evidence acknowledgement clock: %w", err)
 		}
-		evidenceIngress, err = evidence.NewRuntimeIngress(
-			courier,
+		evidenceIngress, err = courier.NewRuntimeIngress(
+			evidenceCourier,
 			authoritySink,
 			ackClock,
 			evidenceBroker.Publish,
@@ -385,12 +388,12 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence runtime ingress: %w", err)
 		}
-		returnClock, err := evidence.OpenReturnSigningClock(cfg.Evidence.ReturnQueueDirectory, deps.now)
+		returnClock, err := signingclock.OpenReturn(cfg.Evidence.ReturnQueueDirectory, deps.now)
 		if err != nil {
 			shutdownRunners()
 			return fmt.Errorf("open evidence return signing clock: %w", err)
 		}
-		returnPublisher, err = evidence.NewReturnPublisher(
+		returnPublisher, err = courier.NewReturnPublisher(
 			authoritySink, returnClock, evidenceBroker.Publish, gatewaySecrets.CurrentSecret, gatewaySecrets.PreviousSecret,
 			deps.now, time.Duration(cfg.Evidence.RetryIntervalS)*time.Second,
 		)
@@ -676,7 +679,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}
 }
 
-func evidenceDeliveryView(worker *evidence.DeliveryWorker) *site.GatewayEvidenceDeliveryView {
+func evidenceDeliveryView(worker *courier.DeliveryWorker) *site.GatewayEvidenceDeliveryView {
 	if worker == nil {
 		return nil
 	}
@@ -705,14 +708,6 @@ func evidenceDeliveryView(worker *evidence.DeliveryWorker) *site.GatewayEvidence
 			}
 		}
 		view.Devices = append(view.Devices, entry)
-	}
-	view.ArchivedRegistrations = make([]site.GatewayEvidenceArchivedRegistration, 0, len(status.Archived))
-	for _, archived := range status.Archived {
-		view.ArchivedRegistrations = append(view.ArchivedRegistrations, site.GatewayEvidenceArchivedRegistration{
-			DeviceID: archived.DeviceID, ArtifactDigest: archived.ArtifactDigest,
-			RefusalStatus: archived.RefusalStatus, Reason: archived.Reason,
-			RefusedAtMS: archived.RefusedAt.UnixMilli(), Acknowledged: archived.Acknowledged,
-		})
 	}
 	return view
 }
@@ -910,7 +905,7 @@ func resolveCustodySecret(
 	}
 	// Read exactly as provisioned. The custody MAC keys from these bytes, so
 	// trimming would key from bytes the operator did not set and derive an
-	// identifier no conforming peer reproduces; evidence.NewCustodySigner
+	// identifier no conforming peer reproduces; custody.NewSigner
 	// refuses surrounding whitespace instead.
 	secret := os.Getenv(envName)
 	if secret == "" {

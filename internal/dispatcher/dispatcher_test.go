@@ -409,7 +409,7 @@ func TestDispatcherConcurrentDuplicateRequestIDPublishesOnce(t *testing.T) {
 	}()
 	time.Sleep(5 * time.Millisecond)
 	close(block)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
@@ -438,7 +438,7 @@ func TestDispatcherSequentialDuplicateRequestIDResponsesAreCorrelated(t *testing
 	if prov.callCount() != 2 || pub.callCount() != 2 {
 		t.Fatalf("provider/publish calls = %d/%d", prov.callCount(), pub.callCount())
 	}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		resp := pub.responseAt(t, i)
 		if resp.RequestID != "req-1" || resp.ActionTier != contracts.ActionTierC {
 			t.Fatalf("response %d not correlated: %#v", i, resp)
