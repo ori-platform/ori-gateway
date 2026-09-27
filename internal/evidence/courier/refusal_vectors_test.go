@@ -155,6 +155,26 @@ func deviceRegistration(device string, n int) []byte {
 
 // laneState is a device's evidence-lane entry, where every checkpoint and
 // envelope travels.
+// quiesceLanes holds each lane's delivery lock, waiting out any attempt in
+// flight, until the returned release: no attempt runs meanwhile, and the
+// first attempt after the release consumes every wake pending until then.
+func quiesceLanes(worker *DeliveryWorker, keys ...LaneKey) func() {
+	lanes := make([]*deliveryLane, 0, len(keys))
+	for _, key := range keys {
+		lane := worker.lane(key)
+		lane.deliveryMu.Lock()
+		lanes = append(lanes, lane)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for _, lane := range lanes {
+				lane.deliveryMu.Unlock()
+			}
+		})
+	}
+}
+
 func laneState(worker *DeliveryWorker, device string) (DeviceDeliveryStatus, bool) {
 	return laneEntry(worker, LaneKey{Device: device, Lane: LaneEvidence})
 }
@@ -650,6 +670,18 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					e, ok := laneEntry(worker, other)
 					otherWaits = ok && e.State == DeviceWaitingHandoff
 				}
+				// A step that signals a handoff runs against quiescent lanes:
+				// no attempt is in flight, and the first attempt after the
+				// release answers every wake pending until then, so an attempt
+				// counted here is one this step caused.
+				release := func() {}
+				switch step.Event {
+				case "deliver", "handoff", "artifact_handed_off_in_other_lane", "queue_full":
+					if worker != nil {
+						release = quiesceLanes(worker, key, other)
+					}
+				}
+				defer release()
 				if step.Event == "deliver" {
 					kind, payload := laneArtifact(key, generation[key])
 					if _, err := q.Enqueue(kind, payload); err != nil {
@@ -675,14 +707,16 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					} else {
 						worker.NotifyDevice(key.Device)
 					}
+					release()
 					if !waitUntil(func() bool { return authority.attempts(key) == before+1 }) {
-						return label + ": no attempt"
+						return fmt.Sprintf("%s: %d attempts, want one", label, authority.attempts(key)-before)
 					}
 					if otherWaits && !waitUntil(func() bool { return authority.attempts(other) == otherBefore+1 }) {
-						return label + ": the other lane was not retried on the handoff"
+						return fmt.Sprintf("%s: the other lane was retried %d times on the handoff, want once", label, authority.attempts(other)-otherBefore)
 					}
 				case "handoff":
 					worker.NotifyDevice(key.Device)
+					release()
 				case "timer_elapsed":
 					time.Sleep(3 * retry)
 				case "restart":
@@ -691,11 +725,13 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					newWorker()
 				case "artifact_handed_off_in_other_lane":
 					worker.NotifyDevice(key.Device)
+					release()
 				case "queue_full":
 					// An authenticated queue_full for a configured device is a
 					// handoff: the outbound subscription notifies the device
 					// after the ingress publishes the refusal.
 					worker.NotifyDevice(key.Device)
+					release()
 				case "queue_full_unconfigured_device", "admission_unauthenticated":
 					// Refused before the ingress admits anything: the
 					// subscription returns without notifying the device.

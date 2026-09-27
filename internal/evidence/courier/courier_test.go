@@ -368,6 +368,53 @@ func TestAHandoffBeforeAnAttemptIsNotTheNextHandoff(t *testing.T) {
 	}
 }
 
+// handoffPins are the handoff-ordering cases this courier does not yet
+// satisfy.
+var handoffPins = map[string]vectorPin{
+	"a handoff signalled for an admission the attempt already sent is not the next handoff": {
+		Requirement: "missing_requirement:handoff-ordering",
+		Issue:       "https://github.com/ori-platform/ori-gateway/issues/106",
+		Observed:    "the admission's late signal retried the refusal: 2 attempts",
+	},
+}
+
+// TestALateSignalForAnAlreadySentAdmissionIsNotTheNextHandoff fixes the
+// interleaving in which an admission commits, an attempt sends it and is
+// refused as receiver state, and only then does that admission's handoff
+// signal arrive. The signal announces nothing the attempt did not send, so it
+// is not the next handoff and must not retry the refusal.
+func TestALateSignalForAnAlreadySentAdmissionIsNotTheNextHandoff(t *testing.T) {
+	const name = "a handoff signalled for an admission the attempt already sent is not the next handoff"
+	checkPinsExist(t, handoffPins, []string{name})
+	q := openTestQueue(t, 10, 1<<20)
+	// The admission commits; its signal is held back.
+	if _, err := q.Enqueue(ArtifactCheckpoint, []byte(`{"v":1,"device_id":"d"}`)); err != nil {
+		t.Fatal(err)
+	}
+	channel := &receiverStateChannel{}
+	worker, err := NewDeliveryWorker(q, channel, nil, DeliveryWorkerOptions{
+		RetryInterval: 5 * time.Millisecond, Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The process start sends the admitted artifact, which is refused.
+	running := startWorker(t, worker)
+	waitFor(t, "the refused attempt", func() bool {
+		e, ok := laneState(worker, "d")
+		return channel.calls.Load() == 1 && ok && e.State == DeviceWaitingHandoff
+	})
+	// The admission's signal arrives late.
+	worker.NotifyDevice("d")
+	time.Sleep(50 * time.Millisecond)
+	running.stop()
+	observed := ""
+	if calls := channel.calls.Load(); calls != 1 {
+		observed = fmt.Sprintf("the admission's late signal retried the refusal: %d attempts", calls)
+	}
+	checkPin(t, handoffPins, name, observed)
+}
+
 func TestAuthorityRetryAfterOverridesShortLocalRetry(t *testing.T) {
 	q := openTestQueue(t, 10, 1<<20)
 	if _, err := q.Enqueue(ArtifactCheckpoint, []byte(`{"v":1,"device_id":"d"}`)); err != nil {

@@ -28,6 +28,7 @@ var requirementIssues = []struct{ Requirement, Issue string }{
 	{Requirement: "missing_requirement:routing-anchor-epoch", Issue: "https://github.com/ori-platform/ori-gateway/issues/104"},
 	{Requirement: "missing_requirement:disposition-carriage", Issue: "https://github.com/ori-platform/ori-gateway/issues/105"},
 	{Requirement: "missing_requirement:stopped-custody-bounds", Issue: "https://github.com/ori-platform/ori-gateway/issues/105"},
+	{Requirement: "missing_requirement:handoff-ordering", Issue: "https://github.com/ori-platform/ori-gateway/issues/106"},
 }
 
 var (

@@ -310,13 +310,6 @@ func (l *deliveryLane) run(ctx context.Context) {
 			}
 		}
 
-		// This attempt sends the lane's current head, so it answers every
-		// handoff already pending: a wake left from before it is not the next
-		// handoff that a receiver-state refusal waits for.
-		select {
-		case <-l.wake:
-		default:
-		}
 		delivered, err := l.deliverHead(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
@@ -422,6 +415,14 @@ func stopTimer(timer *time.Timer) {
 func (l *deliveryLane) deliverHead(ctx context.Context) (bool, error) {
 	l.deliveryMu.Lock()
 	defer l.deliveryMu.Unlock()
+	// This attempt sends the lane's head as it reads it now, so it answers
+	// every handoff already pending: a wake left from before it is not the next
+	// handoff that a receiver-state refusal waits for. The wake is consumed
+	// under the same lock as the head is read, so no handoff falls between.
+	select {
+	case <-l.wake:
+	default:
+	}
 
 	queued, ok := l.adoptedHead()
 	if l.releaseHeldUnless(queued, ok) {
