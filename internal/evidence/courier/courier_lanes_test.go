@@ -361,14 +361,20 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 	}
 	enqueueEnvelopes(t, q, "dev-a", 1, 2)
 	envelope, _ := q.PeekLane(evLane)
-	worker := laneWorker(t, q, authority, nil, 400*time.Millisecond)
+	// The back-off is the delivery interval: long enough that stopping,
+	// reopening and restarting fall well inside it on any machine.
+	worker := laneWorker(t, q, authority, nil, time.Second)
 	running := startWorker(t, worker)
 	waitFor(t, "the persisted back-off", func() bool { _, ok := q.BackoffFor(registration.ID); return ok })
 	waitFor(t, "the persisted hold", func() bool { _, ok := q.HoldFor(envelope.ID); return ok })
 	running.stop()
 
 	reopened := openTestQueueAt(t, dir, 100, 1<<24)
-	next := laneWorker(t, reopened, authority, nil, 400*time.Millisecond)
+	persisted, ok := reopened.BackoffFor(registration.ID)
+	if !ok {
+		t.Fatal("the registration's back-off was not persisted")
+	}
+	next := laneWorker(t, reopened, authority, nil, time.Second)
 	reg, okReg := laneEntry(next, regLane)
 	ev, okEv := laneEntry(next, evLane)
 	if !okReg || reg.State != DeviceBackingOff || reg.Pending != 1 {
@@ -379,7 +385,13 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 	}
 	startWorker(t, next)
 	next.NotifyDevice("dev-a")
-	time.Sleep(100 * time.Millisecond)
+	// Observe before the persisted back-off elapses: an attempt then is the
+	// restart sending early, and one after it is the back-off doing its job.
+	notBefore := time.UnixMilli(persisted.NotBeforeMS)
+	time.Sleep(min(100*time.Millisecond, time.Until(notBefore)-50*time.Millisecond))
+	if time.Now().After(notBefore) {
+		t.Fatal("setup outlasted the persisted back-off, so the restart was not observed before it")
+	}
 	if authority.count(regLane) != 1 || authority.count(evLane) != 1 {
 		t.Fatalf("restart sent early: registration %d, envelope %d", authority.count(regLane), authority.count(evLane))
 	}
