@@ -379,7 +379,9 @@ func TestBackoffSurvivesARestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := deviceWorker(t, q, authority, nil, 400*time.Millisecond)
+	// The back-off is the delivery interval: long enough that stopping,
+	// reopening and restarting fall well inside it on any machine.
+	worker := deviceWorker(t, q, authority, nil, time.Second)
 	running := startWorker(t, worker)
 	waitFor(t, "the back-off", func() bool { _, ok := q.BackoffFor(entry.ID); return ok })
 	running.stop()
@@ -389,13 +391,19 @@ func TestBackoffSurvivesARestart(t *testing.T) {
 	}
 
 	reopened := openTestQueueAt(t, dir, 100, 1<<24)
-	next := deviceWorker(t, reopened, authority, nil, 400*time.Millisecond)
+	next := deviceWorker(t, reopened, authority, nil, time.Second)
 	if e, ok := laneState(next, "dev-a"); !ok || e.State != DeviceBackingOff {
 		t.Fatalf("restart forgot the back-off: %#v", e)
 	}
 	startWorker(t, next)
 	next.NotifyDevice("dev-a")
-	time.Sleep(100 * time.Millisecond)
+	// Observe before the persisted back-off elapses: an attempt then is the
+	// restart resending early.
+	notBefore := time.UnixMilli(record.NotBeforeMS)
+	time.Sleep(min(100*time.Millisecond, time.Until(notBefore)-50*time.Millisecond))
+	if time.Now().After(notBefore) {
+		t.Fatal("setup outlasted the persisted back-off, so the restart was not observed before it")
+	}
 	if authority.count("dev-a") != 1 {
 		t.Fatalf("restart resent before the back-off elapsed: %d attempts", authority.count("dev-a"))
 	}
