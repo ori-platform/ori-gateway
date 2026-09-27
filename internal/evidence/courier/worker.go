@@ -310,6 +310,13 @@ func (l *deliveryLane) run(ctx context.Context) {
 			}
 		}
 
+		// This attempt sends the lane's current head, so it answers every
+		// handoff already pending: a wake left from before it is not the next
+		// handoff that a receiver-state refusal waits for.
+		select {
+		case <-l.wake:
+		default:
+		}
 		delivered, err := l.deliverHead(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {

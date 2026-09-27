@@ -326,6 +326,48 @@ func TestAHeldLaneNeverReadsWithoutItsFailure(t *testing.T) {
 	}
 }
 
+type receiverStateChannel struct {
+	calls atomic.Int32
+}
+
+func (c *receiverStateChannel) Deliver(_ context.Context, _ QueuedArtifact) (DeliveryResult, error) {
+	c.calls.Add(1)
+	return DeliveryResult{Accepted: false, ReceiverState: true, RefusalStatus: 422, RefusalReason: "unknown_key"}, nil
+}
+
+// TestAHandoffBeforeAnAttemptIsNotTheNextHandoff holds a receiver-state
+// refusal to one attempt when the only handoff arrived before it: a lane that
+// starts with a handoff pending and its start timer due attempts once, and the
+// refusal waits for a handoff that arrives after it.
+func TestAHandoffBeforeAnAttemptIsNotTheNextHandoff(t *testing.T) {
+	for range 30 {
+		q := openTestQueue(t, 10, 1<<20)
+		if _, err := q.Enqueue(ArtifactCheckpoint, []byte(`{"v":1,"device_id":"d"}`)); err != nil {
+			t.Fatal(err)
+		}
+		channel := &receiverStateChannel{}
+		worker, err := NewDeliveryWorker(q, channel, nil, DeliveryWorkerOptions{
+			RetryInterval: 5 * time.Millisecond, Logger: slog.New(slog.DiscardHandler),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The lane exists with a handoff pending before it runs, so its start
+		// timer and the handoff are both ready when it begins.
+		worker.NotifyDevice("d")
+		running := startWorker(t, worker)
+		waitFor(t, "the first attempt", func() bool { return channel.calls.Load() >= 1 })
+		time.Sleep(30 * time.Millisecond)
+		if calls := channel.calls.Load(); calls != 1 {
+			running.stop()
+			t.Fatalf("a handoff from before the attempt retried the refusal: %d attempts", calls)
+		}
+		worker.NotifyDevice("d")
+		waitFor(t, "the retry on the next handoff", func() bool { return channel.calls.Load() == 2 })
+		running.stop()
+	}
+}
+
 func TestAuthorityRetryAfterOverridesShortLocalRetry(t *testing.T) {
 	q := openTestQueue(t, 10, 1<<20)
 	if _, err := q.Enqueue(ArtifactCheckpoint, []byte(`{"v":1,"device_id":"d"}`)); err != nil {
