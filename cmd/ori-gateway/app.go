@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -215,8 +216,16 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("open evidence return queue: %w", err)
 		}
+		var authorityCAs *x509.CertPool
+		if cfg.Evidence.AuthorityCAFile != "" {
+			authorityCAs, err = courier.LoadAuthorityTrust(cfg.Evidence.AuthorityCAFile)
+			if err != nil {
+				return err
+			}
+		}
 		channel, err := courier.NewHTTPChannel(courier.HTTPChannelOptions{
 			Endpoint: channelConfig.endpoint, ClientID: channelConfig.clientID, Secret: channelConfig.secret, Now: deps.now,
+			AuthorityCAs: authorityCAs,
 		})
 		if err != nil {
 			return fmt.Errorf("construct independent evidence channel")

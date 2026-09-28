@@ -120,6 +120,9 @@ type EvidenceConfig struct {
 	EndpointEnv         string `yaml:"endpoint_env"`
 	ClientIDEnv         string `yaml:"client_id_env"`
 	SecretEnv           string `yaml:"secret_env"`
+	// AuthorityCAFile is an absolute path to a PEM bundle of CA certificates;
+	// when set, the courier trusts only these for the authority's endpoint.
+	AuthorityCAFile string `yaml:"authority_ca_file"`
 	// DeviceCarriage is each configured device's declared inbound evidence
 	// carriage, every configured device named, after defaults
 	// (gateway-config/v2). Nil while the courier is disabled.
@@ -336,6 +339,7 @@ type fileEvidenceConfig struct {
 	EndpointEnv          string `yaml:"endpoint_env"`
 	ClientIDEnv          string `yaml:"client_id_env"`
 	SecretEnv            string `yaml:"secret_env"`
+	AuthorityCAFile      string `yaml:"authority_ca_file"`
 	// DeviceCarriage is decoded as supplied; a value that is not a map of
 	// strings fails the decode rather than reading as legacy.
 	DeviceCarriage map[string]string `yaml:"device_carriage"`
@@ -523,6 +527,7 @@ func normalizeEvidence(raw fileEvidenceConfig) EvidenceConfig {
 		EndpointEnv:          strings.TrimSpace(raw.EndpointEnv),
 		ClientIDEnv:          strings.TrimSpace(raw.ClientIDEnv),
 		SecretEnv:            strings.TrimSpace(raw.SecretEnv),
+		AuthorityCAFile:      raw.AuthorityCAFile,
 		DeviceCarriage:       raw.DeviceCarriage,
 	}
 }
@@ -545,6 +550,10 @@ func validateEvidence(cfg *EvidenceConfig, deviceIDs []string) error {
 	}
 	if filepath.Clean(cfg.QueueDirectory) == filepath.Clean(cfg.ReturnQueueDirectory) {
 		return fmt.Errorf("evidence outbound and return queues must use distinct directories")
+	}
+	// Its contents are verified when the courier starts; here only its form.
+	if cfg.AuthorityCAFile != "" && (!filepath.IsAbs(cfg.AuthorityCAFile) || strings.TrimSpace(cfg.AuthorityCAFile) != cfg.AuthorityCAFile) {
+		return fmt.Errorf("evidence.authority_ca_file must be an absolute path")
 	}
 	if cfg.MaxItems <= 0 || cfg.MaxBytes <= 0 || cfg.RetryIntervalS <= 0 {
 		return fmt.Errorf("evidence queue bounds and retry interval must be positive")
