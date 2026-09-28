@@ -59,3 +59,11 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      - name: Test the authority CA bundle's ownership checks as root
+        run: |
+          out="$(sudo env "PATH=$PATH" "GOFLAGS=$GOFLAGS" "CGO_ENABLED=$CGO_ENABLED" \
+            "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=$(mktemp -d)" \
+            go test ./internal/evidence/courier -run '^TestADirectoryOwnedByAnotherUserIsRefused$' -count=1 -v)"
+          echo "$out"
+          grep -q -- '--- PASS: TestADirectoryOwnedByAnotherUserIsRefused' <<<"$out"

@@ -552,8 +552,8 @@ func validateEvidence(cfg *EvidenceConfig, deviceIDs []string) error {
 		return fmt.Errorf("evidence outbound and return queues must use distinct directories")
 	}
 	// Its contents are verified when the courier starts; here only its form.
-	if cfg.AuthorityCAFile != "" && (!filepath.IsAbs(cfg.AuthorityCAFile) || strings.TrimSpace(cfg.AuthorityCAFile) != cfg.AuthorityCAFile) {
-		return fmt.Errorf("evidence.authority_ca_file must be an absolute path")
+	if cfg.AuthorityCAFile != "" && (!filepath.IsAbs(cfg.AuthorityCAFile) || filepath.Clean(cfg.AuthorityCAFile) != cfg.AuthorityCAFile || strings.TrimSpace(cfg.AuthorityCAFile) != cfg.AuthorityCAFile) {
+		return fmt.Errorf("evidence.authority_ca_file must be an absolute, clean path")
 	}
 	if cfg.MaxItems <= 0 || cfg.MaxBytes <= 0 || cfg.RetryIntervalS <= 0 {
 		return fmt.Errorf("evidence queue bounds and retry interval must be positive")

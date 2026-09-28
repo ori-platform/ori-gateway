@@ -239,7 +239,7 @@ evidence:
 	}
 }
 
-func TestEvidenceAuthorityCAFileMustBeAbsolute(t *testing.T) {
+func TestEvidenceAuthorityCAFileMustBeAbsoluteAndClean(t *testing.T) {
 	base := `
 gateway:
   broker_url: "tcp://localhost:1883"
@@ -265,6 +265,8 @@ evidence:
 		{"relative", "authority-ca.pem", true},
 		{"dot relative", "./authority-ca.pem", true},
 		{"trailing space", "/etc/ori-gateway/authority-ca.pem ", true},
+		{"unclean", "/etc/ori-gateway/../ori-gateway/authority-ca.pem", true},
+		{"double slash", "/etc//ori-gateway/authority-ca.pem", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.path)))

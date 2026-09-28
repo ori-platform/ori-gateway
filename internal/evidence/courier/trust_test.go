@@ -78,9 +78,33 @@ func (ca testCA) leaf(t *testing.T, dnsNames []string, ips []net.IP) tls.Certifi
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
-func writeBundle(t *testing.T, data []byte, mode os.FileMode) string {
+// trustDir makes a private directory whose every ancestor the test user or
+// root owns and no one else can write. t.TempDir cannot serve: /tmp is
+// world-writable on Linux, and /var is a symlink on macOS.
+func trustDir(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "authority-ca.pem")
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(wd, ".trust-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
+}
+
+func writeBundleIn(t *testing.T, dir string, data []byte, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(dir, "authority-ca.pem")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +112,11 @@ func writeBundle(t *testing.T, data []byte, mode os.FileMode) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeBundle(t *testing.T, data []byte, mode os.FileMode) string {
+	t.Helper()
+	return writeBundleIn(t, trustDir(t), data, mode)
 }
 
 // authorityServer serves the ingest path over TLS with cert, answering 204.
@@ -106,7 +135,7 @@ func authorityServer(t *testing.T, cert tls.Certificate) *httptest.Server {
 // with the bundle at path, and returns its error.
 func reach(t *testing.T, path, url string) error {
 	t.Helper()
-	pool, err := LoadAuthorityTrust(path)
+	pool, err := LoadAuthorityTrust(path, os.Getuid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,8 +210,54 @@ func TestAnUnsafeOrMalformedBundleIsRefused(t *testing.T) {
 		path func() string
 		want string
 	}{
-		{"missing", func() string { return filepath.Join(t.TempDir(), "absent.pem") }, "no such file"},
-		{"a directory", func() string { return t.TempDir() }, "regular file"},
+		{"missing", func() string { return filepath.Join(trustDir(t), "absent.pem") }, "no such file"},
+		{"a directory", func() string { return trustDir(t) }, "regular file"},
+		{"relative", func() string { return "authority-ca.pem" }, "absolute and clean"},
+		{"unclean", func() string {
+			dir := trustDir(t)
+			writeBundleIn(t, dir, ca.pem, 0o644)
+			return dir + "/./authority-ca.pem"
+		}, "absolute and clean"},
+		{"a group-writable parent", func() string {
+			dir := trustDir(t)
+			path := writeBundleIn(t, dir, ca.pem, 0o644)
+			chmod(t, dir, 0o770)
+			return path
+		}, "writable by group or others"},
+		{"a world-writable parent", func() string {
+			dir := trustDir(t)
+			path := writeBundleIn(t, dir, ca.pem, 0o644)
+			chmod(t, dir, 0o707)
+			return path
+		}, "writable by group or others"},
+		{"a world-writable grandparent", func() string {
+			outer := trustDir(t)
+			inner := filepath.Join(outer, "inner")
+			mkdir(t, inner)
+			path := writeBundleIn(t, inner, ca.pem, 0o644)
+			chmod(t, outer, 0o777)
+			return path
+		}, "writable by group or others"},
+		{"a symlinked parent", func() string {
+			outer := trustDir(t)
+			real := filepath.Join(outer, "real")
+			mkdir(t, real)
+			writeBundleIn(t, real, ca.pem, 0o644)
+			link := filepath.Join(outer, "link")
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(link, "authority-ca.pem")
+		}, "is a symlink"},
+		{"a symlinked bundle", func() string {
+			dir := trustDir(t)
+			target := writeBundleIn(t, dir, ca.pem, 0o644)
+			link := filepath.Join(dir, "link.pem")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			return link
+		}, "is a symlink"},
 		{"group writable", func() string { return writeBundle(t, ca.pem, 0o664) }, "writable"},
 		{"world writable", func() string { return writeBundle(t, ca.pem, 0o646) }, "writable"},
 		{"empty", func() string { return writeBundle(t, nil, 0o644) }, "no certificate"},
@@ -197,18 +272,79 @@ func TestAnUnsafeOrMalformedBundleIsRefused(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := LoadAuthorityTrust(tc.path())
+			_, err := LoadAuthorityTrust(tc.path(), os.Getuid())
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want an error containing %q, got %v", tc.want, err)
 			}
 		})
 	}
-	link := filepath.Join(t.TempDir(), "link.pem")
-	if err := os.Symlink(writeBundle(t, ca.pem, 0o644), link); err != nil {
+}
+
+func TestABundleOwnedByAnotherUserIsRefused(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root owns the bundle, and root is always trusted")
+	}
+	path := writeBundle(t, newTestCA(t, "authority CA").pem, 0o644)
+	// The test user owns the bundle and every directory it made; trusting
+	// only some other user makes each of them an untrusted owner.
+	_, err := LoadAuthorityTrust(path, os.Getuid()+1)
+	if err == nil || !strings.Contains(err.Error(), "owned by an untrusted user") {
+		t.Fatalf("a bundle owned by an untrusted user was accepted: %v", err)
+	}
+	if _, err := LoadAuthorityTrust(path, os.Getuid()); err != nil {
+		t.Fatalf("the same bundle under its trusted owner was refused: %v", err)
+	}
+}
+
+// TestADirectoryOwnedByAnotherUserIsRefused needs root to hand a directory to
+// another user. CI runs it under sudo; as any other user it skips.
+func TestADirectoryOwnedByAnotherUserIsRefused(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to create a directory another user owns")
+	}
+	const other = 54321
+	// Under /, so every ancestor is root's, wherever the checkout lives.
+	outer, err := os.MkdirTemp("/", ".ori-trust-test-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadAuthorityTrust(link); err == nil || !strings.Contains(err.Error(), "regular file") {
-		t.Fatalf("a symlinked bundle was accepted: %v", err)
+	t.Cleanup(func() { _ = os.RemoveAll(outer) })
+	if err := os.Chmod(outer, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(outer, "inner")
+	mkdir(t, inner)
+	path := writeBundleIn(t, inner, newTestCA(t, "authority CA").pem, 0o644)
+	if _, err := LoadAuthorityTrust(path, 0); err != nil {
+		t.Fatalf("a root-owned bundle under root-owned directories was refused: %v", err)
+	}
+	for _, owned := range []string{outer, inner} {
+		if err := os.Chown(owned, other, other); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadAuthorityTrust(path, 0)
+		if err == nil || !strings.Contains(err.Error(), owned+" is owned by an untrusted user") {
+			t.Fatalf("a directory owned by uid %d was trusted: %v", other, err)
+		}
+		if err := os.Chown(owned, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func chmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	// Restore access so cleanup can remove the tree.
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+}
+
+func mkdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
 	}
 }
 

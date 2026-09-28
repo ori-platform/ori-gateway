@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // maxAuthorityTrustBytes bounds the CA bundle read at startup.
@@ -18,20 +19,20 @@ const maxAuthorityTrustBytes = 1 << 20
 // LoadAuthorityTrust reads the CA bundle the courier trusts for the evidence
 // authority, in place of the system trust store.
 //
-// Whoever can change this file decides whom the gateway believes it is
-// delivering evidence to, so the file must be a regular file that no group or
-// other user can write. It holds only CA certificates: several during a
-// rotation, and never a private key or a leaf.
-func LoadAuthorityTrust(path string) (*x509.CertPool, error) {
-	info, err := os.Lstat(path)
+// Whoever can change this file, or any directory above it, decides whom the
+// gateway believes it is delivering evidence to. So the path must be absolute
+// and clean with no symlink in any component, and the file and every directory
+// above it must be owned by root or by trustedOwner and writable by no group
+// or other user. The gateway passes root (0) as trustedOwner. The file holds
+// only CA certificates: several during a rotation, never a private key or a
+// leaf.
+func LoadAuthorityTrust(path string, trustedOwner int) (*x509.CertPool, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("evidence: authority CA bundle path must be absolute and clean")
+	}
+	info, err := checkTrustPath(path, trustedOwner)
 	if err != nil {
-		return nil, fmt.Errorf("evidence: authority CA bundle: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("evidence: authority CA bundle must be a regular file")
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("evidence: authority CA bundle must not be writable by group or others")
+		return nil, err
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -52,6 +53,44 @@ func LoadAuthorityTrust(path string) (*x509.CertPool, error) {
 	if len(data) > maxAuthorityTrustBytes {
 		return nil, fmt.Errorf("evidence: authority CA bundle exceeds %d bytes", maxAuthorityTrustBytes)
 	}
+	return parseAuthorityTrust(data)
+}
+
+// checkTrustPath checks the bundle and every directory above it, and returns
+// the bundle's own information.
+func checkTrustPath(path string, trustedOwner int) (os.FileInfo, error) {
+	var bundle os.FileInfo
+	for component := path; ; component = filepath.Dir(component) {
+		info, err := os.Lstat(component)
+		if err != nil {
+			return nil, fmt.Errorf("evidence: authority CA bundle: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("evidence: authority CA bundle path component %s is a symlink", component)
+		}
+		if bundle == nil {
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("evidence: authority CA bundle must be a regular file")
+			}
+			bundle = info
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			return nil, fmt.Errorf("evidence: authority CA bundle path component %s is writable by group or others", component)
+		}
+		owner, ok := fileOwner(info)
+		if !ok {
+			return nil, fmt.Errorf("evidence: authority CA bundle owner cannot be determined on this platform")
+		}
+		if owner != 0 && owner != trustedOwner {
+			return nil, fmt.Errorf("evidence: authority CA bundle path component %s is owned by an untrusted user", component)
+		}
+		if parent := filepath.Dir(component); parent == component {
+			return bundle, nil
+		}
+	}
+}
+
+func parseAuthorityTrust(data []byte) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	count := 0
 	rest := data
