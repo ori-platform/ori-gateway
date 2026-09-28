@@ -26,6 +26,7 @@ var evidenceRuleMessages = map[string]string{
 	"share":       "shared equally across",
 	"env":         "must be an environment variable name",
 	"device_id":   "gateway.device_ids",
+	"ca_file":     "evidence.authority_ca_file",
 	// The loader enforces neither rule yet; a refusal must name its key.
 	"carriage": "evidence.device_carriage",
 	"stopped":  "evidence.stopped",
@@ -55,6 +56,8 @@ func TestEvidenceConfigVectors(t *testing.T) {
 				BackoffBaseS        int   `json:"backoff_base_s"`
 				BackoffMaxS         int   `json:"backoff_max_s"`
 				StoreProbeIntervalS int   `json:"store_probe_interval_s"`
+				// Its default is empty: the system trust store.
+				AuthorityCAFile string `json:"authority_ca_file"`
 				// gateway-config/v2's evidence-carriage and stopped-custody
 				// keys, which the loader does not yet produce.
 				DeviceCarriage        map[string]string `json:"device_carriage"`
@@ -136,7 +139,7 @@ func TestEvidenceConfigVectors(t *testing.T) {
 			e := tc.Effective
 			if got.MaxItems != e.MaxItems || got.MaxBytes != e.MaxBytes || got.RetryIntervalS != e.RetryIntervalS ||
 				got.BackoffBaseS != e.BackoffBaseS || got.BackoffMaxS != e.BackoffMaxS ||
-				got.StoreProbeIntervalS != e.StoreProbeIntervalS {
+				got.StoreProbeIntervalS != e.StoreProbeIntervalS || got.AuthorityCAFile != e.AuthorityCAFile {
 				report("effective = %+v, corpus = %+v", got, *e)
 				return
 			}
