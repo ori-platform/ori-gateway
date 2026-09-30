@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -620,9 +621,10 @@ func TestABackwardsClockNeverShortensARetryAfter(t *testing.T) {
 		{"without one", 0, 200 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// A clamp is kept in whole milliseconds, rounded up.
 			near := func(got time.Time) bool {
 				want := time.Now().Add(tc.bound)
-				return !got.After(want) && got.After(want.Add(-100*time.Millisecond))
+				return !got.After(want.Add(time.Millisecond)) && got.After(want.Add(-100*time.Millisecond))
 			}
 			// A deadline an hour away is one a clock that moved backwards
 			// produced: restored, it is clamped to the longest wait the
@@ -649,13 +651,146 @@ func TestABackwardsClockNeverShortensARetryAfter(t *testing.T) {
 			lane.mu.Lock()
 			lane.notBefore, lane.retryAfter = time.Now().Round(0).Add(far), tc.retryAfter
 			lane.mu.Unlock()
-			if wait := lane.untilDue(); wait > tc.bound || wait < tc.bound-100*time.Millisecond {
+			if wait := lane.untilDue(); wait > tc.bound+time.Millisecond || wait < tc.bound-100*time.Millisecond {
 				t.Fatalf("waits %s, want %s", wait, tc.bound)
 			}
 			if got := worker.nextAttempt("dev-a"); !near(got) {
 				t.Fatalf("deadline in %s, want %s", time.Until(got), tc.bound)
 			}
 		})
+	}
+}
+
+// clampWorker backs off from 250ms to a 2s bound, reading the given clock.
+func clampWorker(t *testing.T, q *DurableQueue, wall *steppedClock) *DeliveryWorker {
+	t.Helper()
+	worker, err := NewDeliveryWorker(q, &fakeEvidenceChannel{}, nil, DeliveryWorkerOptions{
+		RetryInterval: 250 * time.Millisecond, MaxBackoff: 2 * time.Second, BlockedReminderInterval: time.Hour,
+		Logger: slog.New(slog.DiscardHandler), clock: wall.clock(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker
+}
+
+// clampCases are an ordinary back-off, bounded by the back-off bound, and an
+// active Retry-After beyond it, bounded by the Retry-After.
+var clampCases = []struct {
+	name       string
+	retryAfter time.Duration
+	bound      time.Duration
+}{
+	{"an ordinary back-off", 0, 2 * time.Second},
+	{"an active Retry-After", 3 * time.Second, 3 * time.Second},
+}
+
+// clampRecord persists a back-off for a fresh artifact, due in the given time
+// on the wall clock, with three attempts and the case's floor.
+func clampRecord(t *testing.T, q *DurableQueue, wall *steppedClock, in, retryAfter time.Duration) BackoffRecord {
+	t.Helper()
+	entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := BackoffRecord{QueueRecord: entry.ID, NotBeforeMS: wall.clock().wall().Add(in).UnixMilli(), Attempts: 3}
+	if retryAfter > 0 {
+		ms := retryAfter.Milliseconds()
+		record.RetryAfterMS = &ms
+	}
+	if err := q.SetBackoff(record); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = q.BackoffFor(entry.ID)
+	return record
+}
+
+// clampByPath clamps a back-off after the wall clock moved an hour
+// backwards, either as it is restored or as this process asks, and returns
+// the clamped deadline and the worker that holds it.
+func clampByPath(t *testing.T, q *DurableQueue, wall *steppedClock, path string, retryAfter time.Duration) (*DeliveryWorker, time.Time, BackoffRecord) {
+	t.Helper()
+	var worker *DeliveryWorker
+	var record BackoffRecord
+	switch path {
+	case "restored":
+		record = clampRecord(t, q, wall, time.Hour, retryAfter)
+		worker = clampWorker(t, q, wall)
+	case "in process":
+		record = clampRecord(t, q, wall, time.Second, retryAfter)
+		worker = clampWorker(t, q, wall)
+		wall.step(-time.Hour)
+		worker.lane(LaneKey{Device: "dev-a", Lane: LaneEvidence}).untilDue()
+	}
+	return worker, worker.nextAttempt("dev-a"), record
+}
+
+func TestABackwardsClampSurvivesARestart(t *testing.T) {
+	for _, tc := range clampCases {
+		for _, path := range []string{"restored", "in process"} {
+			t.Run(tc.name+", "+path, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), "queue")
+				q := openTestQueueAt(t, dir, 10, 1<<20)
+				wall := &steppedClock{}
+				_, clamp, original := clampByPath(t, q, wall, path, tc.retryAfter)
+				if wait := clamp.Sub(wall.clock().wall()); wait > tc.bound+time.Millisecond || wait < tc.bound-100*time.Millisecond {
+					t.Fatalf("clamped to %s, want %s", wait, tc.bound)
+				}
+				// The clamp is durable, with the attempts, floor and version
+				// of the record it replaced.
+				persisted, _ := q.BackoffFor(original.QueueRecord)
+				if persisted.NotBeforeMS != clamp.UnixMilli() || persisted.Attempts != 3 || persisted.V != original.V ||
+					(persisted.RetryAfterMS == nil) != (original.RetryAfterMS == nil) ||
+					(persisted.RetryAfterMS != nil && *persisted.RetryAfterMS != *original.RetryAfterMS) {
+					t.Fatalf("persisted %#v after clamping %#v to %d", persisted, original, clamp.UnixMilli())
+				}
+				// A restart before it expires restores this clamp, not a
+				// fresh bound from the deadline it replaced.
+				time.Sleep(300 * time.Millisecond)
+				next := clampWorker(t, openTestQueueAt(t, dir, 10, 1<<20), wall)
+				if restored := next.nextAttempt("dev-a"); !restored.Equal(clamp) {
+					t.Fatalf("restored %s after the restart, clamped to %s", restored.Sub(clamp), clamp)
+				}
+			})
+		}
+	}
+}
+
+func TestAClampThatCannotBePersistedStaysInForce(t *testing.T) {
+	for _, tc := range clampCases {
+		for _, path := range []string{"restored", "in process"} {
+			t.Run(tc.name+", "+path, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), "queue")
+				recorder := faults.NewRecorder()
+				q, err := OpenDurableQueue(QueueOptions{
+					Directory: dir, MaxItems: 10, MaxBytes: 1 << 20, Faults: recorder, FaultSource: "queue",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				wall := &steppedClock{}
+				far := time.Hour
+				if path == "in process" {
+					far = time.Second
+				}
+				original := clampRecord(t, q, wall, far, tc.retryAfter)
+				unwritable(t, dir)
+				worker := clampWorker(t, q, wall)
+				if path == "in process" {
+					wall.step(-time.Hour)
+					worker.lane(LaneKey{Device: "dev-a", Lane: LaneEvidence}).untilDue()
+				}
+				if wait := worker.nextAttempt("dev-a").Sub(wall.clock().wall()); wait > tc.bound+time.Millisecond || wait < tc.bound-100*time.Millisecond {
+					t.Fatalf("waits %s in this process, want the %s clamp", wait, tc.bound)
+				}
+				if persisted, _ := q.BackoffFor(original.QueueRecord); persisted.NotBeforeMS != original.NotBeforeMS {
+					t.Fatalf("persisted %#v although the write was made to fail", persisted)
+				}
+				if active := recorder.Active(); !slices.Contains(active, faults.StoreUnavailable) {
+					t.Fatalf("faults %v, want %s", active, faults.StoreUnavailable)
+				}
+			})
+		}
 	}
 }
 

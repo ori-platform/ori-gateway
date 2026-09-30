@@ -149,6 +149,11 @@ A back-off waits until its deadline has passed on both the wall clock and the
 monotonic clock, so a wall clock that steps forward never shortens it. A wall
 clock that steps backwards stretches the wait only up to the longest the
 back-off could have been: `backoff_max_s`, or its `Retry-After` if longer.
+That shortened deadline is written back to the back-off record, so a restart
+restores it rather than bounding the original deadline afresh. If the write
+fails, the shortened deadline holds in the running gateway and the store
+reports `store_unavailable`; a restart before a successful write may then wait
+the bound again.
 After a restart the wall clock is the only record of the time that passed, so
 the rest of the wait it shows is held on both clocks from then on.
 

@@ -237,8 +237,10 @@ type deliveryLane struct {
 	monoDue    time.Duration
 	attempts   int
 	retryAfter time.Duration
-	held       *heldHead
-	stall      *stallState
+	// backoffID is the queue record whose persisted back-off is in force.
+	backoffID string
+	held      *heldHead
+	stall     *stallState
 	// attempted and attemptReason describe the head the last delivery attempt
 	// named, so a failure can be logged against it.
 	attempted     QueuedArtifact
@@ -310,15 +312,19 @@ func (l *deliveryLane) restore() {
 	// here on shortens nothing.
 	now := l.w.clock.wall()
 	notBefore := time.UnixMilli(record.NotBeforeMS)
+	clamped := false
 	if latest := now.Add(l.w.waitBound(retryAfter)); notBefore.After(latest) {
-		notBefore = latest
+		notBefore, clamped = ceilMilli(latest), true
 	}
 	l.mu.Lock()
-	l.notBefore, l.attempts, l.retryAfter = notBefore, record.Attempts, retryAfter
+	l.notBefore, l.attempts, l.retryAfter, l.backoffID = notBefore, record.Attempts, retryAfter, head.ID
 	l.monoDue = l.w.clock.mono() + max(notBefore.Sub(now), 0)
 	l.lastError = safeFailureReason(errChannelRefused)
 	l.lastFailureAt = time.Now()
 	l.mu.Unlock()
+	if clamped {
+		l.persistClamp(head.ID, notBefore, record.Attempts, retryAfter)
+	}
 }
 
 func (l *deliveryLane) run(ctx context.Context) {
@@ -406,14 +412,10 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 	// rounded up, so this process and a restart hold to the same instant. The
 	// monotonic deadline is taken from the same reading.
 	delay := l.w.backoffDelay(attempts, floor)
-	due := l.w.clock.wall().Add(delay)
+	notBefore := ceilMilli(l.w.clock.wall().Add(delay))
 	monoDue := l.w.clock.mono() + delay
-	notBefore := time.UnixMilli(due.UnixMilli())
-	if notBefore.Before(due) {
-		notBefore = notBefore.Add(time.Millisecond)
-	}
 	l.mu.Lock()
-	l.notBefore, l.monoDue, l.retryAfter = notBefore, monoDue, floor
+	l.notBefore, l.monoDue, l.retryAfter, l.backoffID = notBefore, monoDue, floor, head.ID
 	l.mu.Unlock()
 	var retryAfterMS *int64
 	if floor > 0 {
@@ -437,7 +439,7 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 
 func (l *deliveryLane) clearBackoff() {
 	l.mu.Lock()
-	l.notBefore, l.monoDue, l.attempts, l.retryAfter = time.Time{}, 0, 0, 0
+	l.notBefore, l.monoDue, l.attempts, l.retryAfter, l.backoffID = time.Time{}, 0, 0, 0, ""
 	head := l.attempted
 	l.mu.Unlock()
 	if head.ID != "" {
@@ -456,14 +458,52 @@ func (l *deliveryLane) backingOff() bool {
 // moved forwards leaves the monotonic deadline in force.
 func (l *deliveryLane) untilDue() time.Duration {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	now := l.w.clock.wall()
 	wall := l.notBefore.Sub(now)
-	if bound := l.w.waitBound(l.retryAfter); wall > bound {
-		l.notBefore = now.Add(bound)
-		wall = bound
+	bound := l.w.waitBound(l.retryAfter)
+	clamped := wall > bound
+	if clamped {
+		l.notBefore = ceilMilli(now.Add(bound))
+		wall = l.notBefore.Sub(now)
 	}
-	return max(wall, l.monoDue-l.w.clock.mono())
+	wait := max(wall, l.monoDue-l.w.clock.mono())
+	id, notBefore, attempts, retryAfter := l.backoffID, l.notBefore, l.attempts, l.retryAfter
+	l.mu.Unlock()
+	if clamped {
+		l.persistClamp(id, notBefore, attempts, retryAfter)
+	}
+	return wait
+}
+
+// persistClamp records a back-off deadline clamped after a clock moved
+// backwards, so a restart restores the clamp and not the deadline it
+// replaced. The attempt count and any Retry-After floor are kept, and with
+// them the record's version. A clamp that cannot be written stays in force in
+// this process; the store raises store_unavailable, and another restart may
+// wait the bound again.
+func (l *deliveryLane) persistClamp(id string, notBefore time.Time, attempts int, retryAfter time.Duration) {
+	if id == "" {
+		return
+	}
+	record := BackoffRecord{QueueRecord: id, NotBeforeMS: notBefore.UnixMilli(), Attempts: attempts}
+	if retryAfter > 0 {
+		ms := retryAfter.Milliseconds()
+		record.RetryAfterMS = &ms
+	}
+	if err := l.w.queue.SetBackoff(record); err != nil && !errors.Is(err, ErrArtifactNotFound) {
+		l.w.log.Warn("evidence delivery back-off clamp was not persisted",
+			"queue_record", id, "device_id", l.device, "lane", string(l.lane))
+	}
+}
+
+// ceilMilli is t in whole milliseconds, rounded up, without a monotonic
+// reading: the instant a back-off record keeps.
+func ceilMilli(t time.Time) time.Time {
+	ms := time.UnixMilli(t.UnixMilli())
+	if ms.Before(t) {
+		ms = ms.Add(time.Millisecond)
+	}
+	return ms
 }
 
 // waitBound is the longest any back-off with this Retry-After floor can wait
@@ -512,7 +552,7 @@ func (l *deliveryLane) deliverHead(ctx context.Context) (bool, error) {
 		// A new head starts its own back-off from the beginning.
 		l.attempts = 0
 	}
-	l.attempted, l.attemptReason, l.notBefore, l.monoDue, l.retryAfter = queued, "", time.Time{}, 0, 0
+	l.attempted, l.attemptReason, l.notBefore, l.monoDue, l.retryAfter, l.backoffID = queued, "", time.Time{}, 0, 0, ""
 	l.mu.Unlock()
 	result, err := l.w.channel.Deliver(ctx, queued)
 	if err != nil {
