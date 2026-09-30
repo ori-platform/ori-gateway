@@ -396,6 +396,33 @@ func TestRestartNeverRestoresAnEarlierBackoff(t *testing.T) {
 	}
 }
 
+func TestATimerNeverSendsBeforeTheWallClockBackoff(t *testing.T) {
+	q := openTestQueue(t, 10, 1<<20)
+	if _, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1)); err != nil {
+		t.Fatal(err)
+	}
+	authority := newDeviceAuthority()
+	authority.refuse("dev-a", &fakeRefusal{status: http.StatusServiceUnavailable, reason: "unavailable"})
+	worker := deviceWorker(t, q, authority, nil, 300*time.Millisecond)
+	startWorker(t, worker)
+	waitFor(t, "the back-off", func() bool { return worker.nextAttempt("dev-a").After(time.Now()) })
+	time.Sleep(50 * time.Millisecond)
+	// A wall clock running slow against the timer: the deadline moves later
+	// than the timer already armed for it.
+	lane := worker.lane(LaneKey{Device: "dev-a", Lane: LaneEvidence})
+	lane.mu.Lock()
+	deadline := lane.notBefore.Add(400 * time.Millisecond)
+	lane.notBefore = deadline
+	lane.mu.Unlock()
+	for time.Now().Before(deadline) {
+		if authority.count("dev-a") != 1 {
+			t.Fatalf("retried %s before the back-off", time.Until(deadline))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waitFor(t, "the retry after the back-off", func() bool { return authority.count("dev-a") == 2 })
+}
+
 func TestBackoffSurvivesARestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "queue")
 	q := openTestQueueAt(t, dir, 100, 1<<24)

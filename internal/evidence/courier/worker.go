@@ -272,7 +272,7 @@ func (l *deliveryLane) restore() {
 	}
 	notBefore := time.UnixMilli(record.NotBeforeMS)
 	// A clock that moved backwards must not stretch a back-off past its bound.
-	if latest := time.Now().Add(l.w.maxBackoff); notBefore.After(latest) {
+	if latest := time.Now().Round(0).Add(l.w.maxBackoff); notBefore.After(latest) {
 		notBefore = latest
 	}
 	l.mu.Lock()
@@ -306,6 +306,13 @@ func (l *deliveryLane) run(ctx context.Context) {
 			// about when the timer fires; it is never retried on a timer.
 			if l.remind() {
 				resetTimer(timer, l.w.reminder)
+				continue
+			}
+			// The timer runs on the monotonic clock and the back-off is the
+			// persisted wall-clock deadline; a timer that fires before it
+			// waits out the rest.
+			if wait := l.untilDue(); wait > 0 {
+				resetTimer(timer, wait)
 				continue
 			}
 		}
@@ -362,11 +369,12 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 	attempts := l.attempts
 	head := l.attempted
 	l.mu.Unlock()
-	notBefore := time.Now().Add(l.w.backoffDelay(attempts, floor))
-	// The record keeps whole milliseconds, rounded up, so a restart restores
-	// this instant or a later one, never an earlier one.
-	if persisted := time.UnixMilli(notBefore.UnixMilli()); persisted.Before(notBefore) {
-		notBefore = notBefore.Add(persisted.Add(time.Millisecond).Sub(notBefore))
+	// The deadline is the one persisted: wall-clock whole milliseconds,
+	// rounded up, so this process and a restart hold to the same instant.
+	due := time.Now().Add(l.w.backoffDelay(attempts, floor))
+	notBefore := time.UnixMilli(due.UnixMilli())
+	if notBefore.Before(due) {
+		notBefore = notBefore.Add(time.Millisecond)
 	}
 	l.mu.Lock()
 	l.notBefore = notBefore
@@ -397,9 +405,20 @@ func (l *deliveryLane) clearBackoff() {
 
 // backingOff reports whether a back-off still forbids an attempt.
 func (l *deliveryLane) backingOff() bool {
+	return l.untilDue() > 0
+}
+
+// untilDue is how long the lane's back-off still forbids an attempt, on the
+// wall clock. A clock that moved backwards must not stretch it past its bound.
+func (l *deliveryLane) untilDue() time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return time.Now().Before(l.notBefore)
+	wait := time.Until(l.notBefore)
+	if wait > l.w.maxBackoff {
+		l.notBefore = time.Now().Round(0).Add(l.w.maxBackoff)
+		wait = l.w.maxBackoff
+	}
+	return wait
 }
 
 func resetTimer(timer *time.Timer, delay time.Duration) {
