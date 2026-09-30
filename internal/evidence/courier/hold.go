@@ -145,6 +145,8 @@ func (q *DurableQueue) loadHolds(names []string) error {
 
 const (
 	backoffRecordVersion = 1
+	// maxRetryAfterMS is the longest Retry-After the channel parses.
+	maxRetryAfterMS = (1<<31 - 1) * 1000
 	// backoffFilePrefix names the back-off record beside a queue record:
 	// backoffFilePrefix + queue record id.
 	backoffFilePrefix = ".ori-evidence-backoff-"
@@ -157,6 +159,9 @@ type BackoffRecord struct {
 	QueueRecord string `json:"queue_record"`
 	NotBeforeMS int64  `json:"not_before_ms"`
 	Attempts    int    `json:"attempts"`
+	// RetryAfterMS is the Retry-After floor the back-off carried, so a bound
+	// on the exponential part never shortens it.
+	RetryAfterMS int64 `json:"retry_after_ms,omitempty"`
 }
 
 // SetBackoff durably records a queued record's back-off. The write is atomic.
@@ -261,6 +266,8 @@ func validateBackoffRecord(record BackoffRecord) error {
 		return fmt.Errorf("not-before time out of range")
 	case record.Attempts < 1 || record.Attempts > maxBackoffAttempts:
 		return fmt.Errorf("attempt count out of range")
+	case record.RetryAfterMS < 0 || record.RetryAfterMS > maxRetryAfterMS:
+		return fmt.Errorf("retry-after out of range")
 	}
 	return nil
 }

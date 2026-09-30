@@ -610,8 +610,11 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 	checkPinsExist(t, refusalSequencePins, names)
 	const retry = 400 * time.Millisecond
 	// The back-off is long enough that a restart, and the observation after
-	// it, fall inside it on all but a heavily loaded machine.
+	// it, fall inside it on all but a heavily loaded machine. Its bound is
+	// the base, well under the scaled Retry-After, which a bound never
+	// shortens.
 	const backoff = time.Second
+	const maxBackoff = backoff
 	const plays = 5
 	const defaultDevice = "site-a-edge-01"
 	for _, seq := range vectors.Sequences {
@@ -642,7 +645,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 				var running *runningWorker
 				newWorker := func() {
 					worker, err = NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, DeliveryWorkerOptions{
-						RetryInterval: retry, BackoffBase: backoff, BlockedReminderInterval: time.Hour,
+						RetryInterval: retry, BackoffBase: backoff, MaxBackoff: maxBackoff, BlockedReminderInterval: time.Hour,
 						Logger: slog.New(slog.DiscardHandler),
 					})
 					if err != nil {

@@ -204,11 +204,13 @@ type deliveryLane struct {
 	lastFailureAt time.Time
 	lastError     string
 	// notBefore is when a backed-off head may next be sent; attempts is the
-	// consecutive back-off count that sizes the next delay.
-	notBefore time.Time
-	attempts  int
-	held      *heldHead
-	stall     *stallState
+	// consecutive back-off count that sizes the next delay; retryAfter is the
+	// Retry-After floor of the back-off in force, if it carried one.
+	notBefore  time.Time
+	attempts   int
+	retryAfter time.Duration
+	held       *heldHead
+	stall      *stallState
 	// attempted and attemptReason describe the head the last delivery attempt
 	// named, so a failure can be logged against it.
 	attempted     QueuedArtifact
@@ -270,13 +272,13 @@ func (l *deliveryLane) restore() {
 	if !ok {
 		return
 	}
+	retryAfter := time.Duration(record.RetryAfterMS) * time.Millisecond
 	notBefore := time.UnixMilli(record.NotBeforeMS)
-	// A clock that moved backwards must not stretch a back-off past its bound.
-	if latest := time.Now().Round(0).Add(l.w.maxBackoff); notBefore.After(latest) {
+	if latest := time.Now().Round(0).Add(l.w.waitBound(retryAfter)); notBefore.After(latest) {
 		notBefore = latest
 	}
 	l.mu.Lock()
-	l.notBefore, l.attempts = notBefore, record.Attempts
+	l.notBefore, l.attempts, l.retryAfter = notBefore, record.Attempts, retryAfter
 	l.lastError = safeFailureReason(errChannelRefused)
 	l.lastFailureAt = time.Now()
 	l.mu.Unlock()
@@ -377,11 +379,12 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 		notBefore = notBefore.Add(time.Millisecond)
 	}
 	l.mu.Lock()
-	l.notBefore = notBefore
+	l.notBefore, l.retryAfter = notBefore, floor
 	l.mu.Unlock()
 	if head.ID != "" {
 		if err := l.w.queue.SetBackoff(BackoffRecord{
 			QueueRecord: head.ID, NotBeforeMS: notBefore.UnixMilli(), Attempts: attempts,
+			RetryAfterMS: floor.Milliseconds(),
 		}); err != nil && !errors.Is(err, ErrArtifactNotFound) {
 			// A back-off that is not persisted is still kept by this process;
 			// a restart would retry the head once, sooner than it should.
@@ -395,7 +398,7 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 
 func (l *deliveryLane) clearBackoff() {
 	l.mu.Lock()
-	l.notBefore, l.attempts = time.Time{}, 0
+	l.notBefore, l.attempts, l.retryAfter = time.Time{}, 0, 0
 	head := l.attempted
 	l.mu.Unlock()
 	if head.ID != "" {
@@ -414,11 +417,19 @@ func (l *deliveryLane) untilDue() time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	wait := time.Until(l.notBefore)
-	if wait > l.w.maxBackoff {
-		l.notBefore = time.Now().Round(0).Add(l.w.maxBackoff)
-		wait = l.w.maxBackoff
+	if bound := l.w.waitBound(l.retryAfter); wait > bound {
+		l.notBefore = time.Now().Round(0).Add(bound)
+		wait = bound
 	}
 	return wait
+}
+
+// waitBound is the longest any back-off with this Retry-After floor can wait
+// from now: the exponential part never exceeds the bound, and the floor is the
+// authority's. A deadline further away than this comes from a clock that moved
+// backwards; clamping to it leaves at least the wait that was scheduled.
+func (w *DeliveryWorker) waitBound(retryAfter time.Duration) time.Duration {
+	return max(w.maxBackoff, w.retry, retryAfter)
 }
 
 func resetTimer(timer *time.Timer, delay time.Duration) {
@@ -459,7 +470,7 @@ func (l *deliveryLane) deliverHead(ctx context.Context) (bool, error) {
 		// A new head starts its own back-off from the beginning.
 		l.attempts = 0
 	}
-	l.attempted, l.attemptReason, l.notBefore = queued, "", time.Time{}
+	l.attempted, l.attemptReason, l.notBefore, l.retryAfter = queued, "", time.Time{}, 0
 	l.mu.Unlock()
 	result, err := l.w.channel.Deliver(ctx, queued)
 	if err != nil {

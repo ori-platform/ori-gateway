@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -423,6 +424,168 @@ func TestATimerNeverSendsBeforeTheWallClockBackoff(t *testing.T) {
 	waitFor(t, "the retry after the back-off", func() bool { return authority.count("dev-a") == 2 })
 }
 
+// rateLimiter answers the first refusals requests with a 429 whose
+// Retry-After is retryAfterS seconds, and accepts after that. It records each
+// request's wall-clock arrival.
+type rateLimiter struct {
+	mu          sync.Mutex
+	refusals    int
+	retryAfterS int
+	arrived     []time.Time
+}
+
+func (a *rateLimiter) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body bytes.Buffer
+	if _, err := body.ReadFrom(req.Body); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	a.arrived = append(a.arrived, time.Now().Round(0))
+	refuse := len(a.arrived) <= a.refusals
+	a.mu.Unlock()
+	digest := payloadDigest(body.Bytes())
+	if refuse {
+		outcome := "pending"
+		return vectorHTTPResponse(http.StatusTooManyRequests, "json", &outcome, "rate_limited", true, false,
+			strconv.Itoa(a.retryAfterS), digest, nil, nil), nil
+	}
+	outcome := "accepted"
+	return vectorHTTPResponse(http.StatusOK, "json", &outcome, "", true, false, "", digest, nil, nil), nil
+}
+
+func (a *rateLimiter) arrivals() []time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]time.Time(nil), a.arrived...)
+}
+
+// boundedWorker backs off from 100ms to a 200ms bound, well under a
+// one-second Retry-After.
+func boundedWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper) *DeliveryWorker {
+	t.Helper()
+	channel, err := NewHTTPChannel(HTTPChannelOptions{
+		Endpoint: fakeAuthorityURL, ClientID: "site-a-gateway",
+		Secret: "evidence-ingest-secret-with-at-least-32-bytes", HTTPClient: &http.Client{Transport: authority},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, DeliveryWorkerOptions{
+		RetryInterval: 100 * time.Millisecond, MaxBackoff: 200 * time.Millisecond,
+		BlockedReminderInterval: time.Hour, Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker
+}
+
+// awaitRetryNoEarlierThan hands the device off throughout the wait, and
+// requires the retry to arrive no earlier than the persisted deadline.
+func awaitRetryNoEarlierThan(t *testing.T, worker *DeliveryWorker, authority *rateLimiter, notBefore time.Time) {
+	t.Helper()
+	give := time.Now().Add(time.Until(notBefore) + 2*time.Second)
+	for len(authority.arrivals()) < 2 && time.Now().Before(give) {
+		worker.NotifyDevice("dev-a")
+		time.Sleep(5 * time.Millisecond)
+	}
+	arrived := authority.arrivals()
+	if len(arrived) != 2 {
+		t.Fatalf("%d attempts, want the refused one and its retry", len(arrived))
+	}
+	if arrived[1].Before(notBefore) {
+		t.Fatalf("retried %s before the Retry-After", notBefore.Sub(arrived[1]))
+	}
+}
+
+func TestRetryAfterBeyondTheBoundIsWaitedInFull(t *testing.T) {
+	q := openTestQueue(t, 10, 1<<20)
+	entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &rateLimiter{refusals: 1, retryAfterS: 1}
+	worker := boundedWorker(t, q, authority)
+	startWorker(t, worker)
+	waitFor(t, "the back-off", func() bool { _, ok := q.BackoffFor(entry.ID); return ok })
+	record, _ := q.BackoffFor(entry.ID)
+	notBefore := time.UnixMilli(record.NotBeforeMS)
+	if record.RetryAfterMS != 1000 || notBefore.Before(authority.arrivals()[0].Add(time.Second)) {
+		t.Fatalf("persisted back-off = %#v", record)
+	}
+	awaitRetryNoEarlierThan(t, worker, authority, notBefore)
+}
+
+func TestRetryAfterBeyondTheBoundSurvivesARestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "queue")
+	q := openTestQueueAt(t, dir, 100, 1<<24)
+	entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &rateLimiter{refusals: 1, retryAfterS: 1}
+	running := startWorker(t, boundedWorker(t, q, authority))
+	waitFor(t, "the back-off", func() bool { _, ok := q.BackoffFor(entry.ID); return ok })
+	running.stop()
+	record, _ := q.BackoffFor(entry.ID)
+	notBefore := time.UnixMilli(record.NotBeforeMS)
+
+	next := boundedWorker(t, openTestQueueAt(t, dir, 100, 1<<24), authority)
+	if restored := next.nextAttempt("dev-a"); !restored.Equal(notBefore) {
+		t.Fatalf("restored deadline %s, persisted %s", restored.Format(time.RFC3339Nano), notBefore.Format(time.RFC3339Nano))
+	}
+	startWorker(t, next)
+	awaitRetryNoEarlierThan(t, next, authority, notBefore)
+}
+
+func TestABackwardsClockNeverShortensARetryAfter(t *testing.T) {
+	const far = time.Hour
+	for _, tc := range []struct {
+		name       string
+		retryAfter time.Duration
+		bound      time.Duration
+	}{
+		{"with a Retry-After beyond the bound", 1500 * time.Millisecond, 1500 * time.Millisecond},
+		{"without one", 0, 200 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			near := func(got time.Time) bool {
+				want := time.Now().Add(tc.bound)
+				return !got.After(want) && got.After(want.Add(-100*time.Millisecond))
+			}
+			// A deadline an hour away is one a clock that moved backwards
+			// produced: restored, it is clamped to the longest wait the
+			// back-off could have.
+			q := openTestQueue(t, 10, 1<<20)
+			entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := q.SetBackoff(BackoffRecord{
+				QueueRecord: entry.ID, NotBeforeMS: time.Now().Add(far).UnixMilli(), Attempts: 1,
+				RetryAfterMS: tc.retryAfter.Milliseconds(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			worker := boundedWorker(t, q, &rateLimiter{})
+			if got := worker.nextAttempt("dev-a"); !near(got) {
+				t.Fatalf("restored deadline in %s, want %s", time.Until(got), tc.bound)
+			}
+			// And in this process, where every timer and handoff asks.
+			lane := worker.lane(LaneKey{Device: "dev-a", Lane: LaneEvidence})
+			lane.mu.Lock()
+			lane.notBefore, lane.retryAfter = time.Now().Round(0).Add(far), tc.retryAfter
+			lane.mu.Unlock()
+			if wait := lane.untilDue(); wait > tc.bound || wait < tc.bound-100*time.Millisecond {
+				t.Fatalf("waits %s, want %s", wait, tc.bound)
+			}
+			if got := worker.nextAttempt("dev-a"); !near(got) {
+				t.Fatalf("deadline in %s, want %s", time.Until(got), tc.bound)
+			}
+		})
+	}
+}
+
 func TestBackoffSurvivesARestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "queue")
 	q := openTestQueueAt(t, dir, 100, 1<<24)
@@ -469,12 +632,14 @@ func TestBackoffSurvivesARestart(t *testing.T) {
 
 func TestInvalidBackoffRefusesTheQueue(t *testing.T) {
 	for name, body := range map[string]string{
-		"corrupt":         "{",
-		"zero attempts":   `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":0}`,
-		"wrong version":   `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1}`,
-		"unknown field":   `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"x":1}`,
-		"names another":   `{"v":1,"queue_record":"` + strings.Repeat("0", 64) + `","not_before_ms":1,"attempts":1}`,
-		"negative before": `{"v":1,"queue_record":"%s","not_before_ms":-1,"attempts":1}`,
+		"corrupt":              "{",
+		"zero attempts":        `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":0}`,
+		"wrong version":        `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1}`,
+		"unknown field":        `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"x":1}`,
+		"names another":        `{"v":1,"queue_record":"` + strings.Repeat("0", 64) + `","not_before_ms":1,"attempts":1}`,
+		"negative before":      `{"v":1,"queue_record":"%s","not_before_ms":-1,"attempts":1}`,
+		"negative retry-after": `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":-1}`,
+		"retry-after unparsed": `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":2147483648000}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "queue")
