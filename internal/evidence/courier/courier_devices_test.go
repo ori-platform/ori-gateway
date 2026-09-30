@@ -370,6 +370,32 @@ func TestGatewayWideQueueOpensPerDevice(t *testing.T) {
 	}
 }
 
+func TestRestartNeverRestoresAnEarlierBackoff(t *testing.T) {
+	q := openTestQueue(t, 10, 1<<20)
+	if _, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1)); err != nil {
+		t.Fatal(err)
+	}
+	worker := deviceWorker(t, q, newDeviceAuthority(), nil, time.Second)
+	lane := worker.lane(LaneKey{Device: "dev-a", Lane: LaneEvidence})
+	head, ok := lane.head()
+	if !ok {
+		t.Fatal("no head")
+	}
+	lane.attempted = head
+	// A deadline on a whole millisecond is kept exactly by any encoding, so
+	// one back-off proves nothing; across many, one falls between. Each is a
+	// first back-off, well inside the restore's bound.
+	for range 20 {
+		lane.clearBackoff()
+		lane.scheduleBackoff(errChannelRefused)
+		scheduled := worker.nextAttempt("dev-a")
+		restored := deviceWorker(t, q, newDeviceAuthority(), nil, time.Second).nextAttempt("dev-a")
+		if restored.Before(scheduled) {
+			t.Fatalf("a restart brought the back-off forward by %s", scheduled.Sub(restored))
+		}
+	}
+}
+
 func TestBackoffSurvivesARestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "queue")
 	q := openTestQueueAt(t, dir, 100, 1<<24)

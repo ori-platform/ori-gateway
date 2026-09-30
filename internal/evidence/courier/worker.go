@@ -362,8 +362,12 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 	attempts := l.attempts
 	head := l.attempted
 	l.mu.Unlock()
-	delay := l.w.backoffDelay(attempts, floor)
-	notBefore := time.Now().Add(delay)
+	notBefore := time.Now().Add(l.w.backoffDelay(attempts, floor))
+	// The record keeps whole milliseconds, rounded up, so a restart restores
+	// this instant or a later one, never an earlier one.
+	if persisted := time.UnixMilli(notBefore.UnixMilli()); persisted.Before(notBefore) {
+		notBefore = notBefore.Add(persisted.Add(time.Millisecond).Sub(notBefore))
+	}
 	l.mu.Lock()
 	l.notBefore = notBefore
 	l.mu.Unlock()
@@ -378,7 +382,7 @@ func (l *deliveryLane) scheduleBackoff(err error) time.Duration {
 				"lane", string(l.lane))
 		}
 	}
-	return delay
+	return time.Until(notBefore)
 }
 
 func (l *deliveryLane) clearBackoff() {
