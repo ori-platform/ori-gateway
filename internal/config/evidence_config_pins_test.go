@@ -76,6 +76,11 @@ var evidenceConfigPins = map[string]configPin{
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
 		Observed:    "accepted, rule stopped expects a refusal",
 	},
+	"an authority CA bundle at an absolute, clean path": {
+		Requirement: "missing_requirement:stopped-custody-bounds",
+		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
+		Observed:    "the loader produces no stopped-custody bounds",
+	},
 	"an empty carriage map is the absent map": {
 		Requirement: "missing_requirement:stopped-custody-bounds",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",

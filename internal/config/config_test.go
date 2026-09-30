@@ -239,6 +239,53 @@ evidence:
 	}
 }
 
+func TestEvidenceAuthorityCAFileMustBeAbsoluteAndClean(t *testing.T) {
+	base := `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+provider:
+  name: echo
+evidence:
+  enabled: true
+  queue_directory: /var/lib/ori/evidence-out
+  return_queue_directory: /var/lib/ori/evidence-return
+  endpoint_env: ORI_EVIDENCE_ENDPOINT
+  client_id_env: ORI_EVIDENCE_CLIENT_ID
+  secret_env: ORI_EVIDENCE_INGEST_SECRET
+  authority_ca_file: %q
+`
+	for _, tc := range []struct {
+		name      string
+		path      string
+		wantError bool
+	}{
+		{"unset", "", false},
+		{"absolute", "/etc/ori-gateway/authority-ca.pem", false},
+		{"relative", "authority-ca.pem", true},
+		{"dot relative", "./authority-ca.pem", true},
+		{"trailing space", "/etc/ori-gateway/authority-ca.pem ", true},
+		{"unclean", "/etc/ori-gateway/../ori-gateway/authority-ca.pem", true},
+		{"double slash", "/etc//ori-gateway/authority-ca.pem", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, fmt.Sprintf(base, tc.path)))
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "authority_ca_file") {
+					t.Fatalf("authority_ca_file %q was not refused: %v", tc.path, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Evidence.AuthorityCAFile != tc.path {
+				t.Fatalf("authority_ca_file = %q, want %q", cfg.Evidence.AuthorityCAFile, tc.path)
+			}
+		})
+	}
+}
+
 func TestLlamaCppProviderRequiresURLWhenSelected(t *testing.T) {
 	path := writeConfig(t, `
 gateway:

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -84,8 +85,11 @@ type appDependencies struct {
 		simStatus heartbeat.SIMStatus,
 		opts heartbeat.Options,
 	) (heartbeatRunner, error)
-	logger *slog.Logger
-	now    func() time.Time
+	// authorityTrustOwner is the one user besides root trusted to own the
+	// authority CA bundle and the directories above it: zero, root, outside tests.
+	authorityTrustOwner int
+	logger              *slog.Logger
+	now                 func() time.Time
 }
 
 func defaultDependencies() appDependencies {
@@ -215,8 +219,16 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("open evidence return queue: %w", err)
 		}
+		var authorityCAs *x509.CertPool
+		if cfg.Evidence.AuthorityCAFile != "" {
+			authorityCAs, err = courier.LoadAuthorityTrust(cfg.Evidence.AuthorityCAFile, deps.authorityTrustOwner)
+			if err != nil {
+				return err
+			}
+		}
 		channel, err := courier.NewHTTPChannel(courier.HTTPChannelOptions{
 			Endpoint: channelConfig.endpoint, ClientID: channelConfig.clientID, Secret: channelConfig.secret, Now: deps.now,
+			AuthorityCAs: authorityCAs,
 		})
 		if err != nil {
 			return fmt.Errorf("construct independent evidence channel")

@@ -1,5 +1,5 @@
 {
-  "contract": "evidence-transport/v1 refusal policy",
+  "contract": "evidence-transport/v2 refusal policy",
   "note": "Each case is one authority response and the gateway action it must produce. `class` is retire, archive, hold, handoff, retry_after or backoff. `reason` is what the gateway records: the response reason when its status admits it, otherwise `unrecognised`. `media` is the response media type, `outcome` the response body's outcome, `digest` whether it carries `artifact_digest`, `complete` whether a 200 carries every artifact the acceptance requires, `staged` whether the gateway durably staged every authority artifact the response carried, `retention` the result of the gateway's retention checks (`verified`, or the defect that failed them) and present exactly when the response carries a retention or claims `refused_retained`, and `retriable` the response flag, which never changes the class. `min_wait_s` is the least wait a back-off must honour. In a sequence, `archive_persisted: false` is an archive whose commit failed, and `then` is the state an attempt leaves.",
   "cases": [
     {"name": "200 clean acceptance", "status": 200, "media": "json", "outcome": "accepted", "reason": "", "digest": true, "retriable": false, "complete": true, "expected": {"class": "retire", "reason": ""}, "staged": true},

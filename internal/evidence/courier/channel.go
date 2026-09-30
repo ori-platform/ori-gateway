@@ -10,6 +10,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -42,8 +44,11 @@ type HTTPChannelOptions struct {
 	ClientID   string
 	Secret     string
 	HTTPClient *http.Client
-	Now        func() time.Time
-	Nonce      func([]byte) error
+	// AuthorityCAs, when set, is the only trust the channel extends to the
+	// authority's certificate, in place of the system trust store.
+	AuthorityCAs *x509.CertPool
+	Now          func() time.Time
+	Nonce        func([]byte) error
 }
 
 type HTTPChannel struct {
@@ -69,8 +74,19 @@ func NewHTTPChannel(opts HTTPChannelOptions) (*HTTPChannel, error) {
 		return nil, err
 	}
 	client := opts.HTTPClient
+	if client != nil && opts.AuthorityCAs != nil {
+		return nil, fmt.Errorf("evidence: a channel takes either an HTTP client or authority CAs, not both")
+	}
 	if client == nil {
 		client = &http.Client{Timeout: defaultHTTPTimeout}
+		if opts.AuthorityCAs != nil {
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			transport.TLSClientConfig = &tls.Config{
+				RootCAs:    opts.AuthorityCAs,
+				MinVersion: tls.VersionTLS12,
+			}
+			client.Transport = transport
+		}
 	}
 	clientCopy := *client
 	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {

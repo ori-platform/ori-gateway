@@ -62,6 +62,13 @@ evidence:
   endpoint_env: "ORI_EVIDENCE_ENDPOINT"
   client_id_env: "ORI_EVIDENCE_CLIENT_ID"
   secret_env: "ORI_EVIDENCE_INGEST_SECRET"
+  # Optional. An absolute path to a PEM bundle of the evidence authority's CA
+  # certificates, trusted in place of the system trust store. Only CA
+  # certificates. The file and every directory above it must be owned by root,
+  # writable by no group or other user, and no component may be a symlink.
+  # During a rotation it holds the old and the new CA; a change takes effect on
+  # restart. Empty: the system trust store.
+  authority_ca_file: ""
   # Each device's declared inbound evidence carriage, gateway-api/v1 when a
   # device is not named. Declaring gateway-evidence-carriage/v1 activates that
   # carriage's load-time rules above. This gateway implements it partially:

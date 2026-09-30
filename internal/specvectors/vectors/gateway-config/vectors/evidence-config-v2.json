@@ -1,6 +1,6 @@
 {
   "contract": "gateway-config/v2 evidence",
-  "note": "Each case is a gateway.device_ids list and an evidence block. A valid case names the effective values after defaults, or null for a disabled courier; a refused case names the rule it breaks. A valid case's effective values include each configured device's declared inbound carriage contract, `gateway-api/v1` where none is declared, and the stopped-custody bounds, whose per-device defaults divide the totals equally across the configured devices. The routing domain, the back-off inequality, the share rule, the store-probe range and the stopped-custody bounds apply only when a configured device declares gateway-evidence-carriage/v1; a site declaring none is validated by the courier's own rules alone, and every such refusal disappears with the declaration.",
+  "note": "Each case is a gateway.device_ids list and an evidence block. A valid case names the effective values after defaults, including `authority_ca_file`, whose default is empty, or null for a disabled courier; a refused case names the rule it breaks. A valid case's effective values include each configured device's declared inbound carriage contract, `gateway-api/v1` where none is declared, and the stopped-custody bounds, whose per-device defaults divide the totals equally across the configured devices. The routing domain, the back-off inequality, the share rule, the store-probe range and the stopped-custody bounds apply only when a configured device declares gateway-evidence-carriage/v1; a site declaring none is validated by the courier's own rules alone, and every such refusal disappears with the declaration.",
   "cases": [
     {
       "name": "a disabled courier is accepted without validation",
@@ -41,7 +41,8 @@
         "stopped_max_items": 10000,
         "stopped_max_bytes": 268435456,
         "stopped_device_max_items": 10000,
-        "stopped_device_max_bytes": 268435456
+        "stopped_device_max_bytes": 268435456,
+        "authority_ca_file": ""
       }
     },
     {
@@ -72,7 +73,8 @@
         "stopped_max_items": 10000,
         "stopped_max_bytes": 268435456,
         "stopped_device_max_items": 10000,
-        "stopped_device_max_bytes": 268435456
+        "stopped_device_max_bytes": 268435456,
+        "authority_ca_file": ""
       }
     },
     {
@@ -103,7 +105,8 @@
         "stopped_max_items": 10000,
         "stopped_max_bytes": 268435456,
         "stopped_device_max_items": 10000,
-        "stopped_device_max_bytes": 268435456
+        "stopped_device_max_bytes": 268435456,
+        "authority_ca_file": ""
       }
     },
     {
@@ -137,7 +140,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 300
+        "store_probe_interval_s": 300,
+        "authority_ca_file": ""
       }
     },
     {
@@ -170,7 +174,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 900
+        "store_probe_interval_s": 900,
+        "authority_ca_file": ""
       }
     },
     {
@@ -462,7 +467,8 @@
         "stopped_max_items": 10000,
         "stopped_max_bytes": 268435456,
         "stopped_device_max_items": 5000,
-        "stopped_device_max_bytes": 134217728
+        "stopped_device_max_bytes": 134217728,
+        "authority_ca_file": ""
       }
     },
     {
@@ -501,7 +507,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 900
+        "store_probe_interval_s": 900,
+        "authority_ca_file": ""
       }
     },
     {
@@ -611,7 +618,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 900
+        "store_probe_interval_s": 900,
+        "authority_ca_file": ""
       }
     },
     {
@@ -643,7 +651,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 60,
         "backoff_max_s": 30,
-        "store_probe_interval_s": 900
+        "store_probe_interval_s": 900,
+        "authority_ca_file": ""
       }
     },
     {
@@ -674,7 +683,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 60
+        "store_probe_interval_s": 60,
+        "authority_ca_file": ""
       }
     },
     {
@@ -709,7 +719,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 900
+        "store_probe_interval_s": 900,
+        "authority_ca_file": ""
       }
     },
     {
@@ -740,7 +751,8 @@
         "retry_interval_s": 5,
         "backoff_base_s": 5,
         "backoff_max_s": 300,
-        "store_probe_interval_s": 900
+        "store_probe_interval_s": 900,
+        "authority_ca_file": ""
       }
     },
     {
@@ -761,6 +773,157 @@
       },
       "valid": false,
       "rule": "device_id"
+    },
+    {
+      "name": "an authority CA bundle at an absolute, clean path",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "/etc/ori-gateway/authority-ca.pem"
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "authority_ca_file": "/etc/ori-gateway/authority-ca.pem"
+      }
+    },
+    {
+      "name": "a relative authority CA bundle path",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "authority-ca.pem"
+      },
+      "valid": false,
+      "rule": "ca_file"
+    },
+    {
+      "name": "an authority CA bundle path with a parent component",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "/etc/ori-gateway/../ori-gateway/authority-ca.pem"
+      },
+      "valid": false,
+      "rule": "ca_file"
+    },
+    {
+      "name": "an authority CA bundle path with a current-directory component",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "/etc/./ori-gateway/authority-ca.pem"
+      },
+      "valid": false,
+      "rule": "ca_file"
+    },
+    {
+      "name": "an authority CA bundle path with a repeated separator",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "/etc//ori-gateway/authority-ca.pem"
+      },
+      "valid": false,
+      "rule": "ca_file"
+    },
+    {
+      "name": "an authority CA bundle path with a leading double separator",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "//etc/ori-gateway/authority-ca.pem"
+      },
+      "valid": false,
+      "rule": "ca_file"
+    },
+    {
+      "name": "an authority CA bundle path with a trailing separator",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "/etc/ori-gateway/authority-ca.pem/"
+      },
+      "valid": false,
+      "rule": "ca_file"
+    },
+    {
+      "name": "an authority CA bundle path with trailing whitespace",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET",
+        "authority_ca_file": "/etc/ori-gateway/authority-ca.pem "
+      },
+      "valid": false,
+      "rule": "ca_file"
     }
   ]
 }
