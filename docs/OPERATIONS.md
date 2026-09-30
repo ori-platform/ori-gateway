@@ -145,6 +145,26 @@ Back-offs are persisted beside the queue record
 (`.ori-evidence-backoff-<queue_record>`), so a restart waits out the rest of a
 back-off rather than resending early.
 
+A back-off waits until its deadline has passed on both the wall clock and the
+monotonic clock, so a wall clock that steps forward never shortens it. A wall
+clock that steps backwards stretches the wait only up to the longest the
+back-off could have been: `backoff_max_s`, or its `Retry-After` if longer.
+That shortened deadline is written back to the back-off record, so a restart
+restores it rather than bounding the original deadline afresh. If the write
+fails, the shortened deadline holds in the running gateway and the store
+reports `store_unavailable`; a restart before a successful write may then wait
+the bound again.
+After a restart the wall clock is the only record of the time that passed, so
+the rest of the wait it shows is held on both clocks from then on.
+
+A back-off record without a `Retry-After` is written as version 1. One with a
+`Retry-After` is written as version 2, which also records it. A gateway that
+predates version 2 refuses to open a queue holding a version 2 record. Before
+rolling back to such a gateway, stop the gateway, wait until the
+`not_before_ms` of every `.ori-evidence-backoff-*` file whose `"v"` is `2` has
+passed, then remove those files. Removing one sooner lets the older gateway
+retry before the `Retry-After`.
+
 A refusal that does not hold leaves the artifact at the head of its lane. Site
 health reports that lane `waiting_handoff` or `backing_off`, and the later
 artifacts in that lane wait until it is delivered. A `400` refused before

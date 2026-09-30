@@ -445,11 +445,17 @@ type vectorAuthority struct {
 	responses map[LaneKey]refusalVectorResponse
 	nonces    map[LaneKey][]string
 	bodies    map[LaneKey][]string
+	// persisted is the lane's persisted back-off deadline, read as each
+	// request arrives; early records, per request, how long before that
+	// deadline it arrived, or zero.
+	persisted func(LaneKey) (time.Time, bool)
+	early     map[LaneKey][]time.Duration
 }
 
 func newVectorAuthority() *vectorAuthority {
 	return &vectorAuthority{
 		responses: map[LaneKey]refusalVectorResponse{}, nonces: map[LaneKey][]string{}, bodies: map[LaneKey][]string{},
+		early: map[LaneKey][]time.Duration{},
 	}
 }
 
@@ -468,6 +474,29 @@ func (a *vectorAuthority) attempts(key LaneKey) int {
 	return len(a.bodies[key])
 }
 
+// earlyBy is how long before its persisted back-off deadline the lane's nth
+// request arrived, counting from zero, or zero when it did not.
+func (a *vectorAuthority) earlyBy(key LaneKey, n int) time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.early[key][n]
+}
+
+// anyEarly names a request that arrived before its persisted back-off
+// deadline, or returns "".
+func (a *vectorAuthority) anyEarly() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, early := range a.early {
+		for n, by := range early {
+			if by > 0 {
+				return fmt.Sprintf("%s %s request %d arrived %s before its persisted back-off elapsed", key.Device, key.Lane, n, by)
+			}
+		}
+	}
+	return ""
+}
+
 func (a *vectorAuthority) RoundTrip(req *http.Request) (*http.Response, error) {
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
@@ -482,6 +511,16 @@ func (a *vectorAuthority) RoundTrip(req *http.Request) (*http.Response, error) {
 	defer a.mu.Unlock()
 	a.nonces[key] = append(a.nonces[key], req.Header.Get("X-Ori-Evidence-Nonce"))
 	a.bodies[key] = append(a.bodies[key], string(body))
+	// The deadline is persisted in wall-clock milliseconds, so the arrival is
+	// compared with it on the wall clock, exactly.
+	arrived := time.Now().Round(0)
+	var early time.Duration
+	if a.persisted != nil {
+		if notBefore, ok := a.persisted(key); ok && arrived.Before(notBefore) {
+			early = notBefore.Sub(arrived)
+		}
+	}
+	a.early[key] = append(a.early[key], early)
 	r, set := a.responses[key]
 	if !set {
 		// A lane no step has answered, such as the other lane's artifact in
@@ -570,301 +609,391 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 	}
 	checkPinsExist(t, refusalSequencePins, names)
 	const retry = 400 * time.Millisecond
+	// The back-off is long enough that a restart, and the observation after
+	// it, fall inside it on all but a heavily loaded machine. Its bound is
+	// the base, well under the scaled Retry-After, which a bound never
+	// shortens.
+	const backoff = time.Second
+	const maxBackoff = backoff
+	const plays = 5
 	const defaultDevice = "site-a-edge-01"
 	for _, seq := range vectors.Sequences {
 		t.Run(seq.Name, func(t *testing.T) {
-			dir := filepath.Join(t.TempDir(), "queue")
-			authority := newVectorAuthority()
-			channel, err := NewHTTPChannel(HTTPChannelOptions{
-				Endpoint: fakeAuthorityURL, ClientID: "site-a-gateway",
-				Secret: "evidence-ingest-secret-with-at-least-32-bytes", HTTPClient: &http.Client{Transport: authority},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			q := openTestQueueAt(t, dir, 100, 1<<24)
-			var worker *DeliveryWorker
-			var running *runningWorker
-			newWorker := func() {
-				worker, err = NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, DeliveryWorkerOptions{
-					RetryInterval: retry, BlockedReminderInterval: time.Hour, Logger: slog.New(slog.DiscardHandler),
+			// play runs the sequence once. It is inconclusive when the
+			// machine outran an observation that must land before a
+			// back-off elapses; nothing was observed, so it is played again.
+			play := func() (observed string, inconclusive bool) {
+				dir := filepath.Join(t.TempDir(), "queue")
+				authority := newVectorAuthority()
+				channel, err := NewHTTPChannel(HTTPChannelOptions{
+					Endpoint: fakeAuthorityURL, ClientID: "site-a-gateway",
+					Secret: "evidence-ingest-secret-with-at-least-32-bytes", HTTPClient: &http.Client{Transport: authority},
 				})
 				if err != nil {
 					t.Fatal(err)
 				}
-				running = startWorker(t, worker)
-			}
-			var restore func()
-			keyOf := func(step refusalVectorStep) LaneKey {
-				device := step.Device
-				if device == "" {
-					device = defaultDevice
+				q := openTestQueueAt(t, dir, 100, 1<<24)
+				// The deadline in force for a lane is the persisted back-off of
+				// the head it sends. q is reopened by a restart while no
+				// worker runs.
+				persistedFor := func(key LaneKey) (time.Time, bool) {
+					record, ok := q.BackoffFor(q.firstID(key))
+					return time.UnixMilli(record.NotBeforeMS), ok
 				}
-				switch step.Lane {
-				case "", string(LaneEvidence):
-					return LaneKey{Device: device, Lane: LaneEvidence}
-				case string(LaneRegistration):
-					return LaneKey{Device: device, Lane: LaneRegistration}
-				default:
-					t.Fatalf("lane %q the worker cannot express", step.Lane)
-					return LaneKey{}
-				}
-			}
-			// A registration_retired step is the consequence of the step
-			// before it, whose 200 retires the registration: the evidence
-			// lane's response is set, and its attempts counted, before that
-			// step runs.
-			consequenceBefore := map[LaneKey]int{}
-			// generation picks a lane's artifact bytes. A deliver after a
-			// retirement re-offers the same bytes, a new admission of them;
-			// a deliver after an archival is a later registration.
-			generation := map[LaneKey]int{}
-			runStep := func(i int, step refusalVectorStep) string {
-				key := keyOf(step)
-				// waitArchived holds this lane's current artifact to an
-				// archival. The gateway keeps no archive, so none is ever
-				// observed; an artifact that leaves its lane anyway has left
-				// custody, which is reported as its own deviation.
-				waitArchived := func(label string) string {
-					released := waitUntil(func() bool {
-						_, listed := laneEntry(worker, key)
-						return q.LenLane(key) == 0 && !listed
+				authority.persisted = persistedFor
+				var worker *DeliveryWorker
+				var running *runningWorker
+				newWorker := func() {
+					worker, err = NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, DeliveryWorkerOptions{
+						RetryInterval: retry, BackoffBase: backoff, MaxBackoff: maxBackoff, BlockedReminderInterval: time.Hour,
+						Logger: slog.New(slog.DiscardHandler),
 					})
-					generation[key]++
-					if released {
-						return label + ": released from custody with no archive"
-					}
-					return label + ": not archived"
-				}
-				if step.Response != nil && step.Response.RetryAfterS > 0 {
-					step.Response.RetryAfterS = scaledRetryAfterS
-				}
-				before, preset := consequenceBefore[key]
-				if step.Event == "registration_retired" {
-					if !preset || key.Lane != LaneEvidence {
-						t.Fatalf("step %d: registration_retired must follow the step that retires a registration", i)
-					}
-					delete(consequenceBefore, key)
-				} else {
-					authority.set(key, step.Response)
-					before = authority.attempts(key)
-				}
-				if i+1 < len(seq.Steps) && seq.Steps[i+1].Event == "registration_retired" {
-					next := keyOf(seq.Steps[i+1])
-					authority.set(next, seq.Steps[i+1].Response)
-					consequenceBefore[next] = authority.attempts(next)
-				}
-				label := fmt.Sprintf("step %d (%s %s %s)", i, step.Event, key.Device, key.Lane)
-				persistFails := (step.HoldPersisted != nil && !*step.HoldPersisted) ||
-					(step.ArchivePersisted != nil && !*step.ArchivePersisted)
-				// A newly admitted artifact is a handoff for both of its
-				// device's lanes: a lane of the same device waiting for a
-				// handoff is retried once.
-				other := LaneKey{Device: key.Device, Lane: LaneRegistration}
-				if key.Lane == LaneRegistration {
-					other.Lane = LaneEvidence
-				}
-				otherBefore := authority.attempts(other)
-				otherWaits := false
-				if worker != nil {
-					e, ok := laneEntry(worker, other)
-					otherWaits = ok && e.State == DeviceWaitingHandoff
-				}
-				// A step that signals a handoff runs against quiescent lanes:
-				// no attempt is in flight, and the first attempt after the
-				// release answers every wake pending until then, so an attempt
-				// counted here is one this step caused.
-				release := func() {}
-				switch step.Event {
-				case "deliver", "handoff", "artifact_handed_off_in_other_lane", "queue_full":
-					if worker != nil {
-						release = quiesceLanes(worker, key, other)
-					}
-				}
-				defer release()
-				if step.Event == "deliver" {
-					kind, payload := laneArtifact(key, generation[key])
-					if _, err := q.Enqueue(kind, payload); err != nil {
+					if err != nil {
 						t.Fatal(err)
 					}
+					running = startWorker(t, worker)
 				}
-				if step.Event == "artifact_handed_off_in_other_lane" {
-					// A fresh artifact in the device's other lane, admitted
-					// and handed off; this lane's retry is the expectation.
-					kind, payload := laneArtifact(other, 1000+generation[other])
-					if _, err := q.Enqueue(kind, payload); err != nil {
-						t.Fatal(err)
+				var restore func()
+				keyOf := func(step refusalVectorStep) LaneKey {
+					device := step.Device
+					if device == "" {
+						device = defaultDevice
 					}
-					generation[other]++
+					switch step.Lane {
+					case "", string(LaneEvidence):
+						return LaneKey{Device: device, Lane: LaneEvidence}
+					case string(LaneRegistration):
+						return LaneKey{Device: device, Lane: LaneRegistration}
+					default:
+						t.Fatalf("lane %q the worker cannot express", step.Lane)
+						return LaneKey{}
+					}
 				}
-				if persistFails {
-					restore = unwritable(t, dir)
-				}
-				switch step.Event {
-				case "deliver":
-					if worker == nil {
-						newWorker()
+				// A registration_retired step is the consequence of the step
+				// before it, whose 200 retires the registration: the evidence
+				// lane's response is set, and its attempts counted, before that
+				// step runs.
+				consequenceBefore := map[LaneKey]int{}
+				// generation picks a lane's artifact bytes. A deliver after a
+				// retirement re-offers the same bytes, a new admission of them;
+				// a deliver after an archival is a later registration.
+				generation := map[LaneKey]int{}
+				runStep := func(i int, step refusalVectorStep) string {
+					key := keyOf(step)
+					// waitArchived holds this lane's current artifact to an
+					// archival. The gateway keeps no archive, so none is ever
+					// observed; an artifact that leaves its lane anyway has left
+					// custody, which is reported as its own deviation.
+					waitArchived := func(label string) string {
+						released := waitUntil(func() bool {
+							_, listed := laneEntry(worker, key)
+							return q.LenLane(key) == 0 && !listed
+						})
+						generation[key]++
+						if released {
+							return label + ": released from custody with no archive"
+						}
+						return label + ": not archived"
+					}
+					if step.Response != nil && step.Response.RetryAfterS > 0 {
+						step.Response.RetryAfterS = scaledRetryAfterS
+					}
+					before, preset := consequenceBefore[key]
+					if step.Event == "registration_retired" {
+						if !preset || key.Lane != LaneEvidence {
+							t.Fatalf("step %d: registration_retired must follow the step that retires a registration", i)
+						}
+						delete(consequenceBefore, key)
 					} else {
-						worker.NotifyDevice(key.Device)
+						authority.set(key, step.Response)
+						before = authority.attempts(key)
 					}
-					release()
-					if !waitUntil(func() bool { return authority.attempts(key) == before+1 }) {
-						return fmt.Sprintf("%s: %d attempts, want one", label, authority.attempts(key)-before)
+					if i+1 < len(seq.Steps) && seq.Steps[i+1].Event == "registration_retired" {
+						next := keyOf(seq.Steps[i+1])
+						authority.set(next, seq.Steps[i+1].Response)
+						consequenceBefore[next] = authority.attempts(next)
 					}
-					if otherWaits && !waitUntil(func() bool { return authority.attempts(other) == otherBefore+1 }) {
-						return fmt.Sprintf("%s: the other lane was retried %d times on the handoff, want once", label, authority.attempts(other)-otherBefore)
+					label := fmt.Sprintf("step %d (%s %s %s)", i, step.Event, key.Device, key.Lane)
+					persistFails := (step.HoldPersisted != nil && !*step.HoldPersisted) ||
+						(step.ArchivePersisted != nil && !*step.ArchivePersisted)
+					// A newly admitted artifact is a handoff for both of its
+					// device's lanes: a lane of the same device waiting for a
+					// handoff is retried once.
+					other := LaneKey{Device: key.Device, Lane: LaneRegistration}
+					if key.Lane == LaneRegistration {
+						other.Lane = LaneEvidence
 					}
-				case "handoff":
-					worker.NotifyDevice(key.Device)
-					release()
-				case "timer_elapsed":
-					time.Sleep(3 * retry)
-				case "restart":
-					running.stop()
-					q = openTestQueueAt(t, dir, 100, 1<<24)
-					newWorker()
-				case "artifact_handed_off_in_other_lane":
-					worker.NotifyDevice(key.Device)
-					release()
-				case "queue_full":
-					// An authenticated queue_full for a configured device is a
-					// handoff: the outbound subscription notifies the device
-					// after the ingress publishes the refusal.
-					worker.NotifyDevice(key.Device)
-					release()
-				case "queue_full_unconfigured_device", "admission_unauthenticated":
-					// Refused before the ingress admits anything: the
-					// subscription returns without notifying the device.
-				case "retry_after_elapsed", "backoff_elapsed", "registration_retired":
-					// Waited below, by the expectation.
-				default:
-					t.Fatalf("%s: event the worker cannot express", label)
-				}
-				switch step.Expect {
-				case "retained":
-					if !waitUntil(func() bool { _, ok := laneEntry(worker, key); return ok }) {
-						return label + ": no outcome recorded"
+					otherBefore := authority.attempts(other)
+					otherWaits := false
+					if worker != nil {
+						e, ok := laneEntry(worker, other)
+						otherWaits = ok && e.State == DeviceWaitingHandoff
 					}
-					entry, _ := laneEntry(worker, key)
-					if entry.State == DeviceHeld || q.LenLane(key) != 1 {
-						return fmt.Sprintf("%s: not retained, state %s", label, entry.State)
-					}
-				case "held":
-					if !waitUntil(func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
-						e, _ := laneEntry(worker, key)
-						return fmt.Sprintf("%s: not held, state %s", label, e.State)
-					}
-				case "retired":
-					if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
-						return label + ": not retired"
-					}
-				case "no_attempt", "no_attempt_before_retry_after", "no_attempt_before_backoff":
-					window := 100 * time.Millisecond
-					if step.Expect == "no_attempt" && step.Event == "restart" {
-						window = 3 * retry
-					}
-					time.Sleep(window)
-					if got := authority.attempts(key); got != before {
-						return fmt.Sprintf("%s: %d attempts, want none", label, got-before)
-					}
-				case "attempt_fresh_envelope_same_bytes":
-					wait := 3 * time.Second
-					if step.Event == "retry_after_elapsed" {
-						wait = (scaledRetryAfterS + 3) * time.Second
-					}
-					deadline := time.Now().Add(wait)
-					// An elapsed back-off is the lane's own schedule: a lane that
-					// kept backing off while earlier steps waited is due when
-					// its next attempt is, not after a fixed window.
-					if step.Event == "backoff_elapsed" {
-						if due := worker.nextAttemptIn(key).Add(3 * time.Second); due.After(deadline) {
-							deadline = due
+					// A step that signals a handoff runs against quiescent lanes:
+					// no attempt is in flight, and the first attempt after the
+					// release answers every wake pending until then, so an attempt
+					// counted here is one this step caused.
+					release := func() {}
+					switch step.Event {
+					case "deliver", "handoff", "artifact_handed_off_in_other_lane", "queue_full":
+						if worker != nil {
+							release = quiesceLanes(worker, key, other)
 						}
 					}
-					for authority.attempts(key) == before && time.Now().Before(deadline) {
-						time.Sleep(time.Millisecond)
+					defer release()
+					if step.Event == "deliver" {
+						kind, payload := laneArtifact(key, generation[key])
+						if _, err := q.Enqueue(kind, payload); err != nil {
+							t.Fatal(err)
+						}
 					}
-					if authority.attempts(key) != before+1 {
-						return fmt.Sprintf("%s: %d attempts, want one", label, authority.attempts(key)-before)
+					if step.Event == "artifact_handed_off_in_other_lane" {
+						// A fresh artifact in the device's other lane, admitted
+						// and handed off; this lane's retry is the expectation.
+						kind, payload := laneArtifact(other, 1000+generation[other])
+						if _, err := q.Enqueue(kind, payload); err != nil {
+							t.Fatal(err)
+						}
+						generation[other]++
 					}
-					authority.mu.Lock()
-					bodies, nonces := authority.bodies[key], authority.nonces[key]
-					n := len(bodies)
-					sameBytes := bodies[n-1] == bodies[n-2]
-					fresh := nonces[n-1] != nonces[n-2]
-					authority.mu.Unlock()
-					if !sameBytes || !fresh {
-						return fmt.Sprintf("%s: same bytes %v, fresh envelope %v", label, sameBytes, fresh)
+					if persistFails {
+						restore = unwritable(t, dir)
 					}
-					if step.Response != nil && step.Response.Status == http.StatusOK && step.Then == "" {
+					switch step.Event {
+					case "deliver":
+						if worker == nil {
+							newWorker()
+						} else {
+							worker.NotifyDevice(key.Device)
+						}
+						release()
+						if !waitUntil(func() bool { return authority.attempts(key) == before+1 }) {
+							return fmt.Sprintf("%s: %d attempts, want one", label, authority.attempts(key)-before)
+						}
+						if otherWaits && !waitUntil(func() bool { return authority.attempts(other) == otherBefore+1 }) {
+							return fmt.Sprintf("%s: the other lane was retried %d times on the handoff, want once", label, authority.attempts(other)-otherBefore)
+						}
+					case "handoff":
+						worker.NotifyDevice(key.Device)
+						release()
+					case "timer_elapsed":
+						time.Sleep(3 * retry)
+					case "restart":
+						running.stop()
+						q = openTestQueueAt(t, dir, 100, 1<<24)
+						newWorker()
+					case "artifact_handed_off_in_other_lane":
+						worker.NotifyDevice(key.Device)
+						release()
+					case "queue_full":
+						// An authenticated queue_full for a configured device is a
+						// handoff: the outbound subscription notifies the device
+						// after the ingress publishes the refusal.
+						worker.NotifyDevice(key.Device)
+						release()
+					case "queue_full_unconfigured_device", "admission_unauthenticated":
+						// Refused before the ingress admits anything: the
+						// subscription returns without notifying the device.
+					case "retry_after_elapsed", "backoff_elapsed", "registration_retired":
+						// Waited below, by the expectation.
+					default:
+						t.Fatalf("%s: event the worker cannot express", label)
+					}
+					switch step.Expect {
+					case "retained":
+						if !waitUntil(func() bool { _, ok := laneEntry(worker, key); return ok }) {
+							return label + ": no outcome recorded"
+						}
+						entry, _ := laneEntry(worker, key)
+						if entry.State == DeviceHeld || q.LenLane(key) != 1 {
+							return fmt.Sprintf("%s: not retained, state %s", label, entry.State)
+						}
+					case "held":
+						if !waitUntil(func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
+							e, _ := laneEntry(worker, key)
+							return fmt.Sprintf("%s: not held, state %s", label, e.State)
+						}
+					case "retired":
 						if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
 							return label + ": not retired"
 						}
-					}
-					if step.Response != nil && vectorHolds(*step.Response) && step.Then == "" {
-						// A terminal refusal archives only on a retention; without
-						// one it is held, in either lane (evidence-transport/v2).
-						if step.Response.Outcome == "refused_retained" && !persistFails {
-							if d := waitArchived(label); d != "" {
-								return d
+					case "no_attempt":
+						window := 100 * time.Millisecond
+						if step.Event == "restart" {
+							window = 3 * retry
+						}
+						time.Sleep(window)
+						if got := authority.attempts(key); got != before {
+							return fmt.Sprintf("%s: %d attempts, want none", label, got-before)
+						}
+					case "no_attempt_before_retry_after", "no_attempt_before_backoff":
+						// Observe before the persisted back-off elapses: an attempt
+						// then is this step bringing it forward. One the back-off
+						// allowed means the machine outran the observation. Every
+						// attempt is also held to the deadline it arrived under.
+						notBefore, ok := persistedFor(key)
+						if ok {
+							time.Sleep(min(100*time.Millisecond, time.Until(notBefore)-50*time.Millisecond))
+						}
+						if got := authority.attempts(key); got != before {
+							if authority.earlyBy(key, before) > 0 {
+								return fmt.Sprintf("%s: %d attempts, want none", label, got-before)
 							}
-						} else if !waitUntil(func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
-							return label + ": not held"
+							inconclusive = true
+							return label + ": the back-off elapsed before the step was observed"
+						}
+						if !ok {
+							return label + ": no persisted back-off"
+						}
+						if time.Now().After(notBefore) {
+							inconclusive = true
+							return label + ": the back-off elapsed before the step was observed"
+						}
+					case "attempt_fresh_envelope_same_bytes":
+						wait := 3 * time.Second
+						if step.Event == "retry_after_elapsed" {
+							wait = (scaledRetryAfterS + 3) * time.Second
+						}
+						deadline := time.Now().Add(wait)
+						// An elapsed back-off is the lane's own schedule: a lane that
+						// kept backing off while earlier steps waited is due when
+						// its next attempt is, not after a fixed window.
+						if step.Event == "backoff_elapsed" {
+							if due := worker.nextAttemptIn(key).Add(3 * time.Second); due.After(deadline) {
+								deadline = due
+							}
+						}
+						for authority.attempts(key) == before && time.Now().Before(deadline) {
+							time.Sleep(time.Millisecond)
+						}
+						if authority.attempts(key) != before+1 {
+							return fmt.Sprintf("%s: %d attempts, want one", label, authority.attempts(key)-before)
+						}
+						if by := authority.earlyBy(key, before); by > 0 {
+							return fmt.Sprintf("%s: attempted %s before the persisted back-off elapsed", label, by)
+						}
+						authority.mu.Lock()
+						bodies, nonces := authority.bodies[key], authority.nonces[key]
+						n := len(bodies)
+						sameBytes := bodies[n-1] == bodies[n-2]
+						fresh := nonces[n-1] != nonces[n-2]
+						authority.mu.Unlock()
+						if !sameBytes || !fresh {
+							return fmt.Sprintf("%s: same bytes %v, fresh envelope %v", label, sameBytes, fresh)
+						}
+						if step.Response != nil && step.Response.Status == http.StatusOK && step.Then == "" {
+							if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
+								return label + ": not retired"
+							}
+						}
+						if step.Response != nil && vectorHolds(*step.Response) && step.Then == "" {
+							// A terminal refusal archives only on a retention; without
+							// one it is held, in either lane (evidence-transport/v2).
+							if step.Response.Outcome == "refused_retained" && !persistFails {
+								if d := waitArchived(label); d != "" {
+									return d
+								}
+							} else if !waitUntil(func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
+								return label + ": not held"
+							}
+						}
+					case "archived":
+						if d := waitArchived(label); d != "" {
+							return d
+						}
+					default:
+						t.Fatalf("%s: expectation %q the worker cannot express", label, step.Expect)
+					}
+					// then is the state the artifact reaches once the step's
+					// response has been acted on.
+					switch step.Then {
+					case "":
+					case "retained":
+						if !waitUntil(func() bool {
+							e, ok := laneEntry(worker, key)
+							return ok && e.State != DeviceHeld && q.LenLane(key) == 1
+						}) {
+							e, _ := laneEntry(worker, key)
+							return fmt.Sprintf("%s: then not retained, state %s", label, e.State)
+						}
+					case "retired":
+						if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
+							return label + ": then not retired"
+						}
+					case "archived":
+						if d := waitArchived(label); d != "" {
+							return d
+						}
+					default:
+						t.Fatalf("%s: then %q the worker cannot express", label, step.Then)
+					}
+					if persistFails {
+						restore()
+						id := q.firstID(key)
+						if _, ok := q.HoldFor(id); ok {
+							return label + ": a hold was persisted while the write was made to fail"
 						}
 					}
-				case "archived":
-					if d := waitArchived(label); d != "" {
-						return d
-					}
-				default:
-					t.Fatalf("%s: expectation %q the worker cannot express", label, step.Expect)
+					return ""
 				}
-				// then is the state the artifact reaches once the step's
-				// response has been acted on.
-				switch step.Then {
-				case "":
-				case "retained":
-					if !waitUntil(func() bool {
-						e, ok := laneEntry(worker, key)
-						return ok && e.State != DeviceHeld && q.LenLane(key) == 1
-					}) {
-						e, _ := laneEntry(worker, key)
-						return fmt.Sprintf("%s: then not retained, state %s", label, e.State)
+				for i, step := range seq.Steps {
+					observed = runStep(i, step)
+					// An attempt before its deadline, in any lane, is a
+					// violation, and a violation is never inconclusive.
+					if early := authority.anyEarly(); early != "" && (observed == "" || inconclusive) {
+						observed = fmt.Sprintf("step %d (%s): %s", i, step.Event, early)
+						inconclusive = false
 					}
-				case "retired":
-					if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
-						return label + ": then not retired"
-					}
-				case "archived":
-					if d := waitArchived(label); d != "" {
-						return d
-					}
-				default:
-					t.Fatalf("%s: then %q the worker cannot express", label, step.Then)
-				}
-				if persistFails {
-					restore()
-					id := q.firstID(key)
-					if _, ok := q.HoldFor(id); ok {
-						return label + ": a hold was persisted while the write was made to fail"
+					if observed != "" {
+						break
 					}
 				}
-				return ""
+				if observed == "" && len(consequenceBefore) != 0 {
+					t.Fatal("a registration_retired consequence was never checked")
+				}
+				if running != nil {
+					running.stop()
+				}
+				return observed, inconclusive
 			}
-			observed := ""
-			for i, step := range seq.Steps {
-				if observed = runStep(i, step); observed != "" {
-					break
-				}
-			}
-			if observed == "" && len(consequenceBefore) != 0 {
-				t.Fatal("a registration_retired consequence was never checked")
-			}
-			if running != nil {
-				running.stop()
+			observed, conclusive := playUntilConclusive(plays, play, func(observed string) { t.Logf("played again: %s", observed) })
+			if !conclusive {
+				t.Fatalf("inconclusive in %d plays: %s", plays, observed)
 			}
 			checkPin(t, refusalSequencePins, seq.Name, observed)
 		})
+	}
+}
+
+// playUntilConclusive plays until a play is conclusive, at most plays times.
+// A conclusive play, a violation included, is never played again.
+func playUntilConclusive(plays int, play func() (string, bool), again func(string)) (string, bool) {
+	observed, inconclusive := play()
+	for n := 1; inconclusive && n < plays; n++ {
+		again(observed)
+		observed, inconclusive = play()
+	}
+	return observed, !inconclusive
+}
+
+func TestPlayUntilConclusiveNeverReplaysAViolation(t *testing.T) {
+	plays := 0
+	play := func(results ...bool) func() (string, bool) {
+		plays = 0
+		return func() (string, bool) {
+			inconclusive := results[min(plays, len(results)-1)]
+			plays++
+			return fmt.Sprintf("play %d", plays), inconclusive
+		}
+	}
+	if observed, ok := playUntilConclusive(5, play(false), func(string) {}); !ok || observed != "play 1" || plays != 1 {
+		t.Fatalf("a conclusive play was played again: %q after %d plays", observed, plays)
+	}
+	if observed, ok := playUntilConclusive(5, play(true, true, false), func(string) {}); !ok || observed != "play 3" || plays != 3 {
+		t.Fatalf("inconclusive plays: %q after %d plays", observed, plays)
+	}
+	if _, ok := playUntilConclusive(5, play(true), func(string) {}); ok || plays != 5 {
+		t.Fatalf("an always inconclusive sequence was played %d times, conclusive %v", plays, ok)
 	}
 }
 
