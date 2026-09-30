@@ -1,16 +1,16 @@
 {
   "source_repository": "ori-platform/ori-specs",
-  "source_commit": "a43f95b510aa52e2a507a774e9d2e37ca11a6234",
+  "source_commit": "89163fc0b3d518d94ebf6a8722fd4b9f7e5c154c",
   "note": "Vendored copies of the ori-specs vectors the gateway's tests consume, each at its path in the source repository. Digests detect a local edit; the source commit is the provenance trail. Re-vendor from the source commit rather than editing a copy.",
   "files": {
     "evidence-exchange/vectors/anchor-registration-v2.json": "c8c56f2d8ab1a316724f3f6487359c1e39035ce5207af956ec583086a4b94f62",
     "evidence-exchange/vectors/checkpoint.json": "642ef97c5f7cc41401d0d3d262fa34c50359ca897457ab2bd78bdb89bd444a03",
     "evidence-exchange/vectors/custody-acknowledgement.json": "cd12f04d04d01e01c1bf0cd62d535fee736820e5c7fd92285e589d1f7f7f99a8",
-    "evidence-exchange/vectors/routing-projection-v2.json": "87be70fde66bbbe941042a482c354b5a712271c1322a312921eb4ababca28a09",
+    "evidence-exchange/vectors/routing-projection-v2.json": "e46fe8b8c7a6e6686eaf1ef095f831f86e4b36d8667203c464cf1e9b77e6f34b",
     "evidence-transport/vectors/ingest-auth.json": "88cd580040cecac1e6e23bbad29cd24054d42e1a70360cc22487259db3d65c70",
-    "evidence-transport/vectors/refusal-policy-v2.json": "432d1e454f9ac29c74c0ce5d42f105d0e9abec4f71bf34cd80aa78b919cb3b7a",
+    "evidence-transport/vectors/refusal-policy-v2.json": "5830cdefced9d9793f9057b9a89c9f730da2901b40a01636a6b01554fd4c2f32",
     "gateway-api/vectors/outbound-evidence.json": "91475546a540ed81637af193b2e78f22c9092e287ebfcf3e6e68b156152a42b8",
-    "gateway-config/vectors/evidence-config-v2.json": "7b0715d72cc019108a57c8d3f12f370c57ea60be0813d150d32d4a391bfacfb1",
+    "gateway-config/vectors/evidence-config-v2.json": "9638dd33f99ee59cf9000c7d5113ca1ffa72d278cb23ad3d72ee086c4fe1b53d",
     "gateway-evidence-carriage/vectors/site-health-evidence-delivery.json": "05cbe0d8a7e50f4a6a1be85e82b51eb34c43ef3d733f81913bab73834f28e326"
   }
 }

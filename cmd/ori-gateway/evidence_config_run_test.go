@@ -91,6 +91,13 @@ func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 			}
 			evidence["queue_directory"] = filepath.Join(t.TempDir(), "outbound")
 			evidence["return_queue_directory"] = filepath.Join(t.TempDir(), "returned")
+			// The loader checks a bundle path's form only; the bundle itself
+			// is read at startup, so a real one stands in, as the queues do.
+			_, bundled := evidence["authority_ca_file"]
+			if bundled {
+				caPEM, _ := authorityCA(t)
+				evidence["authority_ca_file"] = privateBundle(t, caPEM)
+			}
 			document, err := yaml.Marshal(map[string]any{
 				"gateway":  map[string]any{"broker_url": "tcp://localhost:1883", "device_ids": tc.DeviceIDs},
 				"provider": map[string]any{"name": "echo"},
@@ -113,6 +120,9 @@ func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 			mainBroker := newFakeBroker()
 			evidenceBroker := newFakeBroker()
 			deps := baseDeps(t, cfg, mainBroker, &fakeProvider{healthy: true}, newFakeHeartbeat())
+			if bundled {
+				deps.authorityTrustOwner = os.Getuid()
+			}
 			deps.newBroker = func(opts broker.Options) (brokerClient, error) {
 				if opts.ClientID == defaultEvidenceClientID {
 					return evidenceBroker, nil
