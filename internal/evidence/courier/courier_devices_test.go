@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/custody"
 	"github.com/ori-platform/ori-gateway/internal/evidence/faults"
 	"log/slog"
@@ -425,8 +426,8 @@ func TestATimerNeverSendsBeforeTheWallClockBackoff(t *testing.T) {
 }
 
 // rateLimiter answers the first refusals requests with a 429 whose
-// Retry-After is retryAfterS seconds, and accepts after that. It records each
-// request's wall-clock arrival.
+// Retry-After is retryAfterS seconds, and accepts after that. It records when
+// each request arrived, on both clocks.
 type rateLimiter struct {
 	mu          sync.Mutex
 	refusals    int
@@ -440,7 +441,7 @@ func (a *rateLimiter) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	a.mu.Lock()
-	a.arrived = append(a.arrived, time.Now().Round(0))
+	a.arrived = append(a.arrived, time.Now())
 	refuse := len(a.arrived) <= a.refusals
 	a.mu.Unlock()
 	digest := payloadDigest(body.Bytes())
@@ -459,9 +460,34 @@ func (a *rateLimiter) arrivals() []time.Time {
 	return append([]time.Time(nil), a.arrived...)
 }
 
+// steppedClock is the system clock with a wall clock a test can step; its
+// monotonic clock runs undisturbed.
+type steppedClock struct {
+	mu     sync.Mutex
+	offset time.Duration
+}
+
+func (c *steppedClock) step(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.offset += d
+}
+
+func (c *steppedClock) clock() clock {
+	origin := time.Now()
+	return clock{
+		wall: func() time.Time {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return time.Now().Round(0).Add(c.offset)
+		},
+		mono: func() time.Duration { return time.Since(origin) },
+	}
+}
+
 // boundedWorker backs off from 100ms to a 200ms bound, well under a
-// one-second Retry-After.
-func boundedWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper) *DeliveryWorker {
+// Retry-After of a second or more.
+func boundedWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, clocks ...*steppedClock) *DeliveryWorker {
 	t.Helper()
 	channel, err := NewHTTPChannel(HTTPChannelOptions{
 		Endpoint: fakeAuthorityURL, ClientID: "site-a-gateway",
@@ -470,21 +496,25 @@ func boundedWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper) *
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, DeliveryWorkerOptions{
+	opts := DeliveryWorkerOptions{
 		RetryInterval: 100 * time.Millisecond, MaxBackoff: 200 * time.Millisecond,
 		BlockedReminderInterval: time.Hour, Logger: slog.New(slog.DiscardHandler),
-	})
+	}
+	for _, c := range clocks {
+		opts.clock = c.clock()
+	}
+	worker, err := NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return worker
 }
 
-// awaitRetryNoEarlierThan hands the device off throughout the wait, and
-// requires the retry to arrive no earlier than the persisted deadline.
-func awaitRetryNoEarlierThan(t *testing.T, worker *DeliveryWorker, authority *rateLimiter, notBefore time.Time) {
+// awaitRetry hands the device off throughout the wait and returns when the
+// retry arrived. A wait that ends without one fails.
+func awaitRetry(t *testing.T, worker *DeliveryWorker, authority *rateLimiter, within time.Duration) time.Time {
 	t.Helper()
-	give := time.Now().Add(time.Until(notBefore) + 2*time.Second)
+	give := time.Now().Add(within)
 	for len(authority.arrivals()) < 2 && time.Now().Before(give) {
 		worker.NotifyDevice("dev-a")
 		time.Sleep(5 * time.Millisecond)
@@ -493,41 +523,45 @@ func awaitRetryNoEarlierThan(t *testing.T, worker *DeliveryWorker, authority *ra
 	if len(arrived) != 2 {
 		t.Fatalf("%d attempts, want the refused one and its retry", len(arrived))
 	}
-	if arrived[1].Before(notBefore) {
-		t.Fatalf("retried %s before the Retry-After", notBefore.Sub(arrived[1]))
-	}
+	return arrived[1]
 }
 
-func TestRetryAfterBeyondTheBoundIsWaitedInFull(t *testing.T) {
-	q := openTestQueue(t, 10, 1<<20)
+// refusedBackoff starts a worker that is refused once with a Retry-After of
+// retryAfterS seconds, and returns once the back-off is persisted.
+func refusedBackoff(t *testing.T, q *DurableQueue, retryAfterS int, clocks ...*steppedClock) (*DeliveryWorker, *runningWorker, *rateLimiter, BackoffRecord) {
+	t.Helper()
 	entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority := &rateLimiter{refusals: 1, retryAfterS: 1}
-	worker := boundedWorker(t, q, authority)
-	startWorker(t, worker)
+	authority := &rateLimiter{refusals: 1, retryAfterS: retryAfterS}
+	worker := boundedWorker(t, q, authority, clocks...)
+	running := startWorker(t, worker)
 	waitFor(t, "the back-off", func() bool { _, ok := q.BackoffFor(entry.ID); return ok })
 	record, _ := q.BackoffFor(entry.ID)
-	notBefore := time.UnixMilli(record.NotBeforeMS)
-	if record.RetryAfterMS != 1000 || notBefore.Before(authority.arrivals()[0].Add(time.Second)) {
+	if record.V != 2 || record.RetryAfterMS == nil || *record.RetryAfterMS != int64(retryAfterS)*1000 {
 		t.Fatalf("persisted back-off = %#v", record)
 	}
-	awaitRetryNoEarlierThan(t, worker, authority, notBefore)
+	return worker, running, authority, record
+}
+
+func TestRetryAfterBeyondTheBoundIsWaitedInFull(t *testing.T) {
+	worker, _, authority, record := refusedBackoff(t, openTestQueue(t, 10, 1<<20), 1)
+	refused := authority.arrivals()[0]
+	notBefore := time.UnixMilli(record.NotBeforeMS)
+	if notBefore.Before(refused.Round(0).Add(time.Second)) {
+		t.Fatalf("persisted %s, refused at %s", notBefore, refused)
+	}
+	retried := awaitRetry(t, worker, authority, 3*time.Second)
+	if retried.Round(0).Before(notBefore) || retried.Sub(refused) < time.Second {
+		t.Fatalf("retried %s after the refusal, before the Retry-After", retried.Sub(refused))
+	}
 }
 
 func TestRetryAfterBeyondTheBoundSurvivesARestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "queue")
-	q := openTestQueueAt(t, dir, 100, 1<<24)
-	entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	authority := &rateLimiter{refusals: 1, retryAfterS: 1}
-	running := startWorker(t, boundedWorker(t, q, authority))
-	waitFor(t, "the back-off", func() bool { _, ok := q.BackoffFor(entry.ID); return ok })
+	_, running, authority, record := refusedBackoff(t, openTestQueueAt(t, dir, 100, 1<<24), 1)
 	running.stop()
-	record, _ := q.BackoffFor(entry.ID)
 	notBefore := time.UnixMilli(record.NotBeforeMS)
 
 	next := boundedWorker(t, openTestQueueAt(t, dir, 100, 1<<24), authority)
@@ -535,7 +569,44 @@ func TestRetryAfterBeyondTheBoundSurvivesARestart(t *testing.T) {
 		t.Fatalf("restored deadline %s, persisted %s", restored.Format(time.RFC3339Nano), notBefore.Format(time.RFC3339Nano))
 	}
 	startWorker(t, next)
-	awaitRetryNoEarlierThan(t, next, authority, notBefore)
+	if retried := awaitRetry(t, next, authority, 3*time.Second); retried.Round(0).Before(notBefore) {
+		t.Fatalf("retried %s before the Retry-After", notBefore.Sub(retried.Round(0)))
+	}
+}
+
+func TestAForwardWallClockNeverShortensARetryAfter(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "in one process", true: "across a restart"}[restart], func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "queue")
+			wall := &steppedClock{}
+			worker, running, authority, _ := refusedBackoff(t, openTestQueueAt(t, dir, 100, 1<<24), 2, wall)
+			if restart {
+				running.stop()
+				worker = boundedWorker(t, openTestQueueAt(t, dir, 100, 1<<24), authority, wall)
+				startWorker(t, worker)
+			}
+			// The wall clock steps most of the Retry-After forward; the
+			// monotonic clock still holds the whole of it.
+			wall.step(1800 * time.Millisecond)
+			refused := authority.arrivals()[0]
+			if retried := awaitRetry(t, worker, authority, 4*time.Second); retried.Sub(refused) < 2*time.Second {
+				t.Fatalf("retried %s after a Retry-After of 2s", retried.Sub(refused))
+			}
+		})
+	}
+}
+
+func TestABackwardsWallClockIsBoundedByTheRetryAfter(t *testing.T) {
+	wall := &steppedClock{}
+	worker, _, authority, _ := refusedBackoff(t, openTestQueue(t, 10, 1<<20), 1, wall)
+	// An hour backwards stretches the wall-clock deadline by an hour; the wait
+	// is bounded by the longest the back-off could have been, the Retry-After.
+	wall.step(-time.Hour)
+	refused := authority.arrivals()[0]
+	retried := awaitRetry(t, worker, authority, 4*time.Second)
+	if waited := retried.Sub(refused); waited < time.Second || waited > 3*time.Second {
+		t.Fatalf("retried %s after a Retry-After of 1s", waited)
+	}
 }
 
 func TestABackwardsClockNeverShortensARetryAfter(t *testing.T) {
@@ -561,10 +632,12 @@ func TestABackwardsClockNeverShortensARetryAfter(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := q.SetBackoff(BackoffRecord{
-				QueueRecord: entry.ID, NotBeforeMS: time.Now().Add(far).UnixMilli(), Attempts: 1,
-				RetryAfterMS: tc.retryAfter.Milliseconds(),
-			}); err != nil {
+			record := BackoffRecord{QueueRecord: entry.ID, NotBeforeMS: time.Now().Add(far).UnixMilli(), Attempts: 1}
+			if tc.retryAfter > 0 {
+				ms := tc.retryAfter.Milliseconds()
+				record.RetryAfterMS = &ms
+			}
+			if err := q.SetBackoff(record); err != nil {
 				t.Fatal(err)
 			}
 			worker := boundedWorker(t, q, &rateLimiter{})
@@ -581,6 +654,71 @@ func TestABackwardsClockNeverShortensARetryAfter(t *testing.T) {
 			}
 			if got := worker.nextAttempt("dev-a"); !near(got) {
 				t.Fatalf("deadline in %s, want %s", time.Until(got), tc.bound)
+			}
+		})
+	}
+}
+
+func TestBackoffRecordVersions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "queue")
+	q := openTestQueueAt(t, dir, 10, 1<<20)
+	entry, err := q.Enqueue(ArtifactCheckpoint, deviceCheckpoint("dev-a", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notBefore := time.Now().Add(time.Minute).UnixMilli()
+	read := func() map[string]any {
+		raw, err := os.ReadFile(filepath.Join(dir, backoffFilePrefix+entry.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		return fields
+	}
+	// Without a Retry-After the record is the version an older gateway reads.
+	if err := q.SetBackoff(BackoffRecord{QueueRecord: entry.ID, NotBeforeMS: notBefore, Attempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if fields := read(); fields["v"] != float64(1) || fields["retry_after_ms"] != nil {
+		t.Fatalf("written without a Retry-After: %v", fields)
+	}
+	// With one it is version 2, and only version 2 carries it.
+	ms := int64(90_000)
+	if err := q.SetBackoff(BackoffRecord{QueueRecord: entry.ID, NotBeforeMS: notBefore, Attempts: 1, RetryAfterMS: &ms}); err != nil {
+		t.Fatal(err)
+	}
+	if fields := read(); fields["v"] != float64(2) || fields["retry_after_ms"] != float64(90_000) {
+		t.Fatalf("written with a Retry-After: %v", fields)
+	}
+	for name, body := range map[string]string{
+		"version 1": `{"v":1,"queue_record":"%s","not_before_ms":%d,"attempts":1}`,
+		"version 2": `{"v":2,"queue_record":"%s","not_before_ms":%d,"attempts":1,"retry_after_ms":90000}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := fmt.Sprintf(body, entry.ID, notBefore)
+			if err := os.WriteFile(filepath.Join(dir, backoffFilePrefix+entry.ID), []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenDurableQueue(QueueOptions{Directory: dir, MaxItems: 10, MaxBytes: 1 << 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, ok := reopened.BackoffFor(entry.ID)
+			wantFloor := name == "version 2"
+			if !ok || record.NotBeforeMS != notBefore || (record.RetryAfterMS != nil) != wantFloor {
+				t.Fatalf("read %#v", record)
+			}
+			// A version 1 record restores no floor, so its wait is bounded
+			// by the back-off bound; version 2 restores its Retry-After.
+			lane := boundedWorker(t, reopened, &rateLimiter{}).lane(LaneKey{Device: "dev-a", Lane: LaneEvidence})
+			lane.mu.Lock()
+			floor := lane.retryAfter
+			lane.mu.Unlock()
+			if (floor == 90*time.Second) != wantFloor {
+				t.Fatalf("restored floor %s", floor)
 			}
 		})
 	}
@@ -634,12 +772,15 @@ func TestInvalidBackoffRefusesTheQueue(t *testing.T) {
 	for name, body := range map[string]string{
 		"corrupt":              "{",
 		"zero attempts":        `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":0}`,
-		"wrong version":        `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1}`,
+		"unknown version":      `{"v":3,"queue_record":"%s","not_before_ms":1,"attempts":1}`,
+		"v1 with a floor":      `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":1000}`,
+		"v2 without one":       `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1}`,
+		"zero floor":           `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":0}`,
 		"unknown field":        `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"x":1}`,
 		"names another":        `{"v":1,"queue_record":"` + strings.Repeat("0", 64) + `","not_before_ms":1,"attempts":1}`,
 		"negative before":      `{"v":1,"queue_record":"%s","not_before_ms":-1,"attempts":1}`,
-		"negative retry-after": `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":-1}`,
-		"retry-after unparsed": `{"v":1,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":2147483648000}`,
+		"negative retry-after": `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":-1}`,
+		"retry-after unparsed": `{"v":2,"queue_record":"%s","not_before_ms":1,"attempts":1,"retry_after_ms":2147483648000}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "queue")

@@ -144,7 +144,10 @@ func (q *DurableQueue) loadHolds(names []string) error {
 }
 
 const (
-	backoffRecordVersion = 1
+	// A version 1 back-off record carries no Retry-After floor; version 2
+	// carries one. A back-off without a floor is still written as version 1.
+	backoffRecordV1 = 1
+	backoffRecordV2 = 2
 	// maxRetryAfterMS is the longest Retry-After the channel parses.
 	maxRetryAfterMS = (1<<31 - 1) * 1000
 	// backoffFilePrefix names the back-off record beside a queue record:
@@ -160,8 +163,8 @@ type BackoffRecord struct {
 	NotBeforeMS int64  `json:"not_before_ms"`
 	Attempts    int    `json:"attempts"`
 	// RetryAfterMS is the Retry-After floor the back-off carried, so a bound
-	// on the exponential part never shortens it.
-	RetryAfterMS int64 `json:"retry_after_ms,omitempty"`
+	// on the exponential part never shortens it. Only version 2 carries it.
+	RetryAfterMS *int64 `json:"retry_after_ms,omitempty"`
 }
 
 // SetBackoff durably records a queued record's back-off. The write is atomic.
@@ -174,7 +177,10 @@ func (q *DurableQueue) SetBackoff(record BackoffRecord) error {
 	if _, ok := q.entries[record.QueueRecord]; !ok {
 		return ErrArtifactNotFound
 	}
-	record.V = backoffRecordVersion
+	record.V = backoffRecordV1
+	if record.RetryAfterMS != nil {
+		record.V = backoffRecordV2
+	}
 	if err := validateBackoffRecord(record); err != nil {
 		return err
 	}
@@ -260,13 +266,17 @@ func (q *DurableQueue) loadBackoffs(names []string) error {
 
 func validateBackoffRecord(record BackoffRecord) error {
 	switch {
-	case record.V != backoffRecordVersion:
+	case record.V == backoffRecordV1 && record.RetryAfterMS != nil:
+		return fmt.Errorf("version 1 carries no retry-after")
+	case record.V == backoffRecordV2 && record.RetryAfterMS == nil:
+		return fmt.Errorf("version 2 carries a retry-after")
+	case record.V != backoffRecordV1 && record.V != backoffRecordV2:
 		return fmt.Errorf("unsupported version")
 	case record.NotBeforeMS <= 0 || record.NotBeforeMS > custody.MaxSafeInteger:
 		return fmt.Errorf("not-before time out of range")
 	case record.Attempts < 1 || record.Attempts > maxBackoffAttempts:
 		return fmt.Errorf("attempt count out of range")
-	case record.RetryAfterMS < 0 || record.RetryAfterMS > maxRetryAfterMS:
+	case record.RetryAfterMS != nil && (*record.RetryAfterMS < 1 || *record.RetryAfterMS > maxRetryAfterMS):
 		return fmt.Errorf("retry-after out of range")
 	}
 	return nil
