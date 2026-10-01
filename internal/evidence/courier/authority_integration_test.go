@@ -119,8 +119,6 @@ func TestAgainstTheEvidenceAuthority(t *testing.T) {
 		"ORI_EVIDENCE_CLIENT_ID="+clientID,
 		"ORI_EVIDENCE_INGEST_SECRET="+secret,
 		"ORI_EVIDENCE_DATABASE_PATH="+filepath.Join(work, "authority.db"),
-		"ORI_EVIDENCE_EPOCH_KEY_ID=epoch-integration",
-		"ORI_EVIDENCE_RECEIPT_KEY_ID=receipt-integration",
 		"ORI_EVIDENCE_CHAIN_SIGNING_PUBLIC_KEY_HEX="+strings.Repeat("22", 32),
 	)
 	var serviceLog bytes.Buffer
