@@ -8,12 +8,14 @@
 // service and point the test at the binary:
 //
 //	ORI_EVIDENCE_INGEST_BIN=/path/to/ori-evidence-ingest \
-//	  go test -tags evidence_integration -run TestAgainstTheEvidenceAuthority -v ./internal/evidence
+//	  go test -tags evidence_integration -run 'TestAgainstTheEvidenceAuthority' -v ./internal/evidence/courier
 //
 // The signed registration is the vendored ori-specs vector. The service binds loopback HTTP behind TLS
 // termination, so the test fronts it with a TLS proxy. The proxy can rewrite
 // the path, the method, or drop the authentication header, to reach the
-// service's framework and transport refusals; it never alters a response.
+// service's framework and transport refusals; it never alters a response. The
+// malformed-acceptance test fronts it with a proxy that alters only the
+// authority's 200 responses.
 
 package courier
 
@@ -93,18 +95,25 @@ func vectorCanonicalBytes(t *testing.T, relative string) []byte {
 	return nil
 }
 
-func TestAgainstTheEvidenceAuthority(t *testing.T) {
+const (
+	integrationSecret   = "evidence-ingest-secret-with-at-least-32-bytes-integration"
+	integrationClientID = "site-a-gateway"
+)
+
+// startEvidenceAuthority starts the built ingest service on a loopback port,
+// allowing the vendored registration's device, and returns its address and
+// that registration's wire bytes.
+func startEvidenceAuthority(t *testing.T) (bind string, registration []byte) {
+	t.Helper()
 	bin := os.Getenv("ORI_EVIDENCE_INGEST_BIN")
 	if bin == "" {
 		t.Fatal("ORI_EVIDENCE_INGEST_BIN must name a built evidence ingest service binary")
 	}
-	registration := vectorCanonicalBytes(t, "evidence-exchange/vectors/anchor-registration-v2.json")
+	registration = vectorCanonicalBytes(t, "evidence-exchange/vectors/anchor-registration-v2.json")
 	device := recordDevice(registration)
-	const secret = "evidence-ingest-secret-with-at-least-32-bytes-integration"
-	const clientID = "site-a-gateway"
 
 	work := t.TempDir()
-	bind := freeLoopbackAddr(t)
+	bind = freeLoopbackAddr(t)
 	cmd := exec.Command(bin)
 	cmd.Env = append(os.Environ(),
 		"ORI_EVIDENCE_POSTURE=development",
@@ -116,8 +125,8 @@ func TestAgainstTheEvidenceAuthority(t *testing.T) {
 		"ORI_EVIDENCE_COMMISSIONING_KEY_ID=commissioning-integration",
 		"ORI_EVIDENCE_COMMISSIONING_PUBLIC_KEY_HEX="+strings.Repeat("11", 32),
 		"ORI_EVIDENCE_ALLOWED_DEVICES="+device,
-		"ORI_EVIDENCE_CLIENT_ID="+clientID,
-		"ORI_EVIDENCE_INGEST_SECRET="+secret,
+		"ORI_EVIDENCE_CLIENT_ID="+integrationClientID,
+		"ORI_EVIDENCE_INGEST_SECRET="+integrationSecret,
 		"ORI_EVIDENCE_DATABASE_PATH="+filepath.Join(work, "authority.db"),
 		"ORI_EVIDENCE_CHAIN_SIGNING_PUBLIC_KEY_HEX="+strings.Repeat("22", 32),
 	)
@@ -139,6 +148,12 @@ func TestAgainstTheEvidenceAuthority(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	return bind, registration
+}
+
+func TestAgainstTheEvidenceAuthority(t *testing.T) {
+	bind, registration := startEvidenceAuthority(t)
+	device := recordDevice(registration)
 
 	var modeMu sync.Mutex
 	mode := &proxyMode{}
@@ -220,7 +235,7 @@ func TestAgainstTheEvidenceAuthority(t *testing.T) {
 				}
 			}
 			channel, err := NewHTTPChannel(HTTPChannelOptions{
-				Endpoint: proxy.URL + ingestPath, ClientID: clientID, Secret: secret, HTTPClient: proxy.Client(),
+				Endpoint: proxy.URL + ingestPath, ClientID: integrationClientID, Secret: integrationSecret, HTTPClient: proxy.Client(),
 			})
 			if err != nil {
 				t.Fatal(err)
