@@ -8,9 +8,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 )
 
 // contractTokenSeverity is gateway-api/v2's degradation_reasons table, written
@@ -533,5 +538,149 @@ func TestSilentCriticalJudgedOnGatewayReceiptNotProducerClock(t *testing.T) {
 				t.Fatalf("site status %q", out.Status)
 			}
 		})
+	}
+}
+
+// memberCase is a heartbeat body as raw JSON, so case variants and duplicate
+// member names can be expressed.
+type memberCase struct {
+	name    string
+	body    string
+	verdict string
+}
+
+func memberCases(lastSeenMS int64) []memberCase {
+	ls := fmt.Sprint(lastSeenMS)
+	head := `"device_id":"dev-01","last_seen_ms":` + ls + `,"active_triggers":[]`
+	return []memberCase{
+		{"STATUS alone", `{` + head + `,"STATUS":"healthy"}`, VerdictHeartbeatMemberCaseVariant},
+		{"Status alone", `{` + head + `,"Status":"healthy"}`, VerdictHeartbeatMemberCaseVariant},
+		{"status and Status", `{` + head + `,"status":"critical","Status":"healthy"}`, VerdictHeartbeatMemberCaseVariant},
+		{"Status before status", `{` + head + `,"Status":"healthy","status":"critical"}`, VerdictHeartbeatMemberCaseVariant},
+		{"status twice", `{` + head + `,"status":"critical","status":"healthy"}`, VerdictHeartbeatMemberDuplicate},
+		{"Degradation_Reasons", `{` + head + `,"status":"healthy","Degradation_Reasons":["decision_record_lost"]}`, VerdictHeartbeatMemberCaseVariant},
+		{"DEGRADATION_REASONS beside the exact member", `{` + head + `,"status":"critical","degradation_reasons":["decision_record_lost"],"DEGRADATION_REASONS":["sensor_stale"]}`, VerdictHeartbeatMemberCaseVariant},
+		{"Device_ID", `{"Device_ID":"dev-01","last_seen_ms":` + ls + `,"active_triggers":[],"status":"healthy"}`, VerdictHeartbeatMemberCaseVariant},
+		{"Last_Seen_MS", `{"device_id":"dev-01","Last_Seen_MS":` + ls + `,"active_triggers":[],"status":"healthy"}`, VerdictHeartbeatMemberCaseVariant},
+		{"Active_Triggers", `{"device_id":"dev-01","last_seen_ms":` + ls + `,"Active_Triggers":[],"status":"healthy"}`, VerdictHeartbeatMemberCaseVariant},
+		{"Gateway_Seen_MS", `{` + head + `,"status":"healthy","Gateway_Seen_MS":0}`, VerdictHeartbeatMemberCaseVariant},
+		{"EVIDENCE", `{` + head + `,"status":"healthy","EVIDENCE":{"chain_head_hash":"","attestation_gap_count":0,"available":true,"action_event_type":""}}`, VerdictHeartbeatMemberCaseVariant},
+		{"evidence.Available", `{` + head + `,"status":"healthy","evidence":{"chain_head_hash":"","attestation_gap_count":0,"Available":true,"action_event_type":""}}`, VerdictHeartbeatMemberCaseVariant},
+		{"evidence.CHAIN_HEAD_HASH", `{` + head + `,"status":"healthy","evidence":{"CHAIN_HEAD_HASH":"","attestation_gap_count":0,"available":true,"action_event_type":""}}`, VerdictHeartbeatMemberCaseVariant},
+		{"evidence.available twice", `{` + head + `,"status":"healthy","evidence":{"chain_head_hash":"","attestation_gap_count":0,"available":false,"available":true,"action_event_type":""}}`, VerdictHeartbeatMemberDuplicate},
+		{"evidence twice", `{` + head + `,"status":"healthy","evidence":null,"evidence":null}`, VerdictHeartbeatMemberDuplicate},
+		{"Auth", `{` + head + `,"status":"healthy","Auth":{}}`, VerdictHeartbeatMemberCaseVariant},
+	}
+}
+
+// signBody signs a raw heartbeat body with the runtime's HMAC envelope, keeping
+// its member names exactly as written.
+func signBody(t *testing.T, body string, now time.Time, secret string) []byte {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := mqttauth.Sign(payload, contracts.RuntimeHeartbeatMessageType, "dev-01", "", now.UnixMilli(), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authJSON, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []byte(strings.TrimSuffix(body, "}") + `,"auth":` + string(authJSON) + `}`)
+}
+
+// A member named by a case variant of a contract member, or a contract member
+// named twice, is refused with its verdict, signed or not, and a retained
+// critical node is left exactly as it was.
+func TestHeartbeatMemberNamesAreExact(t *testing.T) {
+	const secret = "site-local-secret"
+	for _, signed := range []bool{false, true} {
+		for _, tc := range memberCases(1234567890000) {
+			t.Run(fmt.Sprintf("signed=%v/%s", signed, tc.name), func(t *testing.T) {
+				now := time.UnixMilli(1234567890000)
+				reg := NewRegistry()
+				opts := RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return now }}
+				if signed {
+					verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: secret, Now: func() time.Time { return now }})
+					if err != nil {
+						t.Fatal(err)
+					}
+					opts.AuthVerifier = verifier
+				}
+				h, err := NewRuntimeHeartbeatHandler(reg, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				critical := heartbeatMap(NodeStatusCritical, now.UnixMilli())
+				critical["degradation_reasons"] = []any{"decision_record_lost"}
+				body := mustJSON(t, critical)
+				if signed {
+					body = signBody(t, string(body), now, secret)
+				}
+				if err := h.Handle(testTopic, body); err != nil {
+					t.Fatal(err)
+				}
+				reg.EvictStaleRetainingCritical(now.Add(time.Hour).UnixMilli(), silenceTTLMS)
+				before := reg.Snapshot()
+
+				now = now.Add(time.Hour)
+				hostile := []byte(tc.body)
+				if signed {
+					hostile = signBody(t, tc.body, now, secret)
+				}
+				err = h.Handle(testTopic, hostile)
+				if got := DegradationVerdict(err); got != tc.verdict {
+					t.Fatalf("verdict = %q, want %q (err=%v)", got, tc.verdict, err)
+				}
+				if after := reg.Snapshot(); !reflect.DeepEqual(after, before) {
+					t.Fatalf("refused heartbeat changed held state:\nbefore %#v\nafter  %#v", before, after)
+				}
+				out := getHealth(t, reg, []string{"dev-01"}, now)
+				if out.Status != SiteStatusCritical || out.Nodes[0].Status != SiteStatusCritical {
+					t.Fatalf("site %q node %q, want critical", out.Status, out.Nodes[0].Status)
+				}
+			})
+		}
+	}
+}
+
+// Exact member names, and unknown members whatever their case, are accepted.
+func TestHeartbeatExactMembersAndUnknownMembersAccepted(t *testing.T) {
+	now := time.UnixMilli(1234567890000)
+	h, reg := newHandler(t, now)
+	body := `{"device_id":"dev-01","last_seen_ms":1234567890000,"gateway_seen_ms":0,"active_triggers":["t"],` +
+		`"status":"critical","degradation_reasons":["decision_record_lost"],` +
+		`"evidence":{"chain_head_hash":"","attestation_gap_count":2,"available":true,"action_event_type":"X","Extra":1},` +
+		`"Some_Future_Field":1,"some_future_field":2}`
+	if err := h.Handle(testTopic, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	got := reg.Snapshot()[0]
+	if got.Status != NodeStatusCritical || len(got.ActiveTriggers) != 1 || got.Evidence == nil ||
+		got.Evidence.AttestationGapCount != 2 || !got.Evidence.Available || got.Evidence.ActionEventType != "X" {
+		t.Fatalf("registered = %#v", got)
+	}
+}
+
+// The decode behind the member-name check reads exact keys on its own, so a
+// case variant that reached it would be ignored, never read as the member.
+func TestParseRuntimeHeartbeatReadsExactKeysOnly(t *testing.T) {
+	if _, _, err := parseRuntimeHeartbeat([]byte(`{"STATUS":"healthy"}`)); DegradationVerdict(err) != VerdictRuntimeStatusInvalid {
+		t.Fatalf("STATUS read as status: err=%v", err)
+	}
+	beat, reasons, err := parseRuntimeHeartbeat([]byte(`{"status":"healthy","Degradation_Reasons":["decision_record_lost"],` +
+		`"Device_ID":"dev-01","Last_Seen_MS":5,"Active_Triggers":["t"],"Gateway_Seen_MS":7,` +
+		`"evidence":{"Chain_Head_Hash":"x","Attestation_Gap_Count":3,"Available":true,"Action_Event_Type":"X"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reasons != nil || beat.DeviceID != "" || beat.LastSeenMS != 0 || beat.ActiveTriggers != nil || beat.GatewaySeenMS != 0 {
+		t.Fatalf("case variants read as members: beat %#v reasons %#v", beat, reasons)
+	}
+	if beat.Evidence == nil || *beat.Evidence != (contracts.RuntimeNodeHeartbeatEvidence{}) {
+		t.Fatalf("evidence case variants read as members: %#v", beat.Evidence)
 	}
 }

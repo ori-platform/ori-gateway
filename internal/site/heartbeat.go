@@ -72,34 +72,16 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := refuseInexactHeartbeatMembers(payload); err != nil {
+		return err
+	}
 	unsignedPayload, err := h.unsignedPayload(deviceID, payload)
 	if err != nil {
 		return err
 	}
-	// status and degradation_reasons are classified on their RAW values
-	// BEFORE the typed decode, which is where gateway-api/v2 places them:
-	// status first, then the reasons against it. Running them afterwards would
-	// let an unrelated typed failure pre-empt a defect and deny it the verdict
-	// the contract requires. A []string field would also reject a non-array or
-	// non-string element with a generic unmarshal error, making two verdicts
-	// unreachable, and would blur absent against present-empty.
-	var wire runtimeHeartbeatWire
-	if err := json.Unmarshal(unsignedPayload, &wire); err != nil {
-		return fmt.Errorf("decode runtime node heartbeat wire fields: %w", err)
-	}
-	status, err := validateRuntimeStatus(wire.Status)
+	beat, degradationReasons, err := parseRuntimeHeartbeat(unsignedPayload)
 	if err != nil {
 		return err
-	}
-	degradationReasons, err := validateDegradationReasons(wire.DegradationReasons, status)
-	if err != nil {
-		return err
-	}
-
-	var beat contracts.RuntimeNodeHeartbeat
-	dec := json.NewDecoder(bytes.NewReader(unsignedPayload))
-	if err := dec.Decode(&beat); err != nil {
-		return fmt.Errorf("decode runtime node heartbeat: %w", err)
 	}
 	if err := h.validate(deviceID, beat); err != nil {
 		return err
@@ -125,14 +107,36 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 	return nil
 }
 
-// runtimeHeartbeatWire carries the fields this package must inspect before
-// typed decoding. It is intentionally private and separate from
-// contracts.RuntimeNodeHeartbeat: raw-JSON semantics belong at the ingress
-// boundary, not in the shared typed model other packages consume.
-type runtimeHeartbeatWire struct {
-	// Status is raw because step 1 classifies it before the typed decode.
-	Status             json.RawMessage `json:"status"`
-	DegradationReasons json.RawMessage `json:"degradation_reasons"`
+// parseRuntimeHeartbeat reads the unsigned heartbeat by exact member names and
+// applies steps 1 to 11 before the typed decode.
+func parseRuntimeHeartbeat(unsignedPayload []byte) (contracts.RuntimeNodeHeartbeat, []string, error) {
+	// status and degradation_reasons are classified on their RAW values
+	// BEFORE the typed decode, which is where gateway-api/v2 places them:
+	// status first, then the reasons against it. Running them afterwards would
+	// let an unrelated typed failure pre-empt a defect and deny it the verdict
+	// the contract requires. A []string field would also reject a non-array or
+	// non-string element with a generic unmarshal error, making two verdicts
+	// unreachable, and would blur absent against present-empty. Every member
+	// is read by its exact key: a struct decode matches names
+	// case-insensitively.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(unsignedPayload, &members); err != nil {
+		return contracts.RuntimeNodeHeartbeat{}, nil, fmt.Errorf("decode runtime node heartbeat wire fields: %w", err)
+	}
+	status, err := validateRuntimeStatus(members["status"])
+	if err != nil {
+		return contracts.RuntimeNodeHeartbeat{}, nil, err
+	}
+	degradationReasons, err := validateDegradationReasons(members["degradation_reasons"], status)
+	if err != nil {
+		return contracts.RuntimeNodeHeartbeat{}, nil, err
+	}
+
+	beat, err := decodeRuntimeHeartbeat(members)
+	if err != nil {
+		return contracts.RuntimeNodeHeartbeat{}, nil, err
+	}
+	return beat, degradationReasons, nil
 }
 
 func (h *RuntimeHeartbeatHandler) unsignedPayload(deviceID string, payload []byte) ([]byte, error) {

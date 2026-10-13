@@ -96,8 +96,11 @@ type DegradationError struct {
 
 func (e *DegradationError) Error() string {
 	field := "degradation_reasons"
-	if e.Verdict == VerdictRuntimeStatusInvalid {
+	switch e.Verdict {
+	case VerdictRuntimeStatusInvalid:
 		field = "status"
+	case VerdictHeartbeatMemberCaseVariant, VerdictHeartbeatMemberDuplicate:
+		field = "member"
 	}
 	return fmt.Sprintf("runtime heartbeat %s: %s (%s)", field, e.Detail, e.Verdict)
 }
