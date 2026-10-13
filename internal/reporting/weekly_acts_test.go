@@ -6,6 +6,7 @@ package reporting
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -110,6 +111,33 @@ func actionRow(name string, executed bool, actionTaken any) map[string]any {
 	return row
 }
 
+// retained is the record the report must hand on for a dispatch row built by
+// actionRow, written out field by field rather than through the client's mapper.
+func retained(name string, executed, safeDefaultUsed bool, actionTaken string) runtimeclient.ActionLogEntry {
+	return runtimeclient.ActionLogEntry{
+		DeviceID:        "edge-1",
+		CreatedAtMS:     1_799_900_000_000,
+		ActionName:      name,
+		Tier:            "C",
+		SafeDefaultUsed: safeDefaultUsed,
+		Success:         executed,
+		ActionTaken:     actionTaken,
+	}
+}
+
+// assertRetained requires the provider input to be exactly want: contributors
+// dropped, every kept record unchanged and in export order.
+func assertRetained(t *testing.T, provider *fakeProvider, want ...runtimeclient.ActionLogEntry) {
+	t.Helper()
+	got := provider.input.Actions
+	if len(got) == 0 && len(want) == 0 {
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider actions =\n%#v\nwant\n%#v", got, want)
+	}
+}
+
 func providerActionTaken(provider *fakeProvider) []string {
 	out := make([]string, 0, len(provider.input.Actions))
 	for _, row := range provider.input.Actions {
@@ -130,6 +158,7 @@ func TestWeeklyReportCountsAnActWithTwoContributorsOnce(t *testing.T) {
 	if got := providerActionTaken(provider); len(got) != 1 || got[0] != "trip_relay/trip_relay" {
 		t.Fatalf("provider actions = %v, want the act only", got)
 	}
+	assertRetained(t, provider, retained("trip_relay", true, false, "trip_relay"))
 }
 
 func TestWeeklyReportDoesNotCountLegacyContributor(t *testing.T) {
@@ -145,11 +174,13 @@ func TestWeeklyReportDoesNotCountLegacyContributor(t *testing.T) {
 			t.Fatalf("provider input lists a legacy contributor as an action: %#v", row)
 		}
 	}
+	assertRetained(t, provider, retained("trip_relay", true, false, "trip_relay"))
 }
 
 func TestWeeklyReportCountsExportWithoutRecordKindByCoalescedRule(t *testing.T) {
 	act := actionRow("alert_sms", true, "alert_sms")
 	failed := actionRow("trip_relay", false, "log_to_dashboard")
+	failed["safe_default_used"] = true
 	untagged := actionRow("alert_whatsapp", true, nil)
 	contributor := actionRow("alert_sms", false, "coalesced")
 	legacy := actionRow("trip_relay", true, "coalesced")
@@ -172,6 +203,11 @@ func TestWeeklyReportCountsExportWithoutRecordKindByCoalescedRule(t *testing.T) 
 			t.Fatalf("provider actions = %v, want %v", got, want)
 		}
 	}
+	assertRetained(t, provider,
+		retained("alert_sms", true, false, "alert_sms"),
+		retained("trip_relay", false, true, "log_to_dashboard"),
+		retained("alert_whatsapp", true, false, ""),
+	)
 }
 
 func TestWeeklyReportContributorRecognitionIsExact(t *testing.T) {
@@ -180,22 +216,26 @@ func TestWeeklyReportContributorRecognitionIsExact(t *testing.T) {
 		actionTaken any
 		executed    bool
 		wantActs    int
+		wantTaken   string
 	}{
-		{"exact contributor", "coalesced", false, 0},
-		{"exact legacy contributor", "coalesced", true, 0},
-		{"capitalised", "Coalesced", true, 1},
-		{"upper case", "COALESCED", false, 1},
-		{"surrounding whitespace", " coalesced ", false, 1},
-		{"empty", "", true, 1},
-		{"absent", nil, true, 1},
-		{"non-string", float64(0), false, 1},
-		{"null", json.RawMessage("null"), true, 1},
+		{"exact contributor", "coalesced", false, 0, ""},
+		{"exact legacy contributor", "coalesced", true, 0, ""},
+		{"capitalised", "Coalesced", true, 1, "Coalesced"},
+		{"upper case", "COALESCED", false, 1, "COALESCED"},
+		{"surrounding whitespace", " coalesced ", false, 1, " coalesced "},
+		{"empty", "", true, 1, ""},
+		{"absent", nil, true, 1, ""},
+		{"non-string", float64(0), false, 1, "0"},
+		{"null", json.RawMessage("null"), true, 1, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			artifact, provider := generateFromActionLogExport(t, []any{actionRow("trip_relay", tc.executed, tc.actionTaken)})
 			if artifact.ActionCount != tc.wantActs || len(provider.input.Actions) != tc.wantActs {
 				t.Fatalf("ActionCount = %d, provider actions = %d, want %d", artifact.ActionCount, len(provider.input.Actions), tc.wantActs)
+			}
+			if tc.wantActs == 1 {
+				assertRetained(t, provider, retained("trip_relay", tc.executed, false, tc.wantTaken))
 			}
 		})
 	}
