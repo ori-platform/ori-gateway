@@ -215,7 +215,7 @@ func (g *WeeklyReportGenerator) Generate(ctx context.Context, req WeeklyReportRe
 	if len(actionRows) == runtimeclient.MaxLimit {
 		warnings = append(warnings, "action_log may be truncated at runtime export limit")
 	}
-	actions := actsOnly(actionRows)
+	actions := dispatchRecordsOnly(actionRows)
 	decisions, err := g.runtime.TierCDecisionLog(ctx, runtimeclient.TierCDecisionLogRequest{BoundedWindow: window})
 	if err != nil {
 		return WeeklyReportArtifact{}, fmt.Errorf("reporting: runtime tier_c_decision_log export failed: %w", err)
@@ -470,20 +470,21 @@ func deepCopyAny(value any) any {
 	}
 }
 
-// isContributorRecord reports whether row records a request that joined another dispatch's act rather than an act.
+// isContributorRecord reports whether row records a request that joined another dispatch's act rather than a dispatch.
 // The action_log export carries no record_kind yet, so this applies the runtime migration's own test; once it
 // does, record_kind decides here and contributor_legacy counts as not executed.
 func isContributorRecord(row runtimeclient.ActionLogEntry) bool {
 	return row.ActionTaken == contributorActionTaken
 }
 
-// actsOnly returns the rows that record an act, leaving out contributor records.
-func actsOnly(rows []runtimeclient.ActionLogEntry) []runtimeclient.ActionLogEntry {
-	acts := make([]runtimeclient.ActionLogEntry, 0, len(rows))
+// dispatchRecordsOnly returns every dispatch record, whatever its outcome (executed, no_executor, suppressed,
+// refused or failed), leaving out only contributor records.
+func dispatchRecordsOnly(rows []runtimeclient.ActionLogEntry) []runtimeclient.ActionLogEntry {
+	dispatches := make([]runtimeclient.ActionLogEntry, 0, len(rows))
 	for _, row := range rows {
 		if !isContributorRecord(row) {
-			acts = append(acts, row)
+			dispatches = append(dispatches, row)
 		}
 	}
-	return acts
+	return dispatches
 }
