@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1089,6 +1091,99 @@ func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("stale runtime nodes were not evicted: %#v", registry.Snapshot())
+}
+
+// syncBuffer is a log sink safe to read while a goroutine writes to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
+	registry := site.NewRegistry()
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "critical", Status: site.NodeStatusCritical, LastSeenMS: 1000})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "degraded", Status: site.NodeStatusDegraded, LastSeenMS: 1000})
+	now := time.UnixMilli(10_000)
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, func() time.Time {
+		return now
+	}, logger)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := registry.Snapshot()
+		if len(snapshot) == 1 && snapshot[0].DeviceID == "critical" &&
+			strings.Contains(logs.String(), "device_id=degraded") {
+			time.Sleep(20 * time.Millisecond)
+			if n := strings.Count(logs.String(), "silent after a critical heartbeat"); n != 1 {
+				t.Fatalf("silent critical node reported %d times, want once:\n%s", n, logs.String())
+			}
+			for _, want := range []string{
+				`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=critical gateway_seen_ms=0 last_seen_ms=1000`,
+				`level=WARN msg="runtime node heartbeat stale" device_id=degraded last_seen_ms=1000`,
+			} {
+				if n := strings.Count(logs.String(), want+"\n"); n != 1 {
+					t.Fatalf("log line %q appears %d times, want once:\n%s", want, n, logs.String())
+				}
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("critical node not retained or degraded node not evicted: %#v\n%s", registry.Snapshot(), logs.String())
+}
+
+func TestEvictStaleRuntimeNodesJudgesCriticalSilenceOnGatewayReceipt(t *testing.T) {
+	const arrivalMS = int64(1_000_000)
+	registry := site.NewRegistry()
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "ahead", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS + 2000, GatewaySeen: arrivalMS})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "behind", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS - 200_000, GatewaySeen: arrivalMS})
+	var nowMS atomic.Int64
+	nowMS.Store(arrivalMS)
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	const interval = 5 * time.Millisecond // TTL is three intervals: 15 ms.
+
+	go evictStaleRuntimeNodes(t.Context(), registry, interval, func() time.Time {
+		return time.UnixMilli(nowMS.Load())
+	}, logger)
+	time.Sleep(20 * interval)
+	if strings.Contains(logs.String(), "silent after a critical heartbeat") {
+		t.Fatalf("a critical node still reporting was logged silent within the TTL of its arrival:\n%s", logs.String())
+	}
+
+	nowMS.Store(arrivalMS + 16)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && strings.Count(logs.String(), "silent after a critical heartbeat") < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(20 * interval)
+	out := logs.String()
+	for _, fields := range []string{
+		"device_id=ahead gateway_seen_ms=1000000 last_seen_ms=1002000",
+		"device_id=behind gateway_seen_ms=1000000 last_seen_ms=800000",
+	} {
+		want := `level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" ` + fields + "\n"
+		if n := strings.Count(out, want); n != 1 {
+			t.Fatalf("log line %q appears %d times past the TTL of its arrival, want once:\n%s", want, n, out)
+		}
+	}
+	if n := strings.Count(out, "silent after a critical heartbeat"); n != 2 {
+		t.Fatalf("%d silent lines, want 2:\n%s", n, out)
+	}
 }
 
 func validTierCEnrichmentRequestPayload(t *testing.T) []byte {

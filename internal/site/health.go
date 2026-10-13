@@ -8,6 +8,7 @@ import "time"
 const (
 	SiteStatusHealthy  = "healthy"
 	SiteStatusDegraded = "degraded"
+	SiteStatusCritical = "critical"
 )
 
 // SiteHealth is a read-only, advisory projection of site state at a point in time.
@@ -186,22 +187,24 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			continue
 		}
 		stale := siteNodeIsStale(n.LastSeenMS, nowMS, p.opts.NodeTTLMS)
-		status := SiteStatusHealthy
-		if stale || n.Status == NodeStatusDegraded {
-			status = SiteStatusDegraded
+		// The node's own status is a floor, never a ceiling: staleness and an
+		// evidence-integrity problem raise a healthy node to degraded and leave
+		// a critical one critical. An evidence-integrity problem is a truncated
+		// or rolled-back chain, or signing reported unavailable while evidence
+		// is enabled: Tier C/D actions are accumulating without verifiable
+		// attestation. Gap count alone stays informational — transient signing
+		// failures repair via runtime reconciliation.
+		status := projectedSeverity(n.Status)
+		if stale {
+			status = max(status, severityDegraded)
 		}
-		// An evidence-integrity problem degrades the node: a truncated or
-		// rolled-back chain, or signing reported unavailable while evidence
-		// is enabled, means Tier C/D actions are accumulating without
-		// verifiable attestation. Gap count alone stays informational —
-		// transient signing failures repair via runtime reconciliation.
 		if n.Evidence != nil &&
 			(n.Evidence.TruncationSuspected || n.Evidence.HeadRegressed || !n.Evidence.Available) {
-			status = SiteStatusDegraded
+			status = max(status, severityDegraded)
 		}
 		nodes = append(nodes, SiteNode{
 			DeviceID:           deviceID,
-			Status:             status,
+			Status:             siteStatusName(status),
 			LastSeenMS:         n.LastSeenMS,
 			GatewayObserved:    true,
 			Stale:              stale,
@@ -212,24 +215,45 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 		})
 	}
 
-	status := SiteStatusHealthy
-	if gateway.Status != SiteStatusHealthy ||
-		(gateway.EvidenceDelivery != nil &&
-			(gateway.EvidenceDelivery.Degraded || gateway.EvidenceDelivery.Blocked)) {
-		status = SiteStatusDegraded
+	// The site takes the most severe of the gateway and every node, critical
+	// over degraded over healthy.
+	status := projectedSeverity(gateway.Status)
+	if gateway.EvidenceDelivery != nil &&
+		(gateway.EvidenceDelivery.Degraded || gateway.EvidenceDelivery.Blocked) {
+		status = max(status, severityDegraded)
 	}
 	for _, n := range nodes {
-		if n.Status == SiteStatusDegraded {
-			status = SiteStatusDegraded
-			break
-		}
+		status = max(status, projectedSeverity(n.Status))
 	}
 
 	return SiteHealth{
 		GeneratedAtMS: nowMS,
-		Status:        status,
+		Status:        siteStatusName(status),
 		Nodes:         nodes,
 		Gateway:       gateway,
+	}
+}
+
+// projectedSeverity reads a status into the projection's severity order. A
+// value that is not healthy, degraded or critical, such as the gateway's own
+// starting, is degraded: it is never read as healthy, and never folds a
+// critical below itself because the projection only ever takes a maximum.
+func projectedSeverity(status string) int {
+	if sev, ok := statusSeverity(status); ok {
+		return sev
+	}
+	return severityDegraded
+}
+
+// siteStatusName names a projected severity.
+func siteStatusName(severity int) string {
+	switch severity {
+	case severityHealthy:
+		return SiteStatusHealthy
+	case severityDegraded:
+		return SiteStatusDegraded
+	default:
+		return SiteStatusCritical
 	}
 }
 

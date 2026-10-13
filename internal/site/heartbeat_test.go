@@ -83,8 +83,8 @@ func TestRuntimeHeartbeatHandlerRejectsInvalidStatus(t *testing.T) {
 	})
 
 	err = handler.Handle("ori/dev-01/runtime/heartbeat", payload)
-	if err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("unexpected error: %v", err)
+	if got := DegradationVerdict(err); got != VerdictRuntimeStatusInvalid {
+		t.Fatalf("verdict = %q, want %q (err=%v)", got, VerdictRuntimeStatusInvalid, err)
 	}
 }
 

@@ -10,26 +10,61 @@ import (
 	"fmt"
 )
 
-// Runtime node heartbeat `degradation_reasons`, per gateway-api/v1.
+// Runtime node heartbeat `degradation_reasons`, per gateway-api/v2.
 //
 // The field names which runtime subsystems are degraded, so a consumer can
-// tell *why* a node reports `degraded` rather than only that it does. It is
-// deliberately not `active_triggers`: an active trigger is a physical or
-// automation trigger and a degraded subsystem is neither, and the two differ
-// in disclosure — trigger names are site-authored and arbitrary, which is why
-// only their count is projected, whereas these tokens are contract-owned and
-// non-sensitive and may be projected in full.
+// tell *why* a node reports `degraded` or `critical` rather than only that it
+// does. It is deliberately not `active_triggers`: an active trigger is a
+// physical or automation trigger and a degraded subsystem is neither, and the
+// two differ in disclosure — trigger names are site-authored and arbitrary,
+// which is why only their count is projected, whereas these tokens are
+// contract-owned and non-sensitive and may be projected in full.
 
 // maxDegradationReasons is the exact bound from the contract, not a guess.
-const maxDegradationReasons = 16
+const maxDegradationReasons = 32
 
-// degradationReasonVocabulary is closed. An unrecognised token is refused
-// rather than passed through, which is what makes a vocabulary addition
-// order-dependent: ratify in specs, then gateway acceptance, then runtime
-// emission. A runtime emitting ahead of its gateways would make a conforming
-// older gateway reject the whole heartbeat.
-var degradationReasonVocabulary = map[string]struct{}{
-	"firmware_liveness_degraded": {},
+// healthSnapshotInvalid is the fallback heartbeat's token: it is only ever the
+// sole token, and only on a critical heartbeat.
+const healthSnapshotInvalid = "health_snapshot_invalid"
+
+// degradationReasonSeverity is the closed vocabulary with each token's
+// severity. An unrecognised token is refused rather than passed through,
+// which is what makes a vocabulary addition order-dependent: ratify in specs,
+// then gateway acceptance, then runtime emission. A runtime emitting ahead of
+// its gateways would make a conforming older gateway reject the whole
+// heartbeat. The umbrella firmware_liveness_degraded decides no severity.
+var degradationReasonSeverity = map[string]int{
+	"action_log_records_lost":              severityDegraded,
+	"action_log_records_stalled":           severityDegraded,
+	"alert_delivery_overdue":               severityDegraded,
+	"commissioning_problem":                severityDegraded,
+	"community_skills_refused":             severityDegraded,
+	"config_unsigned_value_source":         severityDegraded,
+	"decision_record_lost":                 severityCritical,
+	"evidence_contributor_link_unresolved": severityDegraded,
+	"evidence_courier_answer_unrecognised": severityDegraded,
+	"evidence_posture_problem":             severityDegraded,
+	"firmware_liveness_degraded":           severityHealthy,
+	"firmware_liveness_device_expired":     severityCritical,
+	"firmware_liveness_over_capacity":      severityDegraded,
+	"firmware_liveness_stopped":            severityCritical,
+	"firmware_liveness_tick_failures":      severityDegraded,
+	"firmware_liveness_tick_stale":         severityCritical,
+	healthSnapshotInvalid:                  severityCritical,
+	"safety_zone_activation_refused":       severityDegraded,
+	"safety_zone_active_unprotected":       severityDegraded,
+	"safety_zone_trip_unresolved":          severityCritical,
+	"sensor_measurement_degraded":          severityDegraded,
+	"sensor_stale":                         severityDegraded,
+	"sensor_unconnected":                   severityDegraded,
+	"skill_optional_hooks_unavailable":     severityDegraded,
+	"skill_required_hooks_unavailable":     severityCritical,
+	"subsystem_starting":                   severityDegraded,
+	"subsystem_state_unknown":              severityDegraded,
+	"subsystem_state_unknown_critical":     severityCritical,
+	"tier_c_records_degraded":              severityDegraded,
+	"tier_c_recovery_failed":               severityDegraded,
+	"tier_d_alert_delivery_unconfirmed":    severityCritical,
 }
 
 // Closed classification verdicts. These are internal: the runtime node
@@ -38,13 +73,16 @@ var degradationReasonVocabulary = map[string]struct{}{
 // logs, metrics and conformance tests — which is what makes "refused for the
 // right reason" checkable rather than an untestable aspiration.
 const (
+	VerdictRuntimeStatusInvalid             = "runtime_status_invalid"
 	VerdictDegradationReasonsNotArray       = "degradation_reasons_not_array"
 	VerdictDegradationReasonsLengthInvalid  = "degradation_reasons_length_invalid"
 	VerdictDegradationReasonNotString       = "degradation_reason_not_string"
 	VerdictDegradationReasonsNotUnique      = "degradation_reasons_not_unique"
 	VerdictDegradationReasonsNotOrdered     = "degradation_reasons_not_ordered"
 	VerdictDegradationReasonUnknown         = "degradation_reason_unknown"
+	VerdictDegradationReasonNotAlone        = "degradation_reason_not_alone"
 	VerdictDegradationReasonsStatusMismatch = "degradation_reasons_status_mismatch"
+	VerdictDegradationSeverityUnderstated   = "degradation_reasons_severity_understated"
 )
 
 // DegradationError carries the closed verdict alongside a human message.
@@ -57,7 +95,14 @@ type DegradationError struct {
 }
 
 func (e *DegradationError) Error() string {
-	return fmt.Sprintf("runtime heartbeat degradation_reasons: %s (%s)", e.Detail, e.Verdict)
+	field := "degradation_reasons"
+	switch e.Verdict {
+	case VerdictRuntimeStatusInvalid:
+		field = "status"
+	case VerdictHeartbeatMemberCaseVariant, VerdictHeartbeatMemberDuplicate:
+		field = "member"
+	}
+	return fmt.Sprintf("runtime heartbeat %s: %s (%s)", field, e.Detail, e.Verdict)
 }
 
 // DegradationVerdict returns the closed verdict for err, or "" if err is not a
@@ -76,8 +121,9 @@ func newDegradationError(verdict, detail string) *DegradationError {
 	return &DegradationError{Verdict: verdict, Detail: detail}
 }
 
-// validateDegradationReasons applies the normative order from gateway-api/v1
-// to the RAW value, before typed decoding or normalisation.
+// validateDegradationReasons applies steps 2 to 11 of the normative order from
+// gateway-api/v2 to the RAW value, before typed decoding or normalisation.
+// status must already have passed step 1 (validateRuntimeStatus).
 //
 // Operating on json.RawMessage is not incidental. A typed []string decode
 // would reject a non-array or a non-string element with a generic unmarshal
@@ -88,12 +134,12 @@ func newDegradationError(verdict, detail string) *DegradationError {
 // Returns the decoded tokens on success. A nil slice means the field was
 // absent, which is valid and distinct from an empty array.
 func validateDegradationReasons(raw json.RawMessage, status string) ([]string, error) {
-	// 1. presence — absent is valid and terminates validation.
+	// 2. presence — absent is valid and terminates validation.
 	if raw == nil {
 		return nil, nil
 	}
 
-	// 2. array type. An explicit null must be refused here rather than
+	// 3. array type. An explicit null must be refused here rather than
 	// masquerading as absence — and Go will not do it for you: unmarshalling
 	// JSON null into a slice is a successful no-op that yields a nil slice,
 	// which would otherwise be misclassified downstream as a zero-length
@@ -112,9 +158,9 @@ func validateDegradationReasons(raw json.RawMessage, status string) ([]string, e
 		)
 	}
 
-	// 3. length 1..16. Checked before uniqueness, ordering and vocabulary:
-	// the v1 vocabulary holds one token, so any over-length list necessarily
-	// also contains duplicates or unknown tokens. Without this precedence an
+	// 4. length 1..32. Checked before uniqueness, ordering and vocabulary:
+	// the vocabulary holds fewer tokens than the bound, so any over-length
+	// list necessarily also contains duplicates or unknown tokens. Without this precedence an
 	// over-length list would be refused by a later check while no length
 	// guard existed at all, and a test asserting only "refused" would pass.
 	if len(elements) < 1 || len(elements) > maxDegradationReasons {
@@ -125,7 +171,7 @@ func validateDegradationReasons(raw json.RawMessage, status string) ([]string, e
 		)
 	}
 
-	// 4. every element is a string. Decoded generically and type-asserted
+	// 5. every element is a string. Decoded generically and type-asserted
 	// rather than unmarshalled straight into a string: JSON null into a
 	// string is a successful no-op in Go, so [null] would become "" and reach
 	// vocabulary validation as an unknown token instead of being refused
@@ -151,7 +197,7 @@ func validateDegradationReasons(raw json.RawMessage, status string) ([]string, e
 		tokens = append(tokens, token)
 	}
 
-	// 5. unique. Separate from ordering because they are different defects;
+	// 6. unique. Separate from ordering because they are different defects;
 	// one shared verdict would leave a conformance failure ambiguous about
 	// which rule an implementation is missing.
 	seen := make(map[string]struct{}, len(tokens))
@@ -165,7 +211,7 @@ func validateDegradationReasons(raw json.RawMessage, status string) ([]string, e
 		seen[token] = struct{}{}
 	}
 
-	// 6. lexicographically ordered.
+	// 7. ordered by the bytes of their UTF-8 encoding.
 	for i := 1; i < len(tokens); i++ {
 		if tokens[i-1] > tokens[i] {
 			return nil, newDegradationError(
@@ -175,25 +221,47 @@ func validateDegradationReasons(raw json.RawMessage, status string) ([]string, e
 		}
 	}
 
-	// 7. closed vocabulary.
+	// 8. closed vocabulary.
 	for _, token := range tokens {
-		if _, ok := degradationReasonVocabulary[token]; !ok {
+		if _, ok := degradationReasonSeverity[token]; !ok {
 			return nil, newDegradationError(
 				VerdictDegradationReasonUnknown,
-				fmt.Sprintf("token %q is not in the v1 vocabulary", token),
+				fmt.Sprintf("token %q is not in the gateway-api/v2 vocabulary", token),
 			)
 		}
 	}
 
-	// 8. non-empty reasons require status degraded. A receiver seeing reasons
-	// with a healthy status would otherwise have to choose which of two
-	// contradicting fields to believe, and implementations would choose
-	// differently.
-	if status != NodeStatusDegraded {
+	// 9. health_snapshot_invalid is the fallback heartbeat's token: alone,
+	// and only on a critical heartbeat.
+	if _, present := seen[healthSnapshotInvalid]; present &&
+		(len(tokens) != 1 || status != NodeStatusCritical) {
+		return nil, newDegradationError(
+			VerdictDegradationReasonNotAlone,
+			fmt.Sprintf("%s must be the only token on a critical heartbeat (status %q, %d tokens)",
+				healthSnapshotInvalid, status, len(tokens)),
+		)
+	}
+
+	// 10. non-empty reasons require status degraded or critical. A receiver
+	// seeing reasons with a healthy status would otherwise have to choose
+	// which of two contradicting fields to believe.
+	if status != NodeStatusDegraded && status != NodeStatusCritical {
 		return nil, newDegradationError(
 			VerdictDegradationReasonsStatusMismatch,
 			fmt.Sprintf("reasons present with status %q", status),
 		)
+	}
+
+	// 11. status is at least the most severe token's severity. A status above
+	// its tokens is accepted.
+	statusSev, _ := statusSeverity(status)
+	for _, token := range tokens {
+		if degradationReasonSeverity[token] > statusSev {
+			return nil, newDegradationError(
+				VerdictDegradationSeverityUnderstated,
+				fmt.Sprintf("token %q is more severe than status %q", token, status),
+			)
+		}
 	}
 
 	return tokens, nil
@@ -217,17 +285,41 @@ func jsonTypeName(v any) string {
 	}
 }
 
-// rawStatusString returns the heartbeat status when it is a JSON string, and
-// "" otherwise. A malformed status is not "degraded", so reasons carried
-// alongside one are refused by the status-implication check; the typed decode
-// rejects the malformed status separately on its own terms.
-func rawStatusString(raw json.RawMessage) string {
-	if raw == nil {
-		return ""
+// Node status severities, ordered so that a larger value is more severe.
+const (
+	severityHealthy = iota
+	severityDegraded
+	severityCritical
+)
+
+// statusSeverity returns the severity of a runtime node status, and false for
+// a value that is not one.
+func statusSeverity(status string) (int, bool) {
+	switch status {
+	case NodeStatusHealthy:
+		return severityHealthy, true
+	case NodeStatusDegraded:
+		return severityDegraded, true
+	case NodeStatusCritical:
+		return severityCritical, true
+	default:
+		return 0, false
 	}
+}
+
+// validateRuntimeStatus is step 1: status is the string healthy, degraded or
+// critical. It runs before every reasons check, because no reason can be
+// judged against a status that is not one.
+func validateRuntimeStatus(raw json.RawMessage) (string, error) {
 	var status string
-	if err := json.Unmarshal(raw, &status); err != nil {
-		return ""
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &status) != nil {
+		return "", newDegradationError(VerdictRuntimeStatusInvalid, "status is absent or not a string")
 	}
-	return status
+	if _, ok := statusSeverity(status); !ok {
+		return "", newDegradationError(
+			VerdictRuntimeStatusInvalid,
+			fmt.Sprintf("status %q is not healthy, degraded or critical", status),
+		)
+	}
+	return status, nil
 }
