@@ -39,6 +39,15 @@ This repo implements the Gateway API defined in:
 
 - [`ori-specs/gateway-api/v1.md`](https://github.com/ori-platform/ori-specs/blob/main/gateway-api/v1.md)
 
+The runtime node heartbeat on `ori/{device_id}/runtime/heartbeat` follows the
+heartbeat rules of
+[`ori-specs/gateway-api/v2.md`](https://github.com/ori-platform/ori-specs/blob/main/gateway-api/v2.md):
+the `critical` status, the full `degradation_reasons` vocabulary including the
+`health_snapshot_invalid` fallback, and validation steps 1 to 11. A `critical`
+node stays `critical` in the site projection and `GET /health`, and the site
+status is the most severe of the gateway and every node. The rest of
+gateway-api/v2 is not claimed.
+
 Runtime baseline:
 
 - [`ori-runtime`](https://github.com/ori-platform/ori-runtime) `v0.9.0-beta.2+`

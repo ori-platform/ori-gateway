@@ -17,6 +17,7 @@ import (
 const (
 	NodeStatusHealthy  = "healthy"
 	NodeStatusDegraded = "degraded"
+	NodeStatusCritical = "critical"
 
 	defaultMaxActiveTriggers = 64
 	maxActiveTriggerLength   = 128
@@ -75,21 +76,22 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	// degradation_reasons is classified on its RAW value BEFORE the typed
-	// decode, which is where gateway-api/v1 places it. Running it afterwards
-	// would let an unrelated typed failure — an invalid status, say — pre-empt
-	// an overlapping degradation defect and deny it the verdict the contract
-	// requires. A []string field would also reject a non-array or non-string
-	// element with a generic unmarshal error, making two verdicts unreachable,
-	// and would blur absent against present-empty.
+	// status and degradation_reasons are classified on their RAW values
+	// BEFORE the typed decode, which is where gateway-api/v2 places them:
+	// status first, then the reasons against it. Running them afterwards would
+	// let an unrelated typed failure pre-empt a defect and deny it the verdict
+	// the contract requires. A []string field would also reject a non-array or
+	// non-string element with a generic unmarshal error, making two verdicts
+	// unreachable, and would blur absent against present-empty.
 	var wire runtimeHeartbeatWire
 	if err := json.Unmarshal(unsignedPayload, &wire); err != nil {
 		return fmt.Errorf("decode runtime node heartbeat wire fields: %w", err)
 	}
-	degradationReasons, err := validateDegradationReasons(
-		wire.DegradationReasons,
-		rawStatusString(wire.Status),
-	)
+	status, err := validateRuntimeStatus(wire.Status)
+	if err != nil {
+		return err
+	}
+	degradationReasons, err := validateDegradationReasons(wire.DegradationReasons, status)
 	if err != nil {
 		return err
 	}
@@ -128,8 +130,7 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 // contracts.RuntimeNodeHeartbeat: raw-JSON semantics belong at the ingress
 // boundary, not in the shared typed model other packages consume.
 type runtimeHeartbeatWire struct {
-	// Status is raw because the degradation classifier runs before the typed
-	// decode and needs the status for its final check.
+	// Status is raw because step 1 classifies it before the typed decode.
 	Status             json.RawMessage `json:"status"`
 	DegradationReasons json.RawMessage `json:"degradation_reasons"`
 }
@@ -157,7 +158,7 @@ func (h *RuntimeHeartbeatHandler) validate(topicDeviceID string, beat contracts.
 		return fmt.Errorf("device_id %q does not match topic device_id %q", beat.DeviceID, topicDeviceID)
 	}
 	switch beat.Status {
-	case NodeStatusHealthy, NodeStatusDegraded:
+	case NodeStatusHealthy, NodeStatusDegraded, NodeStatusCritical:
 	default:
 		return fmt.Errorf("runtime heartbeat status %q is not supported", beat.Status)
 	}

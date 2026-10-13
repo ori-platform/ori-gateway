@@ -114,9 +114,9 @@ func TestDegradationReasonsUniquenessAndOrderingAreDistinct(t *testing.T) {
 func TestDegradationReasonsPrecedence(t *testing.T) {
 	now := time.UnixMilli(1234567890000)
 
-	// 17 duplicated unknown tokens: violates length, uniqueness and
+	// 33 duplicated unknown tokens: violates length, uniqueness and
 	// vocabulary. Length is checked first, so length must win.
-	overlong := make([]any, 17)
+	overlong := make([]any, maxDegradationReasons+1)
 	for i := range overlong {
 		overlong[i] = "not_a_real_reason"
 	}
@@ -149,7 +149,8 @@ func TestDegradationReasonsPrecedence(t *testing.T) {
 }
 
 // Raw classification runs before the typed decode, so an unrelated typed
-// failure cannot pre-empt a degradation defect and deny it its verdict.
+// failure cannot pre-empt a degradation defect and deny it its verdict. Status
+// is step 1 and is not unrelated: an invalid status wins over every reason.
 func TestDegradationClassificationPrecedesTypedDecode(t *testing.T) {
 	now := time.UnixMilli(1234567890000)
 	cases := []struct {
@@ -157,8 +158,8 @@ func TestDegradationClassificationPrecedesTypedDecode(t *testing.T) {
 		mutate  func(map[string]any)
 		verdict string
 	}{
-		{"invalid status does not pre-empt", func(m map[string]any) { m["status"] = "not_a_status" }, VerdictDegradationReasonUnknown},
-		{"status of wrong type does not pre-empt", func(m map[string]any) { m["status"] = 42 }, VerdictDegradationReasonUnknown},
+		{"invalid status pre-empts every reason", func(m map[string]any) { m["status"] = "not_a_status" }, VerdictRuntimeStatusInvalid},
+		{"status of wrong type pre-empts every reason", func(m map[string]any) { m["status"] = 42 }, VerdictRuntimeStatusInvalid},
 		{"invalid last_seen_ms does not pre-empt", func(m map[string]any) { m["last_seen_ms"] = 0 }, VerdictDegradationReasonUnknown},
 		{"device mismatch does not pre-empt", func(m map[string]any) { m["device_id"] = "someone-else" }, VerdictDegradationReasonUnknown},
 	}
@@ -176,8 +177,31 @@ func TestDegradationClassificationPrecedesTypedDecode(t *testing.T) {
 	}
 }
 
-// A malformed status is not "degraded", so reasons carried alongside one are
-// refused by the status-implication check rather than silently accepted.
+// A status that is not one is refused at step 1, before any reason is judged
+// against it, whether or not reasons are carried.
+func TestRuntimeStatusInvalidIsStepOne(t *testing.T) {
+	now := time.UnixMilli(1234567890000)
+	for _, status := range []any{42, nil, map[string]any{}, "starting", "Critical", " critical", "", "ok"} {
+		h, reg := newHandler(t, now)
+		payload := heartbeatMap(NodeStatusDegraded, now.UnixMilli())
+		payload["status"] = status
+		err := h.Handle(testTopic, mustJSON(t, payload))
+		if got := DegradationVerdict(err); got != VerdictRuntimeStatusInvalid {
+			t.Fatalf("status %#v without reasons: verdict = %q, want %q", status, got, VerdictRuntimeStatusInvalid)
+		}
+		if len(reg.Snapshot()) != 0 {
+			t.Fatalf("status %#v: refused heartbeat reached the registry", status)
+		}
+	}
+	h, _ := newHandler(t, now)
+	absent := heartbeatMap(NodeStatusDegraded, now.UnixMilli())
+	delete(absent, "status")
+	if got := DegradationVerdict(h.Handle(testTopic, mustJSON(t, absent))); got != VerdictRuntimeStatusInvalid {
+		t.Fatalf("absent status: verdict = %q", got)
+	}
+}
+
+// Reasons carried beside an unusable status do not change the verdict.
 func TestDegradationReasonsWithUnusableStatus(t *testing.T) {
 	now := time.UnixMilli(1234567890000)
 	for _, status := range []any{42, nil, map[string]any{}} {
@@ -186,8 +210,8 @@ func TestDegradationReasonsWithUnusableStatus(t *testing.T) {
 		payload["status"] = status
 		payload["degradation_reasons"] = []any{"firmware_liveness_degraded"}
 		err := h.Handle(testTopic, mustJSON(t, payload))
-		if got := DegradationVerdict(err); got != VerdictDegradationReasonsStatusMismatch {
-			t.Fatalf("status %#v: verdict = %q, want %q", status, got, VerdictDegradationReasonsStatusMismatch)
+		if got := DegradationVerdict(err); got != VerdictRuntimeStatusInvalid {
+			t.Fatalf("status %#v: verdict = %q, want %q", status, got, VerdictRuntimeStatusInvalid)
 		}
 	}
 }

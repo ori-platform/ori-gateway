@@ -161,6 +161,13 @@ The optional `site_health` HTTP server (`HealthHandler`) exposes `GET /health`
 on a loopback address (default `127.0.0.1:8765`) and must not appear in the
 JSON output. When `site_health.enabled=false`, no socket is opened and no goroutine
 is started.
+Severity is never folded: a node's own `critical` stays `critical` in the node
+view and the site status, staleness and evidence-integrity problems only raise a
+node's status, and the site status is the most severe of the gateway and every
+node, `critical` over `degraded` over `healthy`. Verified by
+`TestCriticalHeartbeatKeptThroughGetHealth`,
+`TestCriticalNodeNeverFoldedBelowCritical`, and
+`TestFallbackAfterEvidenceHistoryStaysCritical`.
 `internal/site` must never import `internal/runtimeclient`. Posture types are
 defined independently in `internal/site` (`SiteNodePosture`, `SiteNodeBrokerPosture`,
 `SiteNodeEncryptionPosture`, `SiteNodeAlertOutboxPosture`); mapping from
