@@ -814,9 +814,13 @@ func evictStaleRuntimeNodes(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			evicted := registry.EvictStale(now().UnixMilli(), ttlMS)
+			evicted, retained := registry.EvictStaleRetainingCritical(now().UnixMilli(), ttlMS)
 			for _, node := range evicted {
 				logger.Warn("runtime node heartbeat stale", "device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
+			}
+			for _, node := range retained {
+				logger.Error("runtime node silent after a critical heartbeat; kept critical until it reports again",
+					"device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
 			}
 		}
 	}

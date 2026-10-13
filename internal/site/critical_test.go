@@ -352,3 +352,154 @@ func TestProjectedSeverityUnknownIsDegraded(t *testing.T) {
 		}
 	}
 }
+
+// silenceHarness drives heartbeats through the real handler at a movable
+// clock, evicts as the gateway's eviction loop does, and reads GET /health.
+type silenceHarness struct {
+	t   *testing.T
+	now time.Time
+	h   *RuntimeHeartbeatHandler
+	reg *Registry
+}
+
+const silenceTTLMS = 5000
+
+func newSilenceHarness(t *testing.T) *silenceHarness {
+	t.Helper()
+	s := &silenceHarness{t: t, now: time.UnixMilli(1234567890000), reg: NewRegistry()}
+	h, err := NewRuntimeHeartbeatHandler(s.reg, RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return s.now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.h = h
+	return s
+}
+
+func (s *silenceHarness) beat(status string, reasons []any) {
+	s.t.Helper()
+	payload := heartbeatMap(status, s.now.UnixMilli())
+	if reasons != nil {
+		payload["degradation_reasons"] = reasons
+	}
+	if err := s.h.Handle(testTopic, mustJSON(s.t, payload)); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+func (s *silenceHarness) silence(d time.Duration) (evicted, retained []NodeHeartbeat) {
+	s.now = s.now.Add(d)
+	return s.reg.EvictStaleRetainingCritical(s.now.UnixMilli(), silenceTTLMS)
+}
+
+func (s *silenceHarness) health() SiteHealth {
+	s.t.Helper()
+	return getHealth(s.t, s.reg, []string{"dev-01"}, s.now)
+}
+
+// Critical, then silence past eviction: still critical, reported once; a fresh
+// healthy heartbeat clears it, and a healthy node going silent is evicted.
+func TestSilentCriticalNodeStaysCriticalUntilItReportsAgain(t *testing.T) {
+	s := newSilenceHarness(t)
+	s.beat(NodeStatusCritical, []any{"decision_record_lost"})
+
+	evicted, retained := s.silence(10 * silenceTTLMS * time.Millisecond)
+	if len(evicted) != 0 || len(retained) != 1 || retained[0].DeviceID != "dev-01" {
+		t.Fatalf("first eviction past TTL: evicted %v retained %v", evicted, retained)
+	}
+	out := s.health()
+	n := out.Nodes[0]
+	if out.Status != SiteStatusCritical || n.Status != SiteStatusCritical || !n.Stale || !n.GatewayObserved {
+		t.Fatalf("silent critical node projected as site %q node %#v", out.Status, n)
+	}
+	if len(n.DegradationReasons) != 1 || n.DegradationReasons[0] != "decision_record_lost" {
+		t.Fatalf("silent critical node lost its reasons: %#v", n.DegradationReasons)
+	}
+
+	evicted, retained = s.silence(1000 * silenceTTLMS * time.Millisecond)
+	if len(evicted) != 0 || len(retained) != 0 {
+		t.Fatalf("later eviction: evicted %v, retained %v (retention is reported once)", evicted, retained)
+	}
+	if out := s.health(); out.Status != SiteStatusCritical || out.Nodes[0].Status != SiteStatusCritical {
+		t.Fatalf("critical decayed with time: %#v", out)
+	}
+
+	s.beat(NodeStatusHealthy, nil)
+	if out := s.health(); out.Status != SiteStatusHealthy || out.Nodes[0].Status != SiteStatusHealthy || out.Nodes[0].Stale {
+		t.Fatalf("fresh healthy heartbeat did not clear critical: %#v", out)
+	}
+
+	evicted, retained = s.silence(2 * silenceTTLMS * time.Millisecond)
+	if len(evicted) != 1 || len(retained) != 0 {
+		t.Fatalf("silent healthy node: evicted %v retained %v", evicted, retained)
+	}
+	if n := s.health().Nodes[0]; n.Status != SiteStatusDegraded || n.GatewayObserved {
+		t.Fatalf("silent healthy node after eviction: %#v", n)
+	}
+}
+
+// A node that goes silent after critical a second time is reported again.
+func TestSilentCriticalRetentionReportedPerSilence(t *testing.T) {
+	s := newSilenceHarness(t)
+	s.beat(NodeStatusCritical, nil)
+	if _, retained := s.silence(2 * silenceTTLMS * time.Millisecond); len(retained) != 1 {
+		t.Fatalf("first silence retained %v", retained)
+	}
+	s.beat(NodeStatusCritical, nil)
+	if _, retained := s.silence(silenceTTLMS * time.Millisecond); len(retained) != 0 {
+		t.Fatalf("a node at the TTL boundary is not silent: retained %v", retained)
+	}
+	if _, retained := s.silence(time.Millisecond); len(retained) != 1 {
+		t.Fatalf("second silence retained %v", retained)
+	}
+}
+
+// Retention follows the last heartbeat only: degraded after critical, then
+// silence, is today's behaviour, evicted and unobserved degraded.
+func TestSilenceAfterDegradedIsEvicted(t *testing.T) {
+	for _, status := range []string{NodeStatusDegraded, NodeStatusHealthy} {
+		t.Run(status, func(t *testing.T) {
+			s := newSilenceHarness(t)
+			s.beat(NodeStatusCritical, nil)
+			s.beat(status, nil)
+			evicted, retained := s.silence(2 * silenceTTLMS * time.Millisecond)
+			if len(evicted) != 1 || len(retained) != 0 {
+				t.Fatalf("evicted %v retained %v", evicted, retained)
+			}
+			out := s.health()
+			if out.Status != SiteStatusDegraded || out.Nodes[0].Status != SiteStatusDegraded || out.Nodes[0].GatewayObserved {
+				t.Fatalf("site %q node %#v", out.Status, out.Nodes[0])
+			}
+		})
+	}
+}
+
+// A future-dated critical node, which eviction otherwise drops at once, is
+// retained critical as well, and EvictStale keeps it too.
+func TestFutureDatedCriticalNodeRetained(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "dev-01", Status: NodeStatusCritical, LastSeenMS: 2000})
+	reg.Upsert(NodeHeartbeat{DeviceID: "dev-02", Status: NodeStatusHealthy, LastSeenMS: 2000})
+	if evicted := reg.EvictStale(1000, 100); len(evicted) != 1 || evicted[0].DeviceID != "dev-02" {
+		t.Fatalf("evicted %v", evicted)
+	}
+	out := getHealth(t, reg, []string{"dev-01", "dev-02"}, time.UnixMilli(1000))
+	if out.Status != SiteStatusCritical || out.Nodes[0].Status != SiteStatusCritical || !out.Nodes[0].Stale {
+		t.Fatalf("future-dated critical node: %#v", out)
+	}
+}
+
+// A retained node keeps its evidence history, so a chain that comes back
+// truncated after the silence is still caught.
+func TestRetainedCriticalNodeKeepsEvidenceHistory(t *testing.T) {
+	reg := NewRegistry()
+	beat := evidenceBeat("dev-01", headHash(1), 0, true)
+	beat.Status = NodeStatusCritical
+	reg.Upsert(beat)
+	if evicted, retained := reg.EvictStaleRetainingCritical(beat.LastSeenMS+10_000, 100); len(evicted) != 0 || len(retained) != 1 {
+		t.Fatalf("evicted %v retained %v", evicted, retained)
+	}
+	reg.Upsert(evidenceBeat("dev-01", "", 0, true))
+	if got := reg.Snapshot()[0].Evidence; !got.TruncationSuspected {
+		t.Fatalf("truncation after silence not detected: %#v", got)
+	}
+}

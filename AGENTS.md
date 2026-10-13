@@ -164,10 +164,14 @@ is started.
 Severity is never folded: a node's own `critical` stays `critical` in the node
 view and the site status, staleness and evidence-integrity problems only raise a
 node's status, and the site status is the most severe of the gateway and every
-node, `critical` over `degraded` over `healthy`. Verified by
-`TestCriticalHeartbeatKeptThroughGetHealth`,
-`TestCriticalNodeNeverFoldedBelowCritical`, and
-`TestFallbackAfterEvidenceHistoryStaysCritical`.
+node, `critical` over `degraded` over `healthy`. A node whose last heartbeat
+was `critical` is never evicted for silence: it stays `critical` until it
+reports again or is removed from `gateway.device_ids` (`docs/OPERATIONS.md`).
+Verified by `TestCriticalHeartbeatKeptThroughGetHealth`,
+`TestCriticalNodeNeverFoldedBelowCritical`,
+`TestFallbackAfterEvidenceHistoryStaysCritical`,
+`TestSilentCriticalNodeStaysCriticalUntilItReportsAgain`, and
+`TestEvictStaleRuntimeNodesRetainsSilentCriticalNode`.
 `internal/site` must never import `internal/runtimeclient`. Posture types are
 defined independently in `internal/site` (`SiteNodePosture`, `SiteNodeBrokerPosture`,
 `SiteNodeEncryptionPosture`, `SiteNodeAlertOutboxPosture`); mapping from

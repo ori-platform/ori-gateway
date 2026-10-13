@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1089,6 +1090,54 @@ func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("stale runtime nodes were not evicted: %#v", registry.Snapshot())
+}
+
+// syncBuffer is a log sink safe to read while a goroutine writes to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
+	registry := site.NewRegistry()
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "critical", Status: site.NodeStatusCritical, LastSeenMS: 1000})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "degraded", Status: site.NodeStatusDegraded, LastSeenMS: 1000})
+	now := time.UnixMilli(10_000)
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, func() time.Time {
+		return now
+	}, logger)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := registry.Snapshot()
+		if len(snapshot) == 1 && snapshot[0].DeviceID == "critical" &&
+			strings.Contains(logs.String(), "device_id=degraded") {
+			time.Sleep(20 * time.Millisecond)
+			if n := strings.Count(logs.String(), "silent after a critical heartbeat"); n != 1 {
+				t.Fatalf("silent critical node reported %d times, want once:\n%s", n, logs.String())
+			}
+			if !strings.Contains(logs.String(), "level=ERROR") {
+				t.Fatalf("silent critical node not reported at ERROR:\n%s", logs.String())
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("critical node not retained or degraded node not evicted: %#v\n%s", registry.Snapshot(), logs.String())
 }
 
 func validTierCEnrichmentRequestPayload(t *testing.T) []byte {

@@ -451,3 +451,40 @@ Continuing past a refused artifact automatically, acknowledging a hold, or
 releasing it with an explicit operator command, is an open decision and not
 current behaviour. No acknowledgement command exists yet, so `acknowledged` is
 always `false`.
+
+## A runtime node stays critical after it goes silent
+
+A runtime node whose last accepted heartbeat was `critical` keeps that status
+when it stops reporting. Silence after `critical` may be the failure itself,
+such as lost power, and gateway-api/v2 forbids a projection that folds
+`critical` into anything less severe. The site view and `GET /health` show
+the node `critical`, with `stale: true` and its last `degradation_reasons`,
+and the site status stays `critical`. The gateway log carries one `ERROR`,
+`runtime node silent after a critical heartbeat; kept critical until it
+reports again`, with the `device_id` and its `last_seen_ms`, the first time
+the eviction loop finds the node silent, whether or not `site_health` is
+enabled.
+
+A node that goes silent after a `healthy` or `degraded` heartbeat is dropped
+from the registry after three heartbeat intervals and shows as unobserved and
+`degraded`, as before.
+
+The retention has no time limit, because any time limit would be critical
+decaying through silence. It is bounded instead by the configured devices:
+the gateway subscribes only to the heartbeat topics of `gateway.device_ids`,
+and the handler refuses a heartbeat whose `device_id` differs from its topic,
+so at most one retained entry exists per configured device.
+
+It ends in one of three ways:
+
+- **The node reports again.** Its next accepted heartbeat replaces the
+  retained one, whatever its status. A node that comes back and goes silent
+  after another `critical` is reported again.
+- **The node is decommissioned.** Remove its id from `gateway.device_ids` and
+  restart the gateway. The node is no longer projected, and nothing more is
+  retained for it.
+- **The gateway restarts.** The registry is held in memory, so a restart
+  clears every retained node, and a node still silent then shows as
+  unobserved and `degraded`. Before restarting a gateway for any other reason,
+  read `GET /health` or the log for a silent `critical` node and resolve it
+  first.
