@@ -15,6 +15,9 @@ import (
 
 const defaultWeeklyWindow = 7 * 24 * time.Hour
 
+// contributorActionTaken is the action_taken the runtime writes on a request that joined another dispatch's act.
+const contributorActionTaken = "coalesced"
+
 // Provider is the connected reporting boundary. Implementations may call Gemini
 // or another product-reporting backend, but must not execute actions or mutate runtime state.
 type Provider interface {
@@ -205,13 +208,14 @@ func (g *WeeklyReportGenerator) Generate(ctx context.Context, req WeeklyReportRe
 		sensorSeries = append(sensorSeries, SensorSeries{SensorID: sensorID, Rows: rows})
 	}
 
-	actions, err := g.runtime.ActionLog(ctx, runtimeclient.ActionLogRequest{BoundedWindow: window})
+	actionRows, err := g.runtime.ActionLog(ctx, runtimeclient.ActionLogRequest{BoundedWindow: window})
 	if err != nil {
 		return WeeklyReportArtifact{}, fmt.Errorf("reporting: runtime action_log export failed: %w", err)
 	}
-	if len(actions) == runtimeclient.MaxLimit {
+	if len(actionRows) == runtimeclient.MaxLimit {
 		warnings = append(warnings, "action_log may be truncated at runtime export limit")
 	}
+	actions := actsOnly(actionRows)
 	decisions, err := g.runtime.TierCDecisionLog(ctx, runtimeclient.TierCDecisionLogRequest{BoundedWindow: window})
 	if err != nil {
 		return WeeklyReportArtifact{}, fmt.Errorf("reporting: runtime tier_c_decision_log export failed: %w", err)
@@ -464,4 +468,22 @@ func deepCopyAny(value any) any {
 	default:
 		return v
 	}
+}
+
+// isContributorRecord reports whether row records a request that joined another dispatch's act rather than an act.
+// The action_log export carries no record_kind yet, so this applies the runtime migration's own test; once it
+// does, record_kind decides here and contributor_legacy counts as not executed.
+func isContributorRecord(row runtimeclient.ActionLogEntry) bool {
+	return row.ActionTaken == contributorActionTaken
+}
+
+// actsOnly returns the rows that record an act, leaving out contributor records.
+func actsOnly(rows []runtimeclient.ActionLogEntry) []runtimeclient.ActionLogEntry {
+	acts := make([]runtimeclient.ActionLogEntry, 0, len(rows))
+	for _, row := range rows {
+		if !isContributorRecord(row) {
+			acts = append(acts, row)
+		}
+	}
+	return acts
 }
