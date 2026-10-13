@@ -820,7 +820,7 @@ func evictStaleRuntimeNodes(
 			}
 			for _, node := range retained {
 				logger.Error("runtime node silent after a critical heartbeat; kept critical until it reports again",
-					"device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
+					"device_id", node.DeviceID, "gateway_seen_ms", node.GatewaySeen, "last_seen_ms", node.LastSeenMS)
 			}
 		}
 	}

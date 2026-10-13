@@ -144,8 +144,11 @@ func (r *Registry) EvictStale(nowMS, ttlMS int64) []NodeHeartbeat {
 // EvictStaleRetainingCritical evicts as EvictStale does, except that a node
 // whose last accepted heartbeat was critical stays in the registry, stale and
 // critical, until it reports again: silence after critical may be the failure
-// itself, and a projection must not fold critical. retained lists the nodes
-// first retained by this call, so the caller can report each silence once.
+// itself, and a projection must not fold critical. A critical node is silent
+// when the gateway has accepted no heartbeat from it for longer than ttlMS,
+// judged on GatewaySeen, the gateway's own receipt time. retained lists the
+// nodes first found silent by this call, so the caller can report each silence
+// once.
 // The retention is bounded by the configured devices, the only ones whose
 // heartbeats reach the registry; a decommissioned node is cleared by removing
 // it from gateway.device_ids and restarting the gateway.
@@ -154,14 +157,18 @@ func (r *Registry) EvictStaleRetainingCritical(nowMS, ttlMS int64) (evicted, ret
 	defer r.mu.Unlock()
 	evicted = make([]NodeHeartbeat, 0)
 	for deviceID, heartbeat := range r.nodes {
-		if heartbeat.LastSeenMS > nowMS || nowMS-heartbeat.LastSeenMS > ttlMS {
-			if heartbeat.Status == NodeStatusCritical {
+		if heartbeat.Status == NodeStatusCritical {
+			// Silence is the gateway's observation: the time since it last
+			// accepted a heartbeat, never the producer's last_seen_ms.
+			if nowMS-heartbeat.GatewaySeen > ttlMS {
 				if _, already := r.silentCritical[deviceID]; !already {
 					r.silentCritical[deviceID] = struct{}{}
 					retained = append(retained, heartbeat)
 				}
-				continue
 			}
+			continue
+		}
+		if heartbeat.LastSeenMS > nowMS || nowMS-heartbeat.LastSeenMS > ttlMS {
 			evicted = append(evicted, heartbeat)
 			delete(r.nodes, deviceID)
 			delete(r.evidence, deviceID)

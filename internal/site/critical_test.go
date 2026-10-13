@@ -503,3 +503,35 @@ func TestRetainedCriticalNodeKeepsEvidenceHistory(t *testing.T) {
 		t.Fatalf("truncation after silence not detected: %#v", got)
 	}
 }
+
+// Silence is judged on the gateway's receipt time, not the producer's clock: a
+// critical node still reporting with its clock ahead or behind is not silent
+// within the TTL of its arrival, and is reported once past it.
+func TestSilentCriticalJudgedOnGatewayReceiptNotProducerClock(t *testing.T) {
+	for _, skew := range []time.Duration{2 * time.Second, -200 * time.Second} {
+		t.Run(skew.String(), func(t *testing.T) {
+			s := newSilenceHarness(t)
+			payload := heartbeatMap(NodeStatusCritical, s.now.Add(skew).UnixMilli())
+			if err := s.h.Handle(testTopic, mustJSON(t, payload)); err != nil {
+				t.Fatal(err)
+			}
+			for range 3 {
+				if evicted, retained := s.reg.EvictStaleRetainingCritical(s.now.UnixMilli(), silenceTTLMS); len(evicted) != 0 || len(retained) != 0 {
+					t.Fatalf("tick at arrival: evicted %v retained %v", evicted, retained)
+				}
+			}
+			if _, retained := s.silence(silenceTTLMS * time.Millisecond); len(retained) != 0 {
+				t.Fatalf("tick at the TTL of arrival: retained %v", retained)
+			}
+			if _, retained := s.silence(time.Millisecond); len(retained) != 1 {
+				t.Fatalf("tick past the TTL of arrival: retained %v, want once", retained)
+			}
+			if _, retained := s.silence(time.Millisecond); len(retained) != 0 {
+				t.Fatalf("later tick: retained %v, want nothing more", retained)
+			}
+			if out := s.health(); out.Status != SiteStatusCritical {
+				t.Fatalf("site status %q", out.Status)
+			}
+		})
+	}
+}

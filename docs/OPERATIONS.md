@@ -461,9 +461,13 @@ such as lost power, and gateway-api/v2 forbids a projection that folds
 the node `critical`, with `stale: true` and its last `degradation_reasons`,
 and the site status stays `critical`. The gateway log carries one `ERROR`,
 `runtime node silent after a critical heartbeat; kept critical until it
-reports again`, with the `device_id` and its `last_seen_ms`, the first time
-the eviction loop finds the node silent, whether or not `site_health` is
-enabled.
+reports again`, with the `device_id`, `gateway_seen_ms` and `last_seen_ms`, the
+first time the eviction loop finds the node silent, whether or not
+`site_health` is enabled. Silent means the gateway has accepted no heartbeat
+from the node for three heartbeat intervals, measured on the gateway's own
+clock from when it received the last one; the node's `last_seen_ms` plays no
+part, so a node whose clock is ahead or behind is not reported silent while it
+is still reporting.
 
 A node that goes silent after a `healthy` or `degraded` heartbeat is dropped
 from the registry after three heartbeat intervals and shows as unobserved and
