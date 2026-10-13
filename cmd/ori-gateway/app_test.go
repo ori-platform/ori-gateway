@@ -1131,8 +1131,13 @@ func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
 			if n := strings.Count(logs.String(), "silent after a critical heartbeat"); n != 1 {
 				t.Fatalf("silent critical node reported %d times, want once:\n%s", n, logs.String())
 			}
-			if !strings.Contains(logs.String(), "level=ERROR") {
-				t.Fatalf("silent critical node not reported at ERROR:\n%s", logs.String())
+			for _, want := range []string{
+				`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=critical gateway_seen_ms=0 last_seen_ms=1000`,
+				`level=WARN msg="runtime node heartbeat stale" device_id=degraded last_seen_ms=1000`,
+			} {
+				if n := strings.Count(logs.String(), want+"\n"); n != 1 {
+					t.Fatalf("log line %q appears %d times, want once:\n%s", want, n, logs.String())
+				}
 			}
 			return
 		}
@@ -1167,10 +1172,17 @@ func TestEvictStaleRuntimeNodesJudgesCriticalSilenceOnGatewayReceipt(t *testing.
 	}
 	time.Sleep(20 * interval)
 	out := logs.String()
-	for _, device := range []string{"device_id=ahead", "device_id=behind"} {
-		if n := strings.Count(out, device); n != 1 {
-			t.Fatalf("%s logged %d times past the TTL of its arrival, want once:\n%s", device, n, out)
+	for _, fields := range []string{
+		"device_id=ahead gateway_seen_ms=1000000 last_seen_ms=1002000",
+		"device_id=behind gateway_seen_ms=1000000 last_seen_ms=800000",
+	} {
+		want := `level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" ` + fields + "\n"
+		if n := strings.Count(out, want); n != 1 {
+			t.Fatalf("log line %q appears %d times past the TTL of its arrival, want once:\n%s", want, n, out)
 		}
+	}
+	if n := strings.Count(out, "silent after a critical heartbeat"); n != 2 {
+		t.Fatalf("%d silent lines, want 2:\n%s", n, out)
 	}
 }
 
