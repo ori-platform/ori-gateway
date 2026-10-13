@@ -146,6 +146,7 @@ type ActionLogEntry struct {
 	SensorType            string
 	SafeDefaultUsed       bool
 	Success               bool
+	ActionTaken           string
 	AttestationStatus     string
 	AttestationSeq        *int64
 	InputAttestationGrade string

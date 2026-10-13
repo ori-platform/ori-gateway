@@ -711,6 +711,7 @@ func mapActionLogEntry(item map[string]any, fallbackDeviceID string) ActionLogEn
 		SensorType:            stringValue(item, "sensor_type", ""),
 		SafeDefaultUsed:       boolValue(item, "safe_default_used"),
 		Success:               boolValue(item, "executed"),
+		ActionTaken:           stringValue(item, "action_taken", ""),
 		AttestationStatus:     stringValue(item, "attestation_status", ""),
 		AttestationSeq:        optionalInt64Value(item, "attestation_seq"),
 		InputAttestationGrade: stringValue(item, "input_attestation_grade", ""),
