@@ -347,6 +347,7 @@ func TestMQTTRuntimeClientActionLog(t *testing.T) {
 				"sensor_type":             "current_clamp",
 				"safe_default_used":       false,
 				"executed":                true,
+				"action_taken":            "alert_whatsapp",
 				"attestation_status":      "signed",
 				"attestation_seq":         float64(42),
 				"input_attestation_grade": "attested",
@@ -359,7 +360,7 @@ func TestMQTTRuntimeClientActionLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].ActionName != "alert_whatsapp" || !rows[0].Success {
+	if len(rows) != 1 || rows[0].ActionName != "alert_whatsapp" || !rows[0].Success || rows[0].ActionTaken != "alert_whatsapp" {
 		t.Fatalf("unexpected action rows: %#v", rows)
 	}
 	if rows[0].AttestationStatus != "signed" || rows[0].AttestationSeq == nil || *rows[0].AttestationSeq != 42 {
