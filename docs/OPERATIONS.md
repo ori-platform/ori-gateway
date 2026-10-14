@@ -200,9 +200,12 @@ artifact is carried again on the retry interval in a newly signed envelope.
 
 The return queue has one head for the whole site, so while an artifact is
 kept every other runtime's returns wait behind it, custody acknowledgements
-included. If the runtime it is for has stopped handing off, because it is
-offline or being replaced, restart the gateway once the condition behind the
-refusal is repaired; the restart carries the kept artifact again.
+included. If the runtime it is for has stopped handing off, for example while
+it is offline, restart the gateway once the condition behind the refusal is
+repaired; the restart carries the kept artifact again. A restart does not
+help when that runtime will never acknowledge again, because it was
+decommissioned or now runs under another device ID: its artifact is carried
+on every retry interval and the site's returns stay blocked behind it.
 
 ### How to see it
 

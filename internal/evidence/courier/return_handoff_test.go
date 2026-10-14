@@ -533,3 +533,30 @@ func queueFullHandoff(t *testing.T, worker *DeliveryWorker, device string) {
 		t.Fatalf("queue_full carriage: acknowledgements %+v, handoffs %v", acks, kinds)
 	}
 }
+
+// TestARestartCarriesAHeldHeadAgain holds the head, then a new publisher is
+// built on the same durable return queue, as after a gateway restart. The
+// hold is not durable: the new publisher carries the head at once.
+func TestARestartCarriesAHeldHeadAgain(t *testing.T) {
+	r := newReturnRig(t)
+	if err := r.handle(rigTopic, r.decision(rigDevice, "refused", "unknown_key", nil)); err != nil {
+		t.Fatal(err)
+	}
+	r.held()
+	var carried [][]byte
+	restarted, err := NewReturnPublisher(r.sink, testAckClock(t, r.now),
+		func(_ context.Context, _ string, _ byte, _ bool, payload []byte) error {
+			carried = append(carried, payload)
+			return nil
+		}, rigSecret, "", r.now, rigRetry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.publishHead(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var envelope inboundEnvelope
+	if len(carried) != 1 || json.Unmarshal(carried[0], &envelope) != nil || string(envelope.Artifact) != string(r.artifact) {
+		t.Fatalf("the restarted publisher carried %d envelopes, want the held head", len(carried))
+	}
+}

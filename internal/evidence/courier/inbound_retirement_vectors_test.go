@@ -454,7 +454,7 @@ func TestUnknownInboundReasonIsHeld(t *testing.T) {
 		"", "Superseded", "SUPERSEDED", " superseded", "superseded ", "superseded\n",
 		"superseded\x00", "restatement-conflict", "restatementconflict", "Restatement_Conflict",
 		"ѕuperseded", "applied", "queue_full", "retire", "malformed,superseded",
-		strings.Repeat("x", 4096), `super"seded`, "superseded\r\nlevel=ERROR", "\x1b[31msuperseded",
+		strings.Repeat("x", 63), strings.Repeat("x", 64), strings.Repeat("x", 65), strings.Repeat("x", 4096), `super"seded`, "superseded\r\nlevel=ERROR", "\x1b[31msuperseded",
 		strings.Repeat("\"", 100), "x" + strings.Repeat("\u00e9", 40),
 	}
 	for _, c := range corpus.Cases {
@@ -526,6 +526,7 @@ func TestAMisboundRetiringRefusalRetiresNothing(t *testing.T) {
 		// naming this device's head: only the queued-device binding refuses it.
 		"another device's signed decision": {outcome: "refused", device: otherDevice, topic: otherTopic},
 		"no decision time":                 {outcome: "refused", mutate: func(a *inboundAck) { a.AcknowledgedAtMS = 0 }},
+		"negative decision time":           {outcome: "refused", mutate: func(a *inboundAck) { a.AcknowledgedAtMS = -1 }},
 		"tampered after signing":           {outcome: "refused", payload: func(p []byte) []byte { return replaceOnce(p, `"superseded"`, `"malformed"`) }},
 		"retiring reason renamed": {outcome: "refused", payload: func(p []byte) []byte {
 			return replaceOnce(p, `"reason":"superseded"`, `"reason":"restatement_conflict"`)
