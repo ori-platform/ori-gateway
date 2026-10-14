@@ -569,13 +569,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				return fmt.Errorf("evidence inbound acknowledgement topic: %w", err)
 			}
 			if err := evidenceBroker.Subscribe(runCtx, ackTopic, broker.QoSReasoning, func(topic string, payload []byte) {
-				err := returnPublisher.HandleAck(topic, payload)
-				switch {
-				case errors.Is(err, courier.ErrUnrecognisedInboundReason):
-					deps.logger.Warn("evidence inbound refusal reason unrecognised; authority artifact held until a receiver state change")
-				case err != nil:
-					deps.logger.Warn("evidence inbound acknowledgement refused", "error", err)
-				}
+				logInboundAckResult(deps.logger, returnPublisher.HandleAck(topic, payload))
 			}); err != nil {
 				shutdownRunners()
 				return fmt.Errorf("subscribe evidence inbound acknowledgements: %w", err)
@@ -1172,5 +1166,18 @@ func providerStatusFromProvider(reasoningProvider provider.Provider) heartbeat.P
 		healthy: func(context.Context) bool {
 			return false
 		},
+	}
+}
+
+// logInboundAckResult logs the outcome of a runtime's acknowledgement of a
+// returned authority artifact. An unrecognised refusal reason is logged
+// quoted and bounded.
+func logInboundAckResult(logger *slog.Logger, err error) {
+	var unrecognised *courier.UnrecognisedInboundReasonError
+	switch {
+	case errors.As(err, &unrecognised):
+		logger.Warn("evidence inbound refusal reason unrecognised; authority artifact held until a receiver state change", "reason", unrecognised.Reason)
+	case err != nil:
+		logger.Warn("evidence inbound acknowledgement refused", "error", err)
 	}
 }

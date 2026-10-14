@@ -331,15 +331,20 @@ Verified by the tests in `internal/evidence/courier`, including
 `cmd/ori-gateway` by `TestRealProjectionsSatisfyTheContract` and
 `TestProjectionOracleAgreesWithTheVectors`.
 
-An authority artifact returned to a runtime retires only on the runtime's
-authenticated acknowledgement naming it: `applied`, or a refusal the
-`gateway-evidence-carriage/v1` retirement table marks retiring. A refusal that
-does not retire, including one whose reason is outside the
-`evidence-exchange/v3` receiver rejection vocabulary, is held and carried again
-only on a receiver state change. Verified by the
-`gateway-evidence-carriage/vectors/inbound-retirement-v1.json` corpus through
-`TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld` and
-`TestAMisboundRetiringRefusalRetiresNothing`.
+An authority artifact returned to a runtime retires only on an authenticated
+acknowledgement from the device the artifact is for, naming it: `applied`, or a
+refusal the `gateway-evidence-carriage/v1` retirement table marks retiring. The
+site shares one envelope secret, so another device's correctly signed decision
+on its own topic is refused by the queued-device binding, not by the envelope.
+A refusal that does not retire, including one whose reason is outside the
+`evidence-exchange/v3` receiver rejection vocabulary, holds the queue entry it
+was decided on, and only that entry; it is carried again only on a receiver
+state change. An unrecognised reason is logged quoted and bounded. Verified by
+the `gateway-evidence-carriage/vectors/inbound-retirement-v1.json` corpus
+through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
+`TestAHoldBindsOnlyTheHeadItWasDecidedOn`,
+`TestAMisboundRetiringRefusalRetiresNothing` and
+`TestInboundAckResultLogsAnUnrecognisedReasonQuoted`.
 
 20. `GW-20` Contract vectors are vendored, and an unmet case is pinned, never skipped.
 Every `ori-specs` vector a test reads is vendored in `internal/specvectors`,

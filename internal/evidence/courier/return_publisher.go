@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
+	"strconv"
 	"sync"
 	"time"
 
@@ -29,9 +30,15 @@ type ReturnPublisher struct {
 	now            func() time.Time
 	retry          time.Duration
 	wake           chan struct{}
+	// tick and afterIteration are test seams: an extra wake source, and a
+	// call at the end of every loop iteration. Both are nil in production.
+	tick           <-chan struct{}
+	afterIteration func()
 
-	mu      sync.Mutex
-	blocked bool
+	mu sync.Mutex
+	// heldID is the queue entry a non-retiring refusal was decided on. Only
+	// that entry is held; a different head is carried.
+	heldID string
 	// The head last carried and when, so a wake arriving right after a
 	// publish — the initial timer and a Notify for the same entry — does not
 	// put the same bytes on the wire twice within one retry interval. The
@@ -76,7 +83,7 @@ func (p *ReturnPublisher) Notify() {
 		return
 	}
 	p.mu.Lock()
-	p.blocked = false
+	p.heldID = ""
 	p.mu.Unlock()
 	select {
 	case p.wake <- struct{}{}:
@@ -101,18 +108,13 @@ func (p *ReturnPublisher) Run(ctx context.Context) error {
 			return nil
 		case <-p.wake:
 		case <-timer.C:
+		case <-p.tick:
 		}
-		p.mu.Lock()
-		blocked := p.blocked
-		p.mu.Unlock()
-		if blocked {
-			continue
-		}
-		if err := p.publishHead(ctx); err != nil {
-			resetTimer(timer, p.retry)
-			continue
-		}
+		_ = p.publishHead(ctx)
 		resetTimer(timer, p.retry)
+		if p.afterIteration != nil {
+			p.afterIteration()
+		}
 	}
 }
 
@@ -126,9 +128,10 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 		return err
 	}
 	p.mu.Lock()
+	held := queued.ID == p.heldID
 	recentlyCarried := queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
 	p.mu.Unlock()
-	if recentlyCarried {
+	if held || recentlyCarried {
 		return nil
 	}
 	envelope := inboundEnvelope{
@@ -181,6 +184,7 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if err := decoder.Decode(&ack); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
+	// The verifier already binds the body's device_id to the topic; this is defence in depth.
 	if ack.DeviceID != deviceID || ack.AcknowledgedAtMS <= 0 {
 		return fmt.Errorf("evidence: inbound acknowledgement binding mismatch")
 	}
@@ -202,10 +206,10 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	}
 	if !retire {
 		p.mu.Lock()
-		p.blocked = true
+		p.heldID = queued.ID
 		p.mu.Unlock()
 		if !recognised {
-			return ErrUnrecognisedInboundReason
+			return &UnrecognisedInboundReasonError{Reason: boundedQuote(ack.Reason)}
 		}
 		return nil
 	}
@@ -220,6 +224,29 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 // receiver rejection vocabulary. The artifact is held, not retired, and is
 // carried again only on a receiver state change.
 var ErrUnrecognisedInboundReason = errors.New("evidence: inbound refusal reason unrecognised; authority artifact held")
+
+// UnrecognisedInboundReasonError carries the unrecognised reason, quoted and
+// bounded so it is safe to log. It matches ErrUnrecognisedInboundReason.
+type UnrecognisedInboundReasonError struct {
+	Reason string
+}
+
+func (e *UnrecognisedInboundReasonError) Error() string {
+	return "evidence: inbound refusal reason " + e.Reason + " unrecognised; authority artifact held"
+}
+
+func (e *UnrecognisedInboundReasonError) Is(target error) bool {
+	return target == ErrUnrecognisedInboundReason
+}
+
+const maxLoggedReasonBytes = 64
+
+func boundedQuote(reason string) string {
+	if len(reason) > maxLoggedReasonBytes {
+		return strconv.Quote(reason[:maxLoggedReasonBytes]) + "..."
+	}
+	return strconv.Quote(reason)
+}
 
 // inboundRefusalRetires is the evidence-exchange/v3 receiver rejection
 // vocabulary and, per gateway-evidence-carriage/v1, whether each retires.

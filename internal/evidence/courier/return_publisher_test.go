@@ -124,11 +124,11 @@ func TestReceiverStateRefusalDoesNotRetireOrShortLoop(t *testing.T) {
 	if err := publisher.HandleAck("ori/site-a-edge-01/evidence/inbound/ack", payload); err != nil {
 		t.Fatal(err)
 	}
-	if sink.Len() != 1 || !publisher.blocked {
+	if sink.Len() != 1 || publisher.heldID == "" {
 		t.Fatal("receiver-state refusal retired or kept short-looping the artifact")
 	}
 	publisher.ReceiverStateChanged()
-	if publisher.blocked {
+	if publisher.heldID != "" {
 		t.Fatal("receiver state change did not make the retained artifact eligible for retry")
 	}
 	select {
@@ -166,7 +166,7 @@ func TestMalformedRuntimeDecisionCannotRetireOrBlockAuthorityArtifact(t *testing
 	if err := publisher.HandleAck("ori/site-a-edge-01/evidence/inbound/ack", payload); err == nil {
 		t.Fatal("malformed authenticated decision was accepted")
 	}
-	if sink.Len() != 1 || publisher.blocked {
+	if sink.Len() != 1 || publisher.heldID != "" {
 		t.Fatal("malformed decision changed authority return state")
 	}
 }
