@@ -324,3 +324,27 @@ func TestAStaleDecisionNeverReplacesAnotherHeadsHold(t *testing.T) {
 	}
 	r.carriedAgain(r.stateChange(), next)
 }
+
+// TestARetiredHeldEntryStagedAgainIsCarried holds the head, retires it on a
+// later applied decision, and stages the same bytes again, which the queue
+// files under the same content-derived ID. The new entry carries no hold and
+// is carried on the retry interval.
+func TestARetiredHeldEntryStagedAgainIsCarried(t *testing.T) {
+	r := newReturnRig(t)
+	if err := r.handle(rigTopic, r.decision(rigDevice, "refused", "unknown_key", nil)); err != nil {
+		t.Fatal(err)
+	}
+	r.held()
+	if err := r.handle(rigTopic, r.decision(rigDevice, "applied", "", nil)); err != nil || r.sink.Len() != 0 {
+		t.Fatalf("the late applied decision = %v with %d queued, want the head retired", err, r.sink.Len())
+	}
+	if err := r.sink.Store(context.Background(), AuthorityArtifact{
+		Type: AuthorityDeliveryReceipt, DeviceID: rigDevice, Payload: r.artifact,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if head, ok := r.sink.queue.Peek(); !ok || head.ID != r.headID {
+		t.Fatal("the restaged bytes were not filed under the retired entry's ID")
+	}
+	r.carriedAgain(r.interval(), r.artifact)
+}

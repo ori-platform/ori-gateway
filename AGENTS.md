@@ -349,8 +349,10 @@ through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
 `TestAnotherDevicesHandoffNeverReleasesAHold`,
 `TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionIsNotAHandoff`,
-`TestAStaleDecisionNeverReplacesAnotherHeadsHold` and
-`TestAnIllTypedAcknowledgementIsNoDecision`. An acknowledgement member that is
+`TestAStaleDecisionNeverReplacesAnotherHeadsHold`,
+`TestARetiredHeldEntryStagedAgainIsCarried` and
+`TestAnIllTypedAcknowledgementIsNoDecision`, and in `cmd/ori-gateway` by
+`TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff`. An acknowledgement member that is
 absent, null or of another JSON type is no decision: a null or absent `reason`
 never reads as `applied`'s empty one.
 
