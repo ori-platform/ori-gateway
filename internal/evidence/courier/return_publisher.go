@@ -30,9 +30,9 @@ type ReturnPublisher struct {
 	now            func() time.Time
 	retry          time.Duration
 	wake           chan struct{}
-	// tick and afterIteration are test seams: an extra wake source, and a
-	// call at the end of every loop iteration. Both are nil in production.
-	tick           <-chan struct{}
+	// after arms the retry timer; tests replace it. afterIteration is a test
+	// seam called at the end of every loop iteration, nil in production.
+	after          func(time.Duration) <-chan time.Time
 	afterIteration func()
 
 	mu sync.Mutex
@@ -74,7 +74,7 @@ func NewReturnPublisher(
 	}
 	return &ReturnPublisher{
 		sink: sink, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret,
-		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1),
+		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1), after: time.After,
 	}, nil
 }
 
@@ -100,18 +100,16 @@ func (p *ReturnPublisher) ReceiverStateChanged() {
 }
 
 func (p *ReturnPublisher) Run(ctx context.Context) error {
-	timer := time.NewTimer(0)
-	defer timer.Stop()
+	timer := p.after(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-p.wake:
-		case <-timer.C:
-		case <-p.tick:
+		case <-timer:
 		}
 		_ = p.publishHead(ctx)
-		resetTimer(timer, p.retry)
+		timer = p.after(p.retry)
 		if p.afterIteration != nil {
 			p.afterIteration()
 		}
@@ -209,7 +207,7 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 		p.heldID = queued.ID
 		p.mu.Unlock()
 		if !recognised {
-			return &UnrecognisedInboundReasonError{Reason: boundedQuote(ack.Reason)}
+			return NewUnrecognisedInboundReasonError(ack.Reason)
 		}
 		return nil
 	}
@@ -229,6 +227,12 @@ var ErrUnrecognisedInboundReason = errors.New("evidence: inbound refusal reason 
 // bounded so it is safe to log. It matches ErrUnrecognisedInboundReason.
 type UnrecognisedInboundReasonError struct {
 	Reason string
+}
+
+// NewUnrecognisedInboundReasonError quotes reason and bounds it to
+// maxLoggedReasonBytes.
+func NewUnrecognisedInboundReasonError(reason string) *UnrecognisedInboundReasonError {
+	return &UnrecognisedInboundReasonError{Reason: boundedQuote(reason)}
 }
 
 func (e *UnrecognisedInboundReasonError) Error() string {

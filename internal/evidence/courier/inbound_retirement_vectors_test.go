@@ -13,6 +13,7 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,7 +67,8 @@ func loadInboundRetirementCorpus(t *testing.T) inboundRetirementCorpus {
 }
 
 const (
-	// rigRetry never elapses on its own: every interval is an explicit tick.
+	// rigRetry is the publisher's retry; its timer fires only when the test
+	// fires it.
 	rigRetry  = time.Hour
 	rigWait   = 10 * time.Second
 	rigSecret = "runtime-gateway-envelope-secret"
@@ -74,9 +76,11 @@ const (
 	rigTopic  = "ori/site-a-edge-01/evidence/inbound/ack"
 )
 
-// returnRig runs the real return publisher loop over queued receipts. The
-// retry timer never fires; the test advances the clock and ticks the loop,
-// and waits for each iteration to finish before observing what it published.
+// returnRig runs the real return publisher loop over queued receipts. Its
+// retry timer is the rig's: the loop arms it through the publisher's after
+// seam, and the test fires the armed timer, after checking it was re-armed
+// with the retry, and waits for each iteration to finish before observing
+// what it published.
 type returnRig struct {
 	t          *testing.T
 	sink       *DurableAuthoritySink
@@ -85,8 +89,11 @@ type returnRig struct {
 	headID     string
 	first      []byte
 	published  chan []byte
-	ticks      chan struct{}
 	iterations chan struct{}
+
+	timerMu sync.Mutex
+	timer   *rigTimer
+	armed   chan struct{}
 
 	clockMu sync.Mutex
 	clock   time.Time
@@ -95,8 +102,8 @@ type returnRig struct {
 func newReturnRig(t *testing.T, extra ...[]byte) *returnRig {
 	t.Helper()
 	r := &returnRig{
-		t: t, published: make(chan []byte, 128), ticks: make(chan struct{}),
-		iterations: make(chan struct{}, 128), clock: time.UnixMilli(1787000000000),
+		t: t, published: make(chan []byte, 128), iterations: make(chan struct{}, 128),
+		armed: make(chan struct{}, 1), clock: time.UnixMilli(1787000000000),
 	}
 	sink, err := OpenDurableAuthoritySink(QueueOptions{
 		Directory: filepath.Join(t.TempDir(), "return"), MaxItems: 10, MaxBytes: 1 << 20,
@@ -126,7 +133,7 @@ func newReturnRig(t *testing.T, extra ...[]byte) *returnRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher.tick = r.ticks
+	publisher.after = r.after
 	publisher.afterIteration = func() { r.iterations <- struct{}{} }
 	r.publisher = publisher
 	ctx, cancel := context.WithCancel(context.Background())
@@ -139,6 +146,12 @@ func newReturnRig(t *testing.T, extra ...[]byte) *returnRig {
 		cancel()
 		<-done
 	})
+	select {
+	case <-r.armed:
+	case <-time.After(rigWait):
+		t.Fatal("the return publisher loop never armed its timer")
+	}
+	r.fire(0)
 	r.waitIteration()
 	carried := r.drain()
 	if len(carried) != 1 {
@@ -146,6 +159,42 @@ func newReturnRig(t *testing.T, extra ...[]byte) *returnRig {
 	}
 	r.first = carried[0]
 	return r
+}
+
+type rigTimer struct {
+	d     time.Duration
+	c     chan time.Time
+	fired bool
+}
+
+func (r *returnRig) after(d time.Duration) <-chan time.Time {
+	timer := &rigTimer{d: d, c: make(chan time.Time, 1)}
+	r.timerMu.Lock()
+	r.timer = timer
+	r.timerMu.Unlock()
+	select {
+	case r.armed <- struct{}{}:
+	default:
+	}
+	return timer.c
+}
+
+// fire fires the timer the loop armed last, which must be unfired and armed
+// for want.
+func (r *returnRig) fire(want time.Duration) {
+	r.t.Helper()
+	r.timerMu.Lock()
+	timer := r.timer
+	if timer == nil || timer.fired || timer.d != want {
+		r.timerMu.Unlock()
+		if timer == nil || timer.fired {
+			r.t.Fatal("the loop did not re-arm its retry timer")
+		}
+		r.t.Fatalf("the loop armed its retry timer for %v, want %v", timer.d, want)
+	}
+	timer.fired = true
+	r.timerMu.Unlock()
+	timer.c <- r.now()
 }
 
 func (r *returnRig) now() time.Time {
@@ -189,7 +238,7 @@ func (r *returnRig) drain() [][]byte {
 func (r *returnRig) interval() [][]byte {
 	r.t.Helper()
 	r.advance()
-	r.ticks <- struct{}{}
+	r.fire(rigRetry)
 	r.waitIteration()
 	return r.drain()
 }
@@ -361,7 +410,8 @@ func TestUnknownInboundReasonIsHeld(t *testing.T) {
 		"", "Superseded", "SUPERSEDED", " superseded", "superseded ", "superseded\n",
 		"superseded\x00", "restatement-conflict", "restatementconflict", "Restatement_Conflict",
 		"ѕuperseded", "applied", "queue_full", "retire", "malformed,superseded",
-		strings.Repeat("x", 4096),
+		strings.Repeat("x", 4096), `super"seded`, "superseded\r\nlevel=ERROR", "\x1b[31msuperseded",
+		strings.Repeat("\"", 100), "x" + strings.Repeat("\u00e9", 40),
 	}
 	for _, c := range corpus.Cases {
 		if c.Acknowledgement != nil && c.Acknowledgement.Outcome == "refused" && !slices.Contains(corpus.Vocabulary, c.Acknowledgement.Reason) {
@@ -380,9 +430,7 @@ func TestUnknownInboundReasonIsHeld(t *testing.T) {
 			if !errors.Is(err, ErrUnrecognisedInboundReason) || !errors.As(err, &unrecognised) {
 				t.Fatalf("HandleAck = %v, want the refusal held as unrecognised", err)
 			}
-			if len(unrecognised.Reason) > maxLoggedReasonBytes*4+5 || !strings.HasPrefix(unrecognised.Reason, `"`) {
-				t.Fatalf("the reported reason is not quoted and bounded: %d bytes", len(unrecognised.Reason))
-			}
+			assertQuotedPrefix(t, unrecognised.Reason, reason)
 			rig.held()
 			rig.carriedAgain(rig.stateChange(), rig.artifact)
 			if err := rig.handle(rigTopic, rig.decision(rigDevice, "refused", "superseded", nil)); err != nil || rig.sink.Len() != 0 {
@@ -468,6 +516,30 @@ func TestAMisboundRetiringRefusalRetiresNothing(t *testing.T) {
 			rig.carriedAgain(rig.interval(), rig.artifact)
 			rig.headKept()
 		})
+	}
+}
+
+// assertQuotedPrefix requires reported to be a Go-quoted prefix of at most
+// maxLoggedReasonBytes of sent, optionally marked as cut, with no raw control
+// byte or quote inside the quotes.
+func assertQuotedPrefix(t *testing.T, reported, sent string) {
+	t.Helper()
+	quoted, cut := strings.CutSuffix(reported, "...")
+	unquoted, err := strconv.Unquote(quoted)
+	if err != nil {
+		t.Fatalf("the reported reason %q is not quoted: %v", reported, err)
+	}
+	if !strings.HasPrefix(sent, unquoted) || len(unquoted) > maxLoggedReasonBytes || cut != (len(sent) > maxLoggedReasonBytes) {
+		t.Fatalf("the reported reason %q is not the sent reason bounded to %d bytes", reported, maxLoggedReasonBytes)
+	}
+	inner := quoted[1 : len(quoted)-1]
+	for i := 0; i < len(inner); i++ {
+		if inner[i] < 0x20 || inner[i] == 0x7f {
+			t.Fatalf("the reported reason %q carries a raw control byte", reported)
+		}
+		if inner[i] == '"' && (i == 0 || inner[i-1] != '\\') {
+			t.Fatalf("the reported reason %q carries a raw quote", reported)
+		}
 	}
 }
 
