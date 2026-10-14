@@ -97,6 +97,9 @@ type returnRig struct {
 
 	clockMu sync.Mutex
 	clock   time.Time
+
+	gateMu sync.Mutex
+	gate   chan struct{}
 }
 
 func newReturnRig(t *testing.T, extra ...[]byte) *returnRig {
@@ -134,7 +137,16 @@ func newReturnRig(t *testing.T, extra ...[]byte) *returnRig {
 		t.Fatal(err)
 	}
 	publisher.after = r.after
-	publisher.afterIteration = func() { r.iterations <- struct{}{} }
+	publisher.afterIteration = func() {
+		r.iterations <- struct{}{}
+		r.gateMu.Lock()
+		gate := r.gate
+		r.gate = nil
+		r.gateMu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+	}
 	r.publisher = publisher
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -248,7 +260,26 @@ func (r *returnRig) interval() [][]byte {
 func (r *returnRig) stateChange() [][]byte {
 	r.t.Helper()
 	r.advance()
-	r.publisher.ReceiverStateChanged()
+	r.publisher.ReceiverStateChanged(rigDevice)
+	r.waitIteration()
+	return r.drain()
+}
+
+// whilePaused runs fn while the loop is held inside a retry-interval
+// iteration, so every wake fn sends collapses into the loop's one pending
+// wake, then releases the loop and returns what that one wake carried. fn must
+// wake the loop.
+func (r *returnRig) whilePaused(fn func()) [][]byte {
+	r.t.Helper()
+	gate := make(chan struct{})
+	r.gateMu.Lock()
+	r.gate = gate
+	r.gateMu.Unlock()
+	if carried := r.interval(); len(carried) != 0 {
+		r.t.Fatalf("the interval before the pause carried %d envelopes", len(carried))
+	}
+	fn()
+	close(gate)
 	r.waitIteration()
 	return r.drain()
 }

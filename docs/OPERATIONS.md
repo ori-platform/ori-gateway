@@ -188,9 +188,10 @@ as `gateway-evidence-carriage/v1` defines it. `applied` retires. A refusal for
 `unrecognised_version`, `wrong_purpose`, `unknown_key`, `retired_key` or
 `unknown_sequence` keeps the artifact, and so does a refusal naming any other
 reason, which logs `evidence inbound refusal reason unrecognised` with the
-reason quoted and cut at 64 bytes. A kept artifact is carried again on the
-next outbound handoff from any runtime or on a gateway restart, never on
-`evidence.retry_interval_s`. An acknowledgement that
+reason quoted and cut at 64 bytes. A kept artifact is carried again when the
+runtime it is for next hands off an artifact the gateway admits, or on a
+gateway restart, never on `evidence.retry_interval_s`. Another runtime's
+handoff, and a carriage the gateway refuses, do not carry it again. An acknowledgement that
 does not verify or does not name the queued artifact is not a decision: the
 artifact is carried again on the retry interval in a newly signed envelope.
 

@@ -36,9 +36,11 @@ type ReturnPublisher struct {
 	afterIteration func()
 
 	mu sync.Mutex
-	// heldID is the queue entry a non-retiring refusal was decided on. Only
-	// that entry is held; a different head is carried.
-	heldID string
+	// heldID is the queue entry a non-retiring refusal was decided on, and
+	// heldDevice the device it is for. Only that entry is held; a different
+	// head is carried. Only that device's receiver state change releases it.
+	heldID     string
+	heldDevice string
 	// The head last carried and when, so a wake arriving right after a
 	// publish — the initial timer and a Notify for the same entry — does not
 	// put the same bytes on the wire twice within one retry interval. The
@@ -78,13 +80,13 @@ func NewReturnPublisher(
 	}, nil
 }
 
+// Notify wakes the loop to carry the head, as when a return is queued or the
+// head retires. It never releases a hold: a queue wake is not a receiver state
+// change.
 func (p *ReturnPublisher) Notify() {
 	if p == nil {
 		return
 	}
-	p.mu.Lock()
-	p.heldID = ""
-	p.mu.Unlock()
 	select {
 	case p.wake <- struct{}{}:
 	default:
@@ -92,10 +94,20 @@ func (p *ReturnPublisher) Notify() {
 }
 
 // ReceiverStateChanged retries a retained authority artifact after an event
-// that can repair a receiver-state refusal. It is deliberately event-driven:
-// unknown keys, versions, and sequences do not become valid merely because a
-// short retry timer elapsed.
-func (p *ReturnPublisher) ReceiverStateChanged() {
+// on deviceID that can repair a receiver-state refusal: a hold on an artifact
+// for that device is released, and a hold for any other device is kept
+// (gateway-evidence-carriage/v1, a relevant runtime state change). It is
+// deliberately event-driven: unknown keys, versions, and sequences do not
+// become valid merely because a short retry timer elapsed.
+func (p *ReturnPublisher) ReceiverStateChanged(deviceID string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.heldDevice == deviceID {
+		p.heldID, p.heldDevice = "", ""
+	}
+	p.mu.Unlock()
 	p.Notify()
 }
 
@@ -204,7 +216,7 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	}
 	if !retire {
 		p.mu.Lock()
-		p.heldID = queued.ID
+		p.heldID, p.heldDevice = queued.ID, queuedDevice
 		p.mu.Unlock()
 		if !recognised {
 			return NewUnrecognisedInboundReasonError(ack.Reason)
@@ -214,6 +226,11 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if err := p.sink.queue.Remove(queued.ID); err != nil {
 		return err
 	}
+	p.mu.Lock()
+	if p.heldID == queued.ID {
+		p.heldID, p.heldDevice = "", ""
+	}
+	p.mu.Unlock()
 	p.Notify()
 	return nil
 }

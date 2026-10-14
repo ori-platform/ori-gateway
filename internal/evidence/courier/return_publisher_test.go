@@ -127,7 +127,7 @@ func TestReceiverStateRefusalDoesNotRetireOrShortLoop(t *testing.T) {
 	if sink.Len() != 1 || publisher.heldID == "" {
 		t.Fatal("receiver-state refusal retired or kept short-looping the artifact")
 	}
-	publisher.ReceiverStateChanged()
+	publisher.ReceiverStateChanged("site-a-edge-01")
 	if publisher.heldID != "" {
 		t.Fatal("receiver state change did not make the retained artifact eligible for retry")
 	}

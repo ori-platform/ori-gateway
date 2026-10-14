@@ -339,12 +339,16 @@ on its own topic is refused by the queued-device binding, not by the envelope.
 A refusal that does not retire, including one whose reason is outside the
 `evidence-exchange/v3` receiver rejection vocabulary, holds the queue entry it
 was decided on, and only that entry; it is carried again only on a receiver
-state change. An unrecognised reason is logged quoted and bounded. Verified by
+state change for the device it is for: an artifact from that device admitted,
+never another device's handoff, a carriage the ingress refuses, or a queue
+wake. An unrecognised reason is logged quoted and bounded. Verified by
 the `gateway-evidence-carriage/vectors/inbound-retirement-v1.json` corpus
 through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestAHoldBindsOnlyTheHeadItWasDecidedOn`,
-`TestAMisboundRetiringRefusalRetiresNothing` and
-`TestInboundAckResultLogsAnUnrecognisedReasonQuoted`.
+`TestAMisboundRetiringRefusalRetiresNothing`,
+`TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
+`TestAnotherDevicesHandoffNeverReleasesAHold`,
+`TestAQueueWakeNeverReleasesAHold` and `TestARefusedAdmissionIsNotAHandoff`.
 
 20. `GW-20` Contract vectors are vendored, and an unmet case is pinned, never skipped.
 Every `ori-specs` vector a test reads is vendored in `internal/specvectors`,
