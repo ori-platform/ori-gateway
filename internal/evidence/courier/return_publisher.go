@@ -192,6 +192,9 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if err := refuseAmbiguousMembers(payload, &ack); err != nil {
 		return fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
+	if err := requireInboundAckTypes(payload); err != nil {
+		return fmt.Errorf("evidence: malformed inbound acknowledgement")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ack); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
@@ -305,6 +308,27 @@ func inboundDecision(outcome, reason string) (retire, recognised bool, err error
 	default:
 		return false, false, fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
 	}
+}
+
+// inboundAckStrings are the acknowledgement members gateway-evidence-carriage/v1
+// types as strings. Each is required as a string: encoding/json decodes an
+// absent member or a null as "", and an empty reason is applied's.
+var inboundAckStrings = []string{"device_id", "artifact_type", "artifact_digest", "outcome", "reason"}
+
+// requireInboundAckTypes requires every string member to be present as a JSON
+// string, on the wire bytes, before the acknowledgement is decoded. An absent,
+// null or non-integer acknowledged_at_ms already decodes to a refusal.
+func requireInboundAckTypes(payload []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &members); err != nil {
+		return err
+	}
+	for _, name := range inboundAckStrings {
+		if raw, ok := members[name]; !ok || len(raw) == 0 || raw[0] != '"' {
+			return fmt.Errorf("member %s is not a string", name)
+		}
+	}
+	return nil
 }
 
 type inboundAck struct {

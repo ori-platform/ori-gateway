@@ -348,8 +348,11 @@ through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestAMisboundRetiringRefusalRetiresNothing`,
 `TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
 `TestAnotherDevicesHandoffNeverReleasesAHold`,
-`TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionIsNotAHandoff` and
-`TestAStaleDecisionNeverReplacesAnotherHeadsHold`.
+`TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionIsNotAHandoff`,
+`TestAStaleDecisionNeverReplacesAnotherHeadsHold` and
+`TestAnIllTypedAcknowledgementIsNoDecision`. An acknowledgement member that is
+absent, null or of another JSON type is no decision: a null or absent `reason`
+never reads as `applied`'s empty one.
 
 20. `GW-20` Contract vectors are vendored, and an unmet case is pinned, never skipped.
 Every `ori-specs` vector a test reads is vendored in `internal/specvectors`,

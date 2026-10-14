@@ -192,7 +192,9 @@ reason quoted and cut at 64 bytes. A kept artifact is carried again when the
 runtime it is for next hands off an artifact the gateway admits, or on a
 gateway restart, never on `evidence.retry_interval_s`. Another runtime's
 handoff, and a carriage the gateway refuses, do not carry it again. An acknowledgement that
-does not verify or does not name the queued artifact is not a decision: the
+does not verify, does not name the queued artifact, or is missing a member or
+carries one with the wrong JSON type, such as a null `reason`, is not a
+decision: the
 artifact is carried again on the retry interval in a newly signed envelope.
 
 ### How to see it
