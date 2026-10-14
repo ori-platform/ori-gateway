@@ -198,6 +198,12 @@ carries one with the wrong JSON type, such as a null `reason`, is not a
 decision: the
 artifact is carried again on the retry interval in a newly signed envelope.
 
+The return queue has one head for the whole site, so while an artifact is
+kept every other runtime's returns wait behind it, custody acknowledgements
+included. If the runtime it is for has stopped handing off, because it is
+offline or being replaced, restart the gateway once the condition behind the
+refusal is repaired; the restart carries the kept artifact again.
+
 ### How to see it
 
 The gateway log carries the state whether or not `site_health` is enabled.

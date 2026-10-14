@@ -417,46 +417,82 @@ func TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff(t *testing.T) {
 	}
 }
 
-// TestAHandoffSurvivesAFailureAfterDurableAdmission fails the first
-// acknowledgement publish of a newly queued artifact, then the runtime carries
-// the same bytes again, as it does when it holds no acknowledgement. The
-// artifact was handed off when it was durably queued: edge-01's lanes are
-// woken and its held head is carried again, once, and the repeat hands off
-// nothing more.
+// TestAHandoffSurvivesAFailureAfterDurableAdmission fails each step after a
+// newly queued artifact is durably held: the acknowledgement publish of a
+// checkpoint and of a delivery envelope, and the staging of an envelope's
+// custody return. The runtime then carries the same bytes again, as it does
+// when it holds no acknowledgement. The artifact was handed off when it was
+// durably queued: edge-01's lanes are woken and its held head is carried
+// again, once, and the repeat hands off nothing more.
 func TestAHandoffSurvivesAFailureAfterDurableAdmission(t *testing.T) {
-	r := newReturnRig(t)
-	in := r.ingress(rigCourier(t, 10, rigDevice, otherRigDevice))
-	failing := true
-	publish := in.publish
-	in.publish = func(ctx context.Context, topic string, qos byte, retained bool, payload []byte) error {
-		if failing {
-			failing = false
-			return errors.New("broker unavailable")
-		}
-		return publish(ctx, topic, qos, retained, payload)
+	cases := map[string]struct {
+		kind         ArtifactType
+		artifact     []byte
+		failPublish  bool
+		failCustody  bool
+		repeatFailed bool
+	}{
+		"checkpoint, acknowledgement publish fails": {kind: ArtifactCheckpoint, artifact: validCheckpointBytes(), failPublish: true},
+		"envelope, acknowledgement publish fails":   {kind: ArtifactDeliveryEnvelope, artifact: envelopeFor(rigDevice, 5), failPublish: true},
+		"envelope, custody staging fails": {
+			kind: ArtifactDeliveryEnvelope, artifact: envelopeFor(rigDevice, 5), failCustody: true, repeatFailed: true,
+		},
 	}
-	if err := r.handle(rigTopic, r.decision(rigDevice, "refused", "unknown_key", nil)); err != nil {
-		t.Fatal(err)
-	}
-	r.held()
-	r.advance()
-	if err := in.Handle(context.Background(), outboundTopic(rigDevice),
-		carriageOf(rigDevice, ArtifactCheckpoint, validCheckpointBytes())); err == nil {
-		t.Fatal("the failed acknowledgement publish was not reported")
-	}
-	r.carriedAgain(r.waitCarried(), r.artifact)
-	if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
-		t.Fatalf("lanes woken = %v, want edge-01's once", got)
-	}
-	if err := in.Handle(context.Background(), outboundTopic(rigDevice),
-		carriageOf(rigDevice, ArtifactCheckpoint, validCheckpointBytes())); err != nil {
-		t.Fatal(err)
-	}
-	if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
-		t.Fatalf("the repeat handed off again: lanes woken = %v", got)
-	}
-	if acks := in.published(); len(acks) != 1 || acks[0].Outcome != "queued" {
-		t.Fatalf("acknowledgements = %+v, want the repeat acknowledged queued", acks)
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := newReturnRig(t)
+			in := r.ingress(rigCourier(t, 10, rigDevice, otherRigDevice))
+			if c.failPublish {
+				failing := true
+				publish := in.publish
+				in.publish = func(ctx context.Context, topic string, qos byte, retained bool, payload []byte) error {
+					if failing {
+						failing = false
+						return errors.New("broker unavailable")
+					}
+					return publish(ctx, topic, qos, retained, payload)
+				}
+			}
+			if c.failCustody {
+				// The ingress stages custody returns in a store of its own
+				// that cannot be written; the rig's return queue is untouched.
+				dir := filepath.Join(t.TempDir(), "custody")
+				returns, err := OpenDurableAuthoritySink(QueueOptions{Directory: dir, MaxItems: 10, MaxBytes: 1 << 20})
+				if err != nil {
+					t.Fatal(err)
+				}
+				in.returns = returns
+				unwritable(t, dir)
+			}
+			if err := r.handle(rigTopic, r.decision(rigDevice, "refused", "unknown_key", nil)); err != nil {
+				t.Fatal(err)
+			}
+			r.held()
+			r.advance()
+			if err := in.Handle(context.Background(), outboundTopic(rigDevice), carriageOf(rigDevice, c.kind, c.artifact)); err == nil {
+				t.Fatal("the failure after durable admission was not reported")
+			}
+			r.carriedAgain(r.waitCarried(), r.artifact)
+			if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
+				t.Fatalf("lanes woken = %v, want edge-01's once", got)
+			}
+			if err := in.Handle(context.Background(), outboundTopic(rigDevice), carriageOf(rigDevice, c.kind, c.artifact)); (err != nil) != c.repeatFailed {
+				t.Fatalf("the repeat = %v", err)
+			}
+			if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
+				t.Fatalf("the repeat handed off again: lanes woken = %v", got)
+			}
+			acks := in.published()
+			if len(acks) == 0 {
+				t.Fatal("no acknowledgement was published")
+			}
+			for _, ack := range acks {
+				if ack.Outcome != "queued" {
+					t.Fatalf("acknowledgements = %+v, want each queued", acks)
+				}
+			}
+		})
 	}
 }
 
