@@ -561,9 +561,13 @@ func TestAMisboundRetiringRefusalRetiresNothing(t *testing.T) {
 	}
 }
 
+// documentedReasonBound is the bound docs/OPERATIONS.md gives a logged
+// unrecognised reason.
+const documentedReasonBound = 64
+
 // assertQuotedPrefix requires reported to be a Go-quoted prefix of at most
-// maxLoggedReasonBytes of sent, optionally marked as cut, with no raw control
-// byte or quote inside the quotes.
+// documentedReasonBound bytes of sent, marked as cut exactly when sent is
+// longer, with no raw control byte or quote inside the quotes.
 func assertQuotedPrefix(t *testing.T, reported, sent string) {
 	t.Helper()
 	quoted, cut := strings.CutSuffix(reported, "...")
@@ -571,8 +575,9 @@ func assertQuotedPrefix(t *testing.T, reported, sent string) {
 	if err != nil {
 		t.Fatalf("the reported reason %q is not quoted: %v", reported, err)
 	}
-	if !strings.HasPrefix(sent, unquoted) || len(unquoted) > maxLoggedReasonBytes || cut != (len(sent) > maxLoggedReasonBytes) {
-		t.Fatalf("the reported reason %q is not the sent reason bounded to %d bytes", reported, maxLoggedReasonBytes)
+	if !strings.HasPrefix(sent, unquoted) || len(unquoted) > documentedReasonBound || cut != (len(sent) > documentedReasonBound) ||
+		(cut && len(unquoted) != documentedReasonBound) {
+		t.Fatalf("the reported reason %q is not the sent reason bounded to %d bytes", reported, documentedReasonBound)
 	}
 	inner := quoted[1 : len(quoted)-1]
 	for i := 0; i < len(inner); i++ {

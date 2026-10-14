@@ -9,7 +9,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,8 +24,10 @@ import (
 
 // TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff drives the gateway's
 // real construction and subscriptions. dev-01's custody return is carried and
-// refused unknown_key, which holds it. dev-02's admitted handoff does not carry
-// it again; dev-01's admitted handoff does.
+// refused for a reason outside the vocabulary, which holds it and is logged
+// quoted. An acknowledgement that names no queued artifact is logged refused.
+// dev-02's admitted handoff does not carry the held return again; dev-01's
+// admitted handoff does.
 func TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff(t *testing.T) {
 	const secret = "runtime-gateway-envelope-secret"
 	t.Setenv("GATEWAY_ENVELOPE", secret)
@@ -45,6 +49,8 @@ func TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff(t *testing.T) {
 	mainBroker := newFakeBroker()
 	evidenceBroker := newFakeBroker()
 	deps := baseDeps(t, cfg, mainBroker, &fakeProvider{healthy: true}, newFakeHeartbeat())
+	var logs syncBuffer
+	deps.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	deps.newBroker = func(opts broker.Options) (brokerClient, error) {
 		if opts.ClientID == defaultEvidenceClientID {
 			return evidenceBroker, nil
@@ -117,25 +123,37 @@ func TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(envelope.Artifact)
-	ack := map[string]any{
-		"device_id": "dev-01", "artifact_type": "custody_acknowledgement",
-		"artifact_digest": "sha256:" + hex.EncodeToString(digest[:]),
-		"outcome":         "refused", "reason": "unknown_key", "acknowledged_at_ms": deps.now().UnixMilli(),
-	}
-	auth, err := mqttauth.Sign(ack, contracts.EvidenceInboundAckMessageType, "dev-01", "", deps.now().UnixMilli(), secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ack["auth"] = auth
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		t.Fatal(err)
+	signedAck := func(digest, reason string) []byte {
+		ack := map[string]any{
+			"device_id": "dev-01", "artifact_type": "custody_acknowledgement", "artifact_digest": digest,
+			"outcome": "refused", "reason": reason, "acknowledged_at_ms": deps.now().UnixMilli(),
+		}
+		auth, err := mqttauth.Sign(ack, contracts.EvidenceInboundAckMessageType, "dev-01", "", deps.now().UnixMilli(), secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ack["auth"] = auth
+		payload, err := json.Marshal(ack)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload
 	}
 	ackHandler := evidenceBroker.handlerFor("ori/dev-01/evidence/inbound/ack")
 	if ackHandler == nil {
 		t.Fatal("dev-01's inbound acknowledgement subscription never started")
 	}
-	ackHandler("ori/dev-01/evidence/inbound/ack", payload)
+	ackHandler("ori/dev-01/evidence/inbound/ack", signedAck("sha256:"+hex.EncodeToString(make([]byte, 32)), "superseded"))
+	ackHandler("ori/dev-01/evidence/inbound/ack", signedAck("sha256:"+hex.EncodeToString(digest[:]), "not_a\n\"reason\""))
+	out := logs.String()
+	for _, want := range []string{
+		`level=WARN msg="evidence inbound acknowledgement refused" error="evidence: acknowledgement does not name the queued authority artifact"` + "\n",
+		`level=WARN msg="evidence inbound refusal reason unrecognised; authority artifact held until a receiver state change" reason="\"not_a\\n\\\"reason\\\"\""` + "\n",
+	} {
+		if strings.Count(out, want) != 1 {
+			t.Fatalf("log line %q not logged once:\n%s", want, out)
+		}
+	}
 
 	// Another device's admitted handoff. A release would carry the head at
 	// once; the window only bounds how long the test waits to see one.
