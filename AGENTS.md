@@ -216,7 +216,10 @@ type and never stored, so queue directories need no migration. Order, retry
 state, back-off and holds are kept, persisted and restored per `device_id` and
 lane, and a hold or back-off in one lane never delays the device's other lane
 or another device. A handoff is a newly admitted artifact for the same device
-(a handoff for both its lanes), a `200` retiring an anchor registration for
+(a handoff for both its lanes), signalled once its bytes are durably queued
+whatever later step fails, an authenticated admission for the same device
+refused `queue_full` (a handoff for both its lanes that admits no bytes and
+releases no authority-artifact hold), a `200` retiring an anchor registration for
 the same device, confirmed or accepted pending (a handoff for its evidence
 lane), or the courier starting again; it retries only a handoff-only refusal
 and never brings a back-off forward. Queue capacity is reserved per configured
@@ -348,8 +351,9 @@ through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestAMisboundRetiringRefusalRetiresNothing`,
 `TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
 `TestAnotherDevicesHandoffNeverReleasesAHold`,
-`TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionIsNotAHandoff`,
+`TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionReleasesNoHold`,
 `TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff`,
+`TestAHandoffSurvivesAFailureAfterDurableAdmission`,
 `TestAStaleDecisionNeverReplacesAnotherHeadsHold`,
 `TestARetiredHeldEntryStagedAgainIsCarried` and
 `TestAnIllTypedAcknowledgementIsNoDecision`, and in `cmd/ori-gateway` by

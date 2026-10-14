@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -195,10 +196,11 @@ func TestAQueueWakeNeverReleasesAHold(t *testing.T) {
 	r.carriedAgain(r.stateChange(), r.artifact)
 }
 
-// TestARefusedAdmissionIsNotAHandoff hands edge-01's carriages that the
-// ingress refuses, each for its declared reason: none wakes a lane and none
-// releases edge-01's held head.
-func TestARefusedAdmissionIsNotAHandoff(t *testing.T) {
+// TestARefusedAdmissionReleasesNoHold hands edge-01's carriages that the
+// ingress refuses, each for its declared reason: none releases edge-01's held
+// head. Only an authenticated queue_full is a handoff, for edge-01's lanes
+// alone (evidence-transport/v2); no other refusal wakes a lane.
+func TestARefusedAdmissionReleasesNoHold(t *testing.T) {
 	full := func(t *testing.T) *Courier {
 		c := rigCourier(t, 1)
 		if _, err := c.Admit(ArtifactDeliveryEnvelope, envelopeFor(rigDevice, 1)); err != nil {
@@ -214,20 +216,22 @@ func TestARefusedAdmissionIsNotAHandoff(t *testing.T) {
 		// reason is the refusal acknowledged, or "" when the carriage is
 		// refused with no acknowledgement.
 		reason string
+		// handoff is true for the one refusal that is a handoff.
+		handoff bool
 	}{
 		"carriage for another device": {configured, outboundTopic(rigDevice),
-			carriageOf(otherRigDevice, ArtifactDeliveryEnvelope, envelopeFor(otherRigDevice, 2)), "binding_mismatch"},
+			carriageOf(otherRigDevice, ArtifactDeliveryEnvelope, envelopeFor(otherRigDevice, 2)), "binding_mismatch", false},
 		"artifact for another device": {configured, outboundTopic(rigDevice),
-			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(otherRigDevice, 2)), "binding_mismatch"},
+			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(otherRigDevice, 2)), "binding_mismatch", false},
 		"artifact with no device": {configured, outboundTopic(rigDevice),
-			carriageOf(rigDevice, ArtifactDeliveryEnvelope, []byte(`{"v":1,"local_seq":2,"signature":"ed25519:opaque"}`)), "malformed"},
+			carriageOf(rigDevice, ArtifactDeliveryEnvelope, []byte(`{"v":1,"local_seq":2,"signature":"ed25519:opaque"}`)), "malformed", false},
 		"envelope with no sequence": {configured, outboundTopic(rigDevice),
-			carriageOf(rigDevice, ArtifactDeliveryEnvelope, []byte(`{"v":1,"device_id":"`+rigDevice+`","signature":"ed25519:opaque"}`)), "malformed"},
+			carriageOf(rigDevice, ArtifactDeliveryEnvelope, []byte(`{"v":1,"device_id":"`+rigDevice+`","signature":"ed25519:opaque"}`)), "malformed", false},
 		"full queue": {full, outboundTopic(rigDevice),
-			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(rigDevice, 2)), "queue_full"},
+			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(rigDevice, 2)), "queue_full", true},
 		"unconfigured device": {func(t *testing.T) *Courier { return rigCourier(t, 10, otherRigDevice) }, outboundTopic(rigDevice),
-			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(rigDevice, 2)), ""},
-		"carriage that is not JSON": {configured, outboundTopic(rigDevice), []byte(`{"device_id":`), ""},
+			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(rigDevice, 2)), "", false},
+		"carriage that is not JSON": {configured, outboundTopic(rigDevice), []byte(`{"device_id":`), "", false},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -251,8 +255,12 @@ func TestARefusedAdmissionIsNotAHandoff(t *testing.T) {
 			if r.sink.Len() != returns {
 				t.Fatal("a refused carriage queued a custody return")
 			}
-			if got := in.lanes.woken(); len(got) != 0 {
-				t.Fatalf("a refused carriage woke lanes %v", got)
+			var want []string
+			if c.handoff {
+				want = []string{rigDevice}
+			}
+			if got := in.lanes.woken(); !slices.Equal(got, want) {
+				t.Fatalf("lanes woken = %v, want %v", got, want)
 			}
 			r.held()
 			if r.heldID() != r.headID {
@@ -406,5 +414,86 @@ func TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff(t *testing.T) {
 	r.carriedAgain(r.waitCarried(), r.artifact)
 	if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
 		t.Fatalf("lanes woken = %v, want edge-01's once", got)
+	}
+}
+
+// TestAHandoffSurvivesAFailureAfterDurableAdmission fails the first
+// acknowledgement publish of a newly queued artifact, then the runtime carries
+// the same bytes again, as it does when it holds no acknowledgement. The
+// artifact was handed off when it was durably queued: edge-01's lanes are
+// woken and its held head is carried again, once, and the repeat hands off
+// nothing more.
+func TestAHandoffSurvivesAFailureAfterDurableAdmission(t *testing.T) {
+	r := newReturnRig(t)
+	in := r.ingress(rigCourier(t, 10, rigDevice, otherRigDevice))
+	failing := true
+	publish := in.publish
+	in.publish = func(ctx context.Context, topic string, qos byte, retained bool, payload []byte) error {
+		if failing {
+			failing = false
+			return errors.New("broker unavailable")
+		}
+		return publish(ctx, topic, qos, retained, payload)
+	}
+	if err := r.handle(rigTopic, r.decision(rigDevice, "refused", "unknown_key", nil)); err != nil {
+		t.Fatal(err)
+	}
+	r.held()
+	r.advance()
+	if err := in.Handle(context.Background(), outboundTopic(rigDevice),
+		carriageOf(rigDevice, ArtifactCheckpoint, validCheckpointBytes())); err == nil {
+		t.Fatal("the failed acknowledgement publish was not reported")
+	}
+	r.carriedAgain(r.waitCarried(), r.artifact)
+	if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
+		t.Fatalf("lanes woken = %v, want edge-01's once", got)
+	}
+	if err := in.Handle(context.Background(), outboundTopic(rigDevice),
+		carriageOf(rigDevice, ArtifactCheckpoint, validCheckpointBytes())); err != nil {
+		t.Fatal(err)
+	}
+	if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
+		t.Fatalf("the repeat handed off again: lanes woken = %v", got)
+	}
+	if acks := in.published(); len(acks) != 1 || acks[0].Outcome != "queued" {
+		t.Fatalf("acknowledgements = %+v, want the repeat acknowledged queued", acks)
+	}
+}
+
+// queueFullHandoff drives an authenticated admission refused queue_full for
+// device through the real ingress and the gateway's Handoff into worker. The
+// full share is a separate queue's: a queue_full refusal admits no bytes, so
+// the worker's own queue is untouched, as evidence-transport/v2 requires.
+func queueFullHandoff(t *testing.T, worker *DeliveryWorker, device string) {
+	t.Helper()
+	full := rigCourier(t, 1)
+	if _, err := full.Admit(ArtifactDeliveryEnvelope, envelopeFor(device, 1)); err != nil {
+		t.Fatal(err)
+	}
+	var acks []outboundAck
+	in, err := NewRuntimeIngress(full, testReturnSink(t, time.Now()), testAckClock(t, time.Now),
+		func(_ context.Context, _ string, _ byte, _ bool, payload []byte) error {
+			var ack outboundAck
+			if err := json.Unmarshal(payload, &ack); err != nil {
+				return err
+			}
+			acks = append(acks, ack)
+			return nil
+		}, rigSecret, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []HandoffKind
+	handoff := Handoff(worker, nil)
+	in.SetHandoff(func(deviceID string, kind HandoffKind) {
+		kinds = append(kinds, kind)
+		handoff(deviceID, kind)
+	})
+	if err := in.Handle(context.Background(), outboundTopic(device),
+		carriageOf(device, ArtifactDeliveryEnvelope, envelopeFor(device, 2))); err != nil {
+		t.Fatal(err)
+	}
+	if len(acks) != 1 || acks[0].Reason != "queue_full" || !slices.Equal(kinds, []HandoffKind{HandoffQueueFull}) {
+		t.Fatalf("queue_full carriage: acknowledgements %+v, handoffs %v", acks, kinds)
 	}
 }
