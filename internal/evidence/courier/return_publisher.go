@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -310,10 +312,23 @@ func inboundDecision(outcome, reason string) (retire, recognised bool, err error
 	}
 }
 
-// inboundAckStrings are the acknowledgement members gateway-evidence-carriage/v1
-// types as strings. Each is required as a string: encoding/json decodes an
-// absent member or a null as "", and an empty reason is applied's.
-var inboundAckStrings = []string{"device_id", "artifact_type", "artifact_digest", "outcome", "reason"}
+// inboundAckStrings are the acknowledgement's string members, read from
+// inboundAck so a member added there is covered. Each is required as a
+// string: encoding/json decodes an absent member or a null as "", and an empty
+// reason is applied's.
+var inboundAckStrings = stringMembers(reflect.TypeFor[inboundAck]())
+
+// stringMembers lists the json member names of typ's string fields.
+func stringMembers(typ reflect.Type) []string {
+	var members []string
+	for field := range typ.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if field.Type.Kind() == reflect.String && name != "" && name != "-" {
+			members = append(members, name)
+		}
+	}
+	return members
+}
 
 // requireInboundAckTypes requires every string member to be present as a JSON
 // string, on the wire bytes, before the acknowledgement is decoded. An absent,

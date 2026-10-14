@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -51,6 +52,9 @@ func TestAnIllTypedAcknowledgementIsNoDecision(t *testing.T) {
 	// The acknowledgement's members as gateway-evidence-carriage/v1 lists
 	// them, independently of the list the handler checks.
 	members := []string{"device_id", "artifact_type", "artifact_digest", "outcome", "reason", "acknowledged_at_ms"}
+	if want := members[:5]; !slices.Equal(inboundAckStrings, want) {
+		t.Fatalf("the handler requires strings %v, want %v", inboundAckStrings, want)
+	}
 	for _, member := range members {
 		shapes = append(shapes, shape{member, "absent"})
 		for form := range values {
