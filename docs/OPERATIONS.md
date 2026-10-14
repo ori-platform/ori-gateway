@@ -178,6 +178,21 @@ is not conformant. Before quarantining a `409`, confirm with the evidence
 authority's operator that the conflict is real; if it was not, use *Retrying a
 held artifact once* below.
 
+### Authority artifacts returned to the runtime
+
+Receipts, epoch confirmations and custody acknowledgements the gateway carries
+back to a runtime retire only on the runtime's authenticated acknowledgement,
+as `gateway-evidence-carriage/v1` defines it. `applied` retires. A refusal for
+`malformed`, `bad_authenticator`, `binding_mismatch`, `non_contiguous_range`,
+`superseded` or `restatement_conflict` retires. A refusal for
+`unrecognised_version`, `wrong_purpose`, `unknown_key`, `retired_key` or
+`unknown_sequence` keeps the artifact, and so does a refusal naming any other
+reason, which logs `evidence inbound refusal reason unrecognised`. A kept
+artifact is carried again on the next outbound handoff from any runtime or on a
+gateway restart, never on `evidence.retry_interval_s`. An acknowledgement that
+does not verify or does not name the queued artifact is not a decision: the
+artifact is carried again on the retry interval in a newly signed envelope.
+
 ### How to see it
 
 The gateway log carries the state whether or not `site_health` is enabled.

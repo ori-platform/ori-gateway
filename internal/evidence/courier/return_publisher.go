@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
@@ -195,17 +196,17 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if queuedDevice != deviceID || string(queuedType) != ack.ArtifactType || ack.ArtifactDigest != "sha256:"+hex.EncodeToString(digest[:]) {
 		return fmt.Errorf("evidence: acknowledgement does not name the queued authority artifact")
 	}
-	if err := validateInboundDecision(ack.Outcome, ack.Reason); err != nil {
+	retire, recognised, err := inboundDecision(ack.Outcome, ack.Reason)
+	if err != nil {
 		return err
-	}
-	retire := ack.Outcome == "applied" && ack.Reason == ""
-	if ack.Outcome == "refused" {
-		retire = bytePermanentRefusal(ack.Reason)
 	}
 	if !retire {
 		p.mu.Lock()
 		p.blocked = true
 		p.mu.Unlock()
+		if !recognised {
+			return ErrUnrecognisedInboundReason
+		}
 		return nil
 	}
 	if err := p.sink.queue.Remove(queued.ID); err != nil {
@@ -215,19 +216,42 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	return nil
 }
 
-func validateInboundDecision(outcome, reason string) error {
-	if outcome == "applied" && reason == "" {
-		return nil
-	}
-	if outcome != "refused" {
-		return fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
-	}
-	switch reason {
-	case "malformed", "bad_authenticator", "binding_mismatch", "non_contiguous_range",
-		"unrecognised_version", "wrong_purpose", "unknown_key", "retired_key", "unknown_sequence":
-		return nil
+// ErrUnrecognisedInboundReason reports a refusal whose reason is outside the
+// receiver rejection vocabulary. The artifact is held, not retired, and is
+// carried again only on a receiver state change.
+var ErrUnrecognisedInboundReason = errors.New("evidence: inbound refusal reason unrecognised; authority artifact held")
+
+// inboundRefusalRetires is the evidence-exchange/v3 receiver rejection
+// vocabulary and, per gateway-evidence-carriage/v1, whether each retires.
+var inboundRefusalRetires = map[string]bool{
+	"malformed":            true,
+	"bad_authenticator":    true,
+	"binding_mismatch":     true,
+	"non_contiguous_range": true,
+	"unrecognised_version": false,
+	"wrong_purpose":        false,
+	"unknown_key":          false,
+	"retired_key":          false,
+	"unknown_sequence":     false,
+	"superseded":           true,
+	"restatement_conflict": true,
+}
+
+// inboundDecision classifies an authenticated decision. Any outcome other than
+// applied with no reason, or refused, is not a decision and is an error. A
+// refusal whose reason is outside the vocabulary is held, never retired.
+func inboundDecision(outcome, reason string) (retire, recognised bool, err error) {
+	switch outcome {
+	case "applied":
+		if reason != "" {
+			return false, false, fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
+		}
+		return true, true, nil
+	case "refused":
+		retire, recognised = inboundRefusalRetires[reason]
+		return retire, recognised, nil
 	default:
-		return fmt.Errorf("evidence: invalid inbound acknowledgement reason")
+		return false, false, fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
 	}
 }
 
@@ -258,14 +282,5 @@ func authorityQueueRouting(queued QueuedArtifact) (string, AuthorityArtifactType
 		return value.DeviceID, InboundCustodyAcknowledgement, nil
 	default:
 		return "", "", fmt.Errorf("evidence: invalid authority return queue type")
-	}
-}
-
-func bytePermanentRefusal(reason string) bool {
-	switch reason {
-	case "malformed", "bad_authenticator", "binding_mismatch", "non_contiguous_range":
-		return true
-	default:
-		return false
 	}
 }
