@@ -348,7 +348,8 @@ through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestAMisboundRetiringRefusalRetiresNothing`,
 `TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
 `TestAnotherDevicesHandoffNeverReleasesAHold`,
-`TestAQueueWakeNeverReleasesAHold` and `TestARefusedAdmissionIsNotAHandoff`.
+`TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionIsNotAHandoff` and
+`TestAStaleDecisionNeverReplacesAnotherHeadsHold`.
 
 20. `GW-20` Contract vectors are vendored, and an unmet case is pinned, never skipped.
 Every `ori-specs` vector a test reads is vendored in `internal/specvectors`,

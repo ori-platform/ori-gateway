@@ -275,11 +275,24 @@ func (r *returnRig) whilePaused(fn func()) [][]byte {
 	r.gateMu.Lock()
 	r.gate = gate
 	r.gateMu.Unlock()
-	if carried := r.interval(); len(carried) != 0 {
-		r.t.Fatalf("the interval before the pause carried %d envelopes", len(carried))
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(gate)
+		}
+	}
+	// Released even when the test fails here, or the loop never stops.
+	defer release()
+	// The clock is not advanced, so the head last carried is not carried
+	// again in the iteration the loop pauses in.
+	r.fire(rigRetry)
+	r.waitIteration()
+	if carried := r.drain(); len(carried) != 0 {
+		r.t.Fatalf("the iteration the loop paused in carried %d envelopes", len(carried))
 	}
 	fn()
-	close(gate)
+	release()
 	r.waitIteration()
 	return r.drain()
 }
@@ -472,9 +485,7 @@ func TestUnknownInboundReasonIsHeld(t *testing.T) {
 }
 
 // TestAHoldBindsOnlyTheHeadItWasDecidedOn holds the head, then the head is
-// replaced without a wake, as when a concurrent acknowledgement retires it
-// between another's Peek and its hold. The new head is carried on the next
-// interval.
+// replaced without a wake. The new head is carried on the next interval.
 func TestAHoldBindsOnlyTheHeadItWasDecidedOn(t *testing.T) {
 	next := validReceiptBytes(rigDevice, 2, 2)
 	rig := newReturnRig(t, next)

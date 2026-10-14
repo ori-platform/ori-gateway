@@ -5,7 +5,9 @@ package courier
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
 	"slices"
@@ -258,4 +260,67 @@ func TestARefusedAdmissionIsNotAHandoff(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAStaleDecisionNeverReplacesAnotherHeadsHold runs the schedule in which
+// acknowledgement A reads head X, B retires X and C holds the next head Y
+// before A decides. Whenever the publisher lets B and C run inside A's
+// decision, the seam runs them there; otherwise they run after A. Either way
+// the outcome must be X retired and Y held: Y is not carried on the retry
+// interval, and is carried on a receiver state change.
+func TestAStaleDecisionNeverReplacesAnotherHeadsHold(t *testing.T) {
+	next := validReceiptBytes(rigDevice, 2, 2)
+	r := newReturnRig(t, next)
+	nextDigest := sha256.Sum256(next)
+	holdX := r.decision(rigDevice, "refused", "unknown_key", nil)
+	retireX := r.decision(rigDevice, "applied", "", nil)
+	holdY := r.decision(rigDevice, "refused", "unknown_key", func(a *inboundAck) {
+		a.ArtifactDigest = "sha256:" + hex.EncodeToString(nextDigest[:])
+	})
+	interleaved, ranLater := false, false
+	r.publisher.peeked = func() {
+		r.publisher.peeked = nil
+		if !r.publisher.mu.TryLock() {
+			return
+		}
+		r.publisher.mu.Unlock()
+		interleaved = true
+		if err := r.publisher.HandleAck(rigTopic, retireX); err != nil {
+			t.Error(err)
+		}
+		if err := r.publisher.HandleAck(rigTopic, holdY); err != nil {
+			t.Error(err)
+		}
+	}
+	// The loop is paused, so the retirement's wake runs once all three
+	// decisions are applied.
+	carried := r.whilePaused(func() {
+		err := r.publisher.HandleAck(rigTopic, holdX)
+		if interleaved {
+			return
+		}
+		ranLater = true
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.publisher.HandleAck(rigTopic, retireX); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.publisher.HandleAck(rigTopic, holdY); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if len(carried) != 0 {
+		t.Fatalf("the wake after retiring X carried %d envelopes; Y is held (interleaved %v)", len(carried), interleaved)
+	}
+	head, ok := r.sink.queue.Peek()
+	if !ok || r.sink.Len() != 1 || string(head.Payload) != string(next) {
+		t.Fatalf("queue holds %d entries, want Y alone (interleaved %v, after %v)", r.sink.Len(), interleaved, ranLater)
+	}
+	for range 3 {
+		if carried := r.interval(); len(carried) != 0 {
+			t.Fatalf("held Y was carried on the retry interval (interleaved %v)", interleaved)
+		}
+	}
+	r.carriedAgain(r.stateChange(), next)
 }

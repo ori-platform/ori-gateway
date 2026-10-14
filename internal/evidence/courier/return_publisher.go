@@ -34,7 +34,13 @@ type ReturnPublisher struct {
 	// seam called at the end of every loop iteration, nil in production.
 	after          func(time.Duration) <-chan time.Time
 	afterIteration func()
+	// peeked is a test seam called by HandleAck once it has read the head
+	// and before it decides; nil in production.
+	peeked func()
 
+	// mu also spans an acknowledgement's decision, from reading the head to
+	// holding or retiring it, so a decision is never applied to a head another
+	// acknowledgement has since replaced.
 	mu sync.Mutex
 	// heldID is the queue entry a non-retiring refusal was decided on, and
 	// heldDevice the device it is for. Only that entry is held; a different
@@ -129,20 +135,17 @@ func (p *ReturnPublisher) Run(ctx context.Context) error {
 }
 
 func (p *ReturnPublisher) publishHead(ctx context.Context) error {
+	p.mu.Lock()
 	queued, ok := p.sink.queue.Peek()
-	if !ok {
+	held := ok && queued.ID == p.heldID
+	recentlyCarried := ok && queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
+	p.mu.Unlock()
+	if !ok || held || recentlyCarried {
 		return nil
 	}
 	deviceID, kind, err := authorityQueueRouting(queued)
 	if err != nil {
 		return err
-	}
-	p.mu.Lock()
-	held := queued.ID == p.heldID
-	recentlyCarried := queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
-	p.mu.Unlock()
-	if held || recentlyCarried {
-		return nil
 	}
 	envelope := inboundEnvelope{
 		DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(queued.Payload),
@@ -198,9 +201,14 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if ack.DeviceID != deviceID || ack.AcknowledgedAtMS <= 0 {
 		return fmt.Errorf("evidence: inbound acknowledgement binding mismatch")
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	queued, ok := p.sink.queue.Peek()
 	if !ok {
 		return fmt.Errorf("evidence: acknowledgement names an empty return queue")
+	}
+	if p.peeked != nil {
+		p.peeked()
 	}
 	queuedDevice, queuedType, err := authorityQueueRouting(queued)
 	if err != nil {
@@ -215,9 +223,7 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 		return err
 	}
 	if !retire {
-		p.mu.Lock()
 		p.heldID, p.heldDevice = queued.ID, queuedDevice
-		p.mu.Unlock()
 		if !recognised {
 			return NewUnrecognisedInboundReasonError(ack.Reason)
 		}
@@ -226,11 +232,9 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if err := p.sink.queue.Remove(queued.ID); err != nil {
 		return err
 	}
-	p.mu.Lock()
 	if p.heldID == queued.ID {
 		p.heldID, p.heldDevice = "", ""
 	}
-	p.mu.Unlock()
 	p.Notify()
 	return nil
 }
