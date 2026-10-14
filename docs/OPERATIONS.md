@@ -189,9 +189,10 @@ as `gateway-evidence-carriage/v1` defines it. `applied` retires. A refusal for
 `unknown_sequence` keeps the artifact, and so does a refusal naming any other
 reason, which logs `evidence inbound refusal reason unrecognised` with the
 reason quoted and cut at 64 bytes. A kept artifact is carried again when the
-runtime it is for next hands off an artifact the gateway admits, or on a
+runtime it is for next hands off a new artifact the gateway admits, or on a
 gateway restart, never on `evidence.retry_interval_s`. Another runtime's
-handoff, and a carriage the gateway refuses, do not carry it again. An acknowledgement that
+handoff, a carriage the gateway refuses, and a runtime carrying again an
+artifact the gateway already queued, do not carry it again. An acknowledgement that
 does not verify, does not name the queued artifact, or is missing a member or
 carries one with the wrong JSON type, such as a null `reason`, is not a
 decision: the

@@ -339,9 +339,9 @@ on its own topic is refused by the queued-device binding, not by the envelope.
 A refusal that does not retire, including one whose reason is outside the
 `evidence-exchange/v3` receiver rejection vocabulary, holds the queue entry it
 was decided on, and only that entry; it is carried again only on a receiver
-state change for the device it is for: an artifact from that device admitted,
-never another device's handoff, a carriage the ingress refuses, or a queue
-wake. An unrecognised reason is logged quoted and bounded. Verified by
+state change for the device it is for: an artifact from that device newly
+admitted, never a carriage of bytes already queued, another device's handoff,
+a carriage the ingress refuses, or a queue wake. An unrecognised reason is logged quoted and bounded. Verified by
 the `gateway-evidence-carriage/vectors/inbound-retirement-v1.json` corpus
 through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestAHoldBindsOnlyTheHeadItWasDecidedOn`,
@@ -349,6 +349,7 @@ through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
 `TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
 `TestAnotherDevicesHandoffNeverReleasesAHold`,
 `TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionIsNotAHandoff`,
+`TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff`,
 `TestAStaleDecisionNeverReplacesAnotherHeadsHold`,
 `TestARetiredHeldEntryStagedAgainIsCarried` and
 `TestAnIllTypedAcknowledgementIsNoDecision`, and in `cmd/ori-gateway` by

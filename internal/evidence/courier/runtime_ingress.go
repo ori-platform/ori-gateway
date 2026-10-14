@@ -73,10 +73,10 @@ func (h *RuntimeIngress) SetReturnNotifier(notify func()) {
 	h.notify = notify
 }
 
-// SetHandoff names what to call once an artifact for deviceID is admitted. It
-// is called only on admission: a carriage refused with an acknowledgement
-// (binding_mismatch, malformed, queue_full) or refused without one is not a
-// handoff.
+// SetHandoff names what to call once an artifact for deviceID is newly
+// admitted. A carriage refused with an acknowledgement (binding_mismatch,
+// malformed, queue_full) or without one is not a handoff, and neither is a
+// carriage of bytes already queued.
 func (h *RuntimeIngress) SetHandoff(handoff func(deviceID string)) {
 	h.handoff = handoff
 }
@@ -177,7 +177,7 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 	}
 	if admission.Custody == nil {
 		h.courier.queue.NoteAdmittedDevice(deviceID)
-		h.handedOff(deviceID)
+		h.handedOff(deviceID, admission)
 		return nil
 	}
 	// Canonical bytes, because the runtime acknowledges by a digest over the
@@ -198,12 +198,15 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 	if h.notify != nil {
 		h.notify()
 	}
-	h.handedOff(deviceID)
+	h.handedOff(deviceID, admission)
 	return nil
 }
 
-func (h *RuntimeIngress) handedOff(deviceID string) {
-	if h.handoff != nil {
+// handedOff calls the handoff for a newly queued artifact only. The runtime
+// carries an artifact again until it holds its acknowledgement, and the same
+// bytes are already queued: that is not a newly handed-off artifact.
+func (h *RuntimeIngress) handedOff(deviceID string, admission Admission) {
+	if h.handoff != nil && admission.New {
 		h.handoff(deviceID)
 	}
 }

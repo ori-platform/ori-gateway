@@ -348,3 +348,63 @@ func TestARetiredHeldEntryStagedAgainIsCarried(t *testing.T) {
 	}
 	r.carriedAgain(r.interval(), r.artifact)
 }
+
+// TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff holds edge-01's head,
+// then edge-01's runtime carries again a checkpoint and a delivery envelope
+// already queued, as it does until it holds their acknowledgements. Each is
+// acknowledged queued again, but neither is a newly handed-off artifact: no
+// lane is woken and the hold is kept. A new artifact from edge-01 releases it.
+func TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff(t *testing.T) {
+	r := newReturnRig(t)
+	c := rigCourier(t, 10, rigDevice, otherRigDevice)
+	envelope := envelopeFor(rigDevice, 7)
+	for _, a := range []struct {
+		kind    ArtifactType
+		payload []byte
+	}{{ArtifactCheckpoint, validCheckpointBytes()}, {ArtifactDeliveryEnvelope, envelope}} {
+		if admission, err := c.Admit(a.kind, a.payload); err != nil || !admission.New {
+			t.Fatalf("first admission = %v, new %v", err, admission.New)
+		}
+	}
+	in := r.ingress(c)
+	if err := r.handle(rigTopic, r.decision(rigDevice, "refused", "unknown_key", nil)); err != nil {
+		t.Fatal(err)
+	}
+	r.held()
+
+	r.advance()
+	if err := in.Handle(context.Background(), outboundTopic(rigDevice),
+		carriageOf(rigDevice, ArtifactCheckpoint, validCheckpointBytes())); err != nil {
+		t.Fatal(err)
+	}
+	r.held()
+	// The envelope's custody return is staged and wakes the loop.
+	carried := r.whilePaused(func() {
+		r.advance()
+		if err := in.Handle(context.Background(), outboundTopic(rigDevice),
+			carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelope)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if len(carried) != 0 {
+		t.Fatalf("a repeated envelope released the hold and carried %d envelopes", len(carried))
+	}
+	r.held()
+	acks := in.published()
+	if len(acks) != 2 || acks[0].Outcome != "queued" || acks[1].Outcome != "queued" {
+		t.Fatalf("acknowledgements = %+v, want both carriages acknowledged queued", acks)
+	}
+	if got := in.lanes.woken(); len(got) != 0 {
+		t.Fatalf("a repeated carriage woke lanes %v", got)
+	}
+
+	r.advance()
+	if err := in.Handle(context.Background(), outboundTopic(rigDevice),
+		carriageOf(rigDevice, ArtifactDeliveryEnvelope, envelopeFor(rigDevice, 8))); err != nil {
+		t.Fatal(err)
+	}
+	r.carriedAgain(r.waitCarried(), r.artifact)
+	if got := in.lanes.woken(); !slices.Equal(got, []string{rigDevice}) {
+		t.Fatalf("lanes woken = %v, want edge-01's once", got)
+	}
+}

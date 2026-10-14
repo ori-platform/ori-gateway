@@ -72,6 +72,9 @@ var (
 type Admission struct {
 	Queued  QueuedArtifact
 	Custody *custody.Acknowledgement
+	// New is false when the bytes were already queued: the runtime carried
+	// again an artifact it had already handed off.
+	New bool
 }
 
 // Courier owns the only boundary allowed to issue custody: a successful
@@ -99,11 +102,11 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 	if err := validateArtifactRoutingFields(kind, payload, c.queue.RoutingDeviceID); err != nil {
 		return Admission{}, err
 	}
-	queued, err := c.queue.Enqueue(kind, payload)
+	queued, isNew, err := c.queue.enqueueOutbound(kind, payload)
 	if err != nil {
 		return Admission{}, err
 	}
-	admission := Admission{Queued: queued}
+	admission := Admission{Queued: queued, New: isNew}
 	if kind != ArtifactDeliveryEnvelope || c.signer == nil {
 		return admission, nil
 	}
