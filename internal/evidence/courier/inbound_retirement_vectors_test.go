@@ -550,3 +550,62 @@ func replaceOnce(payload []byte, from, to string) []byte {
 	}
 	return out
 }
+
+// TestTheDefaultRetryTimerRedeliversAnUnacknowledgedHead runs the publisher as
+// the constructor builds it, with its production timer: an unacknowledged head
+// is carried again after the retry in a newly signed envelope.
+func TestTheDefaultRetryTimerRedeliversAnUnacknowledgedHead(t *testing.T) {
+	sink, err := OpenDurableAuthoritySink(QueueOptions{
+		Directory: filepath.Join(t.TempDir(), "return"), MaxItems: 10, MaxBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := validReceiptBytes(rigDevice, 1, 1)
+	if err := sink.Store(context.Background(), AuthorityArtifact{
+		Type: AuthorityDeliveryReceipt, DeviceID: rigDevice, Payload: artifact,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan []byte, 128)
+	publisher, err := NewReturnPublisher(sink, testAckClock(t, time.Now),
+		func(_ context.Context, _ string, _ byte, _ bool, payload []byte) error {
+			published <- append([]byte(nil), payload...)
+			return nil
+		}, rigSecret, "", time.Now, 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = publisher.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	var envelopes []inboundEnvelope
+	var raw [][]byte
+	for len(envelopes) < 2 {
+		select {
+		case payload := <-published:
+			var envelope inboundEnvelope
+			if err := json.Unmarshal(payload, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			envelopes = append(envelopes, envelope)
+			raw = append(raw, payload)
+		case <-time.After(rigWait):
+			t.Fatalf("the default retry timer carried the head %d times, want 2", len(envelopes))
+		}
+	}
+	a, b := envelopes[0], envelopes[1]
+	if string(a.Artifact) != string(artifact) || string(b.Artifact) != string(artifact) {
+		t.Fatal("the redelivery did not carry the same artifact")
+	}
+	if bytes.Equal(raw[0], raw[1]) || a.Auth == nil || b.Auth == nil || b.Auth.SignedAtMS <= a.Auth.SignedAtMS {
+		t.Fatal("the redelivery was not a newly signed envelope")
+	}
+}
