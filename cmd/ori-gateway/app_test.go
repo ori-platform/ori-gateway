@@ -2717,3 +2717,23 @@ func TestMainReasoningUnderGatewayAuthDropsUnsignedAndSignsResponses(t *testing.
 	}
 	t.Fatal("timed out waiting for the signed reasoning response")
 }
+
+func TestInboundAckResultLogsAnUnrecognisedReasonQuoted(t *testing.T) {
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logInboundAckResult(logger, courier.NewUnrecognisedInboundReasonError("not_a\n\"reason\""))
+	logInboundAckResult(logger, errors.New("evidence: acknowledgement does not name the queued authority artifact"))
+	logInboundAckResult(logger, nil)
+	out := logs.String()
+	for _, want := range []string{
+		`level=WARN msg="evidence inbound refusal reason unrecognised; authority artifact held until a receiver state change" reason="\"not_a\\n\\\"reason\\\"\""` + "\n",
+		`level=WARN msg="evidence inbound acknowledgement refused" error="evidence: acknowledgement does not name the queued authority artifact"` + "\n",
+	} {
+		if strings.Count(out, want) != 1 {
+			t.Fatalf("log line %q not logged once:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "\n") != 2 {
+		t.Fatalf("a nil result was logged:\n%s", out)
+	}
+}

@@ -72,6 +72,9 @@ var (
 type Admission struct {
 	Queued  QueuedArtifact
 	Custody *custody.Acknowledgement
+	// New is false when the bytes were already queued: the runtime carried
+	// again an artifact it had already handed off.
+	New bool
 }
 
 // Courier owns the only boundary allowed to issue custody: a successful
@@ -99,11 +102,11 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 	if err := validateArtifactRoutingFields(kind, payload, c.queue.RoutingDeviceID); err != nil {
 		return Admission{}, err
 	}
-	queued, err := c.queue.Enqueue(kind, payload)
+	queued, isNew, err := c.queue.enqueueOutbound(kind, payload)
 	if err != nil {
 		return Admission{}, err
 	}
-	admission := Admission{Queued: queued}
+	admission := Admission{Queued: queued, New: isNew}
 	if kind != ArtifactDeliveryEnvelope || c.signer == nil {
 		return admission, nil
 	}
@@ -115,7 +118,7 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 	// validateArtifactRoutingFields already decoded these exact bytes. This
 	// second decode is local routing only and never changes queued.Payload.
 	if err := decodeRouting(payload, &envelope); err != nil {
-		return Admission{}, fmt.Errorf("evidence: decode queued envelope routing fields: %w", err)
+		return admission, fmt.Errorf("evidence: decode queued envelope routing fields: %w", err)
 	}
 	digest := sha256.Sum256(payload)
 	ack, _, err := c.signer.Acknowledge(
@@ -128,7 +131,8 @@ func (c *Courier) Admit(kind ArtifactType, payload []byte) (Admission, error) {
 		// The artifact is already durable. Returning an error is intentional: the
 		// runtime must retry and the idempotent enqueue will recover the same entry
 		// and timestamp rather than losing it or claiming custody prematurely.
-		return Admission{}, fmt.Errorf("%w: %w", errCustodyConstruction, err)
+		// The admission still reports the queued entry and whether it is new.
+		return admission, fmt.Errorf("%w: %w", errCustodyConstruction, err)
 	}
 	admission.Custody = &ack
 	return admission, nil

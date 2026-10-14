@@ -787,9 +787,9 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 						release()
 					case "queue_full":
 						// An authenticated queue_full for a configured device is a
-						// handoff: the outbound subscription notifies the device
-						// after the ingress publishes the refusal.
-						worker.NotifyDevice(key.Device)
+						// handoff, driven through the ingress and the gateway's
+						// Handoff into this worker.
+						queueFullHandoff(t, worker, key.Device)
 						release()
 					case "queue_full_unconfigured_device", "admission_unauthenticated":
 						// Refused before the ingress admits anything: the

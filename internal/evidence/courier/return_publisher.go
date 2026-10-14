@@ -9,9 +9,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
+	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,9 +32,23 @@ type ReturnPublisher struct {
 	now            func() time.Time
 	retry          time.Duration
 	wake           chan struct{}
+	// after arms the retry timer; tests replace it. afterIteration is a test
+	// seam called at the end of every loop iteration, nil in production.
+	after          func(time.Duration) <-chan time.Time
+	afterIteration func()
+	// peeked is a test seam called by HandleAck once it has read the head
+	// and before it decides; nil in production.
+	peeked func()
 
-	mu      sync.Mutex
-	blocked bool
+	// mu also spans an acknowledgement's decision, from reading the head to
+	// holding or retiring it, so a decision is never applied to a head another
+	// acknowledgement has since replaced.
+	mu sync.Mutex
+	// heldID is the queue entry a non-retiring refusal was decided on, and
+	// heldDevice the device it is for. Only that entry is held; a different
+	// head is carried. Only that device's receiver state change releases it.
+	heldID     string
+	heldDevice string
 	// The head last carried and when, so a wake arriving right after a
 	// publish — the initial timer and a Notify for the same entry — does not
 	// put the same bytes on the wire twice within one retry interval. The
@@ -66,17 +84,17 @@ func NewReturnPublisher(
 	}
 	return &ReturnPublisher{
 		sink: sink, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret,
-		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1),
+		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1), after: time.After,
 	}, nil
 }
 
+// Notify wakes the loop to carry the head, as when a return is queued or the
+// head retires. It never releases a hold: a queue wake is not a receiver state
+// change.
 func (p *ReturnPublisher) Notify() {
 	if p == nil {
 		return
 	}
-	p.mu.Lock()
-	p.blocked = false
-	p.mu.Unlock()
 	select {
 	case p.wake <- struct{}{}:
 	default:
@@ -84,51 +102,52 @@ func (p *ReturnPublisher) Notify() {
 }
 
 // ReceiverStateChanged retries a retained authority artifact after an event
-// that can repair a receiver-state refusal. It is deliberately event-driven:
-// unknown keys, versions, and sequences do not become valid merely because a
-// short retry timer elapsed.
-func (p *ReturnPublisher) ReceiverStateChanged() {
+// on deviceID that can repair a receiver-state refusal: a hold on an artifact
+// for that device is released, and a hold for any other device is kept
+// (gateway-evidence-carriage/v1, a relevant runtime state change). It is
+// deliberately event-driven: unknown keys, versions, and sequences do not
+// become valid merely because a short retry timer elapsed.
+func (p *ReturnPublisher) ReceiverStateChanged(deviceID string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.heldDevice == deviceID {
+		p.heldID, p.heldDevice = "", ""
+	}
+	p.mu.Unlock()
 	p.Notify()
 }
 
 func (p *ReturnPublisher) Run(ctx context.Context) error {
-	timer := time.NewTimer(0)
-	defer timer.Stop()
+	timer := p.after(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-p.wake:
-		case <-timer.C:
+		case <-timer:
 		}
-		p.mu.Lock()
-		blocked := p.blocked
-		p.mu.Unlock()
-		if blocked {
-			continue
+		_ = p.publishHead(ctx)
+		timer = p.after(p.retry)
+		if p.afterIteration != nil {
+			p.afterIteration()
 		}
-		if err := p.publishHead(ctx); err != nil {
-			resetTimer(timer, p.retry)
-			continue
-		}
-		resetTimer(timer, p.retry)
 	}
 }
 
 func (p *ReturnPublisher) publishHead(ctx context.Context) error {
+	p.mu.Lock()
 	queued, ok := p.sink.queue.Peek()
-	if !ok {
+	held := ok && queued.ID == p.heldID
+	recentlyCarried := ok && queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
+	p.mu.Unlock()
+	if !ok || held || recentlyCarried {
 		return nil
 	}
 	deviceID, kind, err := authorityQueueRouting(queued)
 	if err != nil {
 		return err
-	}
-	p.mu.Lock()
-	recentlyCarried := queued.ID == p.lastID && p.now().Sub(p.lastAt) < p.retry
-	p.mu.Unlock()
-	if recentlyCarried {
-		return nil
 	}
 	envelope := inboundEnvelope{
 		DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(queued.Payload),
@@ -175,17 +194,26 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if err := refuseAmbiguousMembers(payload, &ack); err != nil {
 		return fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
+	if err := requireInboundAckTypes(payload); err != nil {
+		return fmt.Errorf("evidence: malformed inbound acknowledgement")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ack); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
+	// The verifier already binds the body's device_id to the topic; this is defence in depth.
 	if ack.DeviceID != deviceID || ack.AcknowledgedAtMS <= 0 {
 		return fmt.Errorf("evidence: inbound acknowledgement binding mismatch")
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	queued, ok := p.sink.queue.Peek()
 	if !ok {
 		return fmt.Errorf("evidence: acknowledgement names an empty return queue")
+	}
+	if p.peeked != nil {
+		p.peeked()
 	}
 	queuedDevice, queuedType, err := authorityQueueRouting(queued)
 	if err != nil {
@@ -195,40 +223,127 @@ func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	if queuedDevice != deviceID || string(queuedType) != ack.ArtifactType || ack.ArtifactDigest != "sha256:"+hex.EncodeToString(digest[:]) {
 		return fmt.Errorf("evidence: acknowledgement does not name the queued authority artifact")
 	}
-	if err := validateInboundDecision(ack.Outcome, ack.Reason); err != nil {
+	retire, recognised, err := inboundDecision(ack.Outcome, ack.Reason)
+	if err != nil {
 		return err
 	}
-	retire := ack.Outcome == "applied" && ack.Reason == ""
-	if ack.Outcome == "refused" {
-		retire = bytePermanentRefusal(ack.Reason)
-	}
 	if !retire {
-		p.mu.Lock()
-		p.blocked = true
-		p.mu.Unlock()
+		p.heldID, p.heldDevice = queued.ID, queuedDevice
+		if !recognised {
+			return NewUnrecognisedInboundReasonError(ack.Reason)
+		}
 		return nil
 	}
 	if err := p.sink.queue.Remove(queued.ID); err != nil {
 		return err
 	}
+	if p.heldID == queued.ID {
+		p.heldID, p.heldDevice = "", ""
+	}
 	p.Notify()
 	return nil
 }
 
-func validateInboundDecision(outcome, reason string) error {
-	if outcome == "applied" && reason == "" {
-		return nil
+// ErrUnrecognisedInboundReason reports a refusal whose reason is outside the
+// receiver rejection vocabulary. The artifact is held, not retired, and is
+// carried again only on a receiver state change.
+var ErrUnrecognisedInboundReason = errors.New("evidence: inbound refusal reason unrecognised; authority artifact held")
+
+// UnrecognisedInboundReasonError carries the unrecognised reason, quoted and
+// bounded so it is safe to log. It matches ErrUnrecognisedInboundReason.
+type UnrecognisedInboundReasonError struct {
+	Reason string
+}
+
+// NewUnrecognisedInboundReasonError quotes reason and bounds it to
+// maxLoggedReasonBytes.
+func NewUnrecognisedInboundReasonError(reason string) *UnrecognisedInboundReasonError {
+	return &UnrecognisedInboundReasonError{Reason: boundedQuote(reason)}
+}
+
+func (e *UnrecognisedInboundReasonError) Error() string {
+	return "evidence: inbound refusal reason " + e.Reason + " unrecognised; authority artifact held"
+}
+
+func (e *UnrecognisedInboundReasonError) Is(target error) bool {
+	return target == ErrUnrecognisedInboundReason
+}
+
+const maxLoggedReasonBytes = 64
+
+func boundedQuote(reason string) string {
+	if len(reason) > maxLoggedReasonBytes {
+		return strconv.Quote(reason[:maxLoggedReasonBytes]) + "..."
 	}
-	if outcome != "refused" {
-		return fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
-	}
-	switch reason {
-	case "malformed", "bad_authenticator", "binding_mismatch", "non_contiguous_range",
-		"unrecognised_version", "wrong_purpose", "unknown_key", "retired_key", "unknown_sequence":
-		return nil
+	return strconv.Quote(reason)
+}
+
+// inboundRefusalRetires is the evidence-exchange/v3 receiver rejection
+// vocabulary and, per gateway-evidence-carriage/v1, whether each retires.
+var inboundRefusalRetires = map[string]bool{
+	"malformed":            true,
+	"bad_authenticator":    true,
+	"binding_mismatch":     true,
+	"non_contiguous_range": true,
+	"unrecognised_version": false,
+	"wrong_purpose":        false,
+	"unknown_key":          false,
+	"retired_key":          false,
+	"unknown_sequence":     false,
+	"superseded":           true,
+	"restatement_conflict": true,
+}
+
+// inboundDecision classifies an authenticated decision. Any outcome other than
+// applied with no reason, or refused, is not a decision and is an error. A
+// refusal whose reason is outside the vocabulary is held, never retired.
+func inboundDecision(outcome, reason string) (retire, recognised bool, err error) {
+	switch outcome {
+	case "applied":
+		if reason != "" {
+			return false, false, fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
+		}
+		return true, true, nil
+	case "refused":
+		retire, recognised = inboundRefusalRetires[reason]
+		return retire, recognised, nil
 	default:
-		return fmt.Errorf("evidence: invalid inbound acknowledgement reason")
+		return false, false, fmt.Errorf("evidence: invalid inbound acknowledgement outcome")
 	}
+}
+
+// inboundAckStrings are the acknowledgement's string members, read from
+// inboundAck so a member added there is covered. Each is required as a
+// string: encoding/json decodes an absent member or a null as "", and an empty
+// reason is applied's.
+var inboundAckStrings = stringMembers(reflect.TypeFor[inboundAck]())
+
+// stringMembers lists the json member names of typ's string fields.
+func stringMembers(typ reflect.Type) []string {
+	var members []string
+	for field := range typ.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if field.Type.Kind() == reflect.String && name != "" && name != "-" {
+			members = append(members, name)
+		}
+	}
+	return members
+}
+
+// requireInboundAckTypes requires every string member to be present as a JSON
+// string, on the wire bytes, before the acknowledgement is decoded. An absent,
+// null or non-integer acknowledged_at_ms already decodes to a refusal.
+func requireInboundAckTypes(payload []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &members); err != nil {
+		return err
+	}
+	for _, name := range inboundAckStrings {
+		if raw, ok := members[name]; !ok || len(raw) == 0 || raw[0] != '"' {
+			return fmt.Errorf("member %s is not a string", name)
+		}
+	}
+	return nil
 }
 
 type inboundAck struct {
@@ -258,14 +373,5 @@ func authorityQueueRouting(queued QueuedArtifact) (string, AuthorityArtifactType
 		return value.DeviceID, InboundCustodyAcknowledgement, nil
 	default:
 		return "", "", fmt.Errorf("evidence: invalid authority return queue type")
-	}
-}
-
-func bytePermanentRefusal(reason string) bool {
-	switch reason {
-	case "malformed", "bad_authenticator", "binding_mismatch", "non_contiguous_range":
-		return true
-	default:
-		return false
 	}
 }

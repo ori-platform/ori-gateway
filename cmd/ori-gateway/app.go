@@ -419,6 +419,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			return fmt.Errorf("construct evidence return publisher: %w", err)
 		}
 		evidenceIngress.SetReturnNotifier(returnPublisher.Notify)
+		evidenceIngress.SetHandoff(courier.Handoff(evidenceWorker, returnPublisher))
 		evidenceIngress.SetFaultRecorder(evidenceFaults)
 		runners.start("evidence delivery worker", evidenceWorker.Run)
 		// Each durable store was probed when it opened; these keep probing it,
@@ -546,18 +547,11 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				deps.logger.Warn("evidence outbound carriage for an unconfigured device refused")
 				return
 			}
+			// An admission is a handoff, through the ingress's handoff hook; a
+			// carriage it refuses, with or without an acknowledgement, is not.
 			if err := evidenceIngress.Handle(runCtx, topic, payload); err != nil {
 				deps.logger.Warn("evidence outbound transport refused")
-				return
 			}
-			// A handoff for both of this device's lanes only: it retries
-			// their handoff-only refusals and never touches another device's.
-			evidenceWorker.NotifyDevice(deviceID)
-			// A newly observed runtime artifact can repair receiver-state
-			// refusals such as unknown_sequence, and commonly follows a runtime
-			// release that installs an authority key or version. Retry retained
-			// authority output on that event, never on a fixed short loop.
-			returnPublisher.ReceiverStateChanged()
 		}); err != nil {
 			shutdownRunners()
 			return fmt.Errorf("subscribe outbound evidence: %w", err)
@@ -569,9 +563,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				return fmt.Errorf("evidence inbound acknowledgement topic: %w", err)
 			}
 			if err := evidenceBroker.Subscribe(runCtx, ackTopic, broker.QoSReasoning, func(topic string, payload []byte) {
-				if err := returnPublisher.HandleAck(topic, payload); err != nil {
-					deps.logger.Warn("evidence inbound acknowledgement refused", "error", err)
-				}
+				logInboundAckResult(deps.logger, returnPublisher.HandleAck(topic, payload))
 			}); err != nil {
 				shutdownRunners()
 				return fmt.Errorf("subscribe evidence inbound acknowledgements: %w", err)
@@ -1168,5 +1160,18 @@ func providerStatusFromProvider(reasoningProvider provider.Provider) heartbeat.P
 		healthy: func(context.Context) bool {
 			return false
 		},
+	}
+}
+
+// logInboundAckResult logs the outcome of a runtime's acknowledgement of a
+// returned authority artifact. An unrecognised refusal reason is logged
+// quoted and bounded.
+func logInboundAckResult(logger *slog.Logger, err error) {
+	var unrecognised *courier.UnrecognisedInboundReasonError
+	switch {
+	case errors.As(err, &unrecognised):
+		logger.Warn("evidence inbound refusal reason unrecognised; authority artifact held until a receiver state change", "reason", unrecognised.Reason)
+	case err != nil:
+		logger.Warn("evidence inbound acknowledgement refused", "error", err)
 	}
 }

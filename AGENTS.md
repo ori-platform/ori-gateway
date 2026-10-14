@@ -216,7 +216,10 @@ type and never stored, so queue directories need no migration. Order, retry
 state, back-off and holds are kept, persisted and restored per `device_id` and
 lane, and a hold or back-off in one lane never delays the device's other lane
 or another device. A handoff is a newly admitted artifact for the same device
-(a handoff for both its lanes), a `200` retiring an anchor registration for
+(a handoff for both its lanes), signalled once its bytes are durably queued
+whatever later step fails, an authenticated admission for the same device
+refused `queue_full` (a handoff for both its lanes that admits no bytes and
+releases no authority-artifact hold), a `200` retiring an anchor registration for
 the same device, confirmed or accepted pending (a handoff for its evidence
 lane), or the courier starting again; it retries only a handoff-only refusal
 and never brings a back-off forward. Queue capacity is reserved per configured
@@ -330,6 +333,33 @@ Verified by the tests in `internal/evidence/courier`, including
 `TestRefusalPolicyVectorCases` and `TestRefusalPolicyVectorSequences`, and in
 `cmd/ori-gateway` by `TestRealProjectionsSatisfyTheContract` and
 `TestProjectionOracleAgreesWithTheVectors`.
+
+An authority artifact returned to a runtime retires only on an authenticated
+acknowledgement from the device the artifact is for, naming it: `applied`, or a
+refusal the `gateway-evidence-carriage/v1` retirement table marks retiring. The
+site shares one envelope secret, so another device's correctly signed decision
+on its own topic is refused by the queued-device binding, not by the envelope.
+A refusal that does not retire, including one whose reason is outside the
+`evidence-exchange/v3` receiver rejection vocabulary, holds the queue entry it
+was decided on, and only that entry; it is carried again only on a receiver
+state change for the device it is for: an artifact from that device newly
+admitted, never a carriage of bytes already queued, another device's handoff,
+a carriage the ingress refuses, or a queue wake. An unrecognised reason is logged quoted and bounded. Verified by
+the `gateway-evidence-carriage/vectors/inbound-retirement-v1.json` corpus
+through `TestInboundRetirementCorpus`, and by `TestUnknownInboundReasonIsHeld`,
+`TestAHoldBindsOnlyTheHeadItWasDecidedOn`,
+`TestAMisboundRetiringRefusalRetiresNothing`,
+`TestInboundAckResultLogsAnUnrecognisedReasonQuoted`,
+`TestAnotherDevicesHandoffNeverReleasesAHold`,
+`TestAQueueWakeNeverReleasesAHold`, `TestARefusedAdmissionReleasesNoHold`,
+`TestACarriageOfAnArtifactAlreadyQueuedIsNotAHandoff`,
+`TestAHandoffSurvivesAFailureAfterDurableAdmission`,
+`TestAStaleDecisionNeverReplacesAnotherHeadsHold`,
+`TestARetiredHeldEntryStagedAgainIsCarried` and
+`TestAnIllTypedAcknowledgementIsNoDecision`, and in `cmd/ori-gateway` by
+`TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff`. An acknowledgement member that is
+absent, null or of another JSON type is no decision: a null or absent `reason`
+never reads as `applied`'s empty one.
 
 20. `GW-20` Contract vectors are vendored, and an unmet case is pinned, never skipped.
 Every `ori-specs` vector a test reads is vendored in `internal/specvectors`,

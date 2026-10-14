@@ -31,6 +31,7 @@ type RuntimeIngress struct {
 	now            func() time.Time
 	signingClock   *signingclock.Clock
 	notify         func()
+	handoff        func(deviceID string, kind HandoffKind)
 	faults         *faults.Recorder
 }
 
@@ -70,6 +71,49 @@ func NewRuntimeIngress(courier *Courier, returns *DurableAuthoritySink, signingC
 // SetReturnNotifier names what to wake once a custody acknowledgement is queued.
 func (h *RuntimeIngress) SetReturnNotifier(notify func()) {
 	h.notify = notify
+}
+
+// HandoffKind is what made a handoff for a device (evidence-transport/v2).
+type HandoffKind int
+
+const (
+	// HandoffAdmitted is a newly admitted outbound artifact.
+	HandoffAdmitted HandoffKind = iota + 1
+	// HandoffQueueFull is an authenticated admission refused queue_full. It
+	// admits no bytes, so it hands off no artifact.
+	HandoffQueueFull
+)
+
+// SetHandoff names what to call on a handoff for deviceID: as soon as an
+// artifact is durably queued as a new entry, whatever later step fails, and
+// when an authenticated admission is refused queue_full. A carriage refused
+// for anything else, with or without an acknowledgement, is not a handoff, and
+// neither is a carriage of bytes already queued.
+func (h *RuntimeIngress) SetHandoff(handoff func(deviceID string, kind HandoffKind)) {
+	h.handoff = handoff
+}
+
+// laneWaker is the part of the delivery worker a handoff wakes.
+type laneWaker interface {
+	NotifyDevice(deviceID string)
+}
+
+// Handoff is what a handoff for deviceID does. Every handoff wakes both of
+// that device's lanes only, which retries their handoff-only refusals and
+// never touches another device's (evidence-transport/v2). A newly admitted
+// artifact is also a receiver state change for that device: it can repair the
+// device's receiver-state refusals such as unknown_sequence, and commonly
+// follows a runtime release that installs an authority key or version, so its
+// retained authority output is retried on that event, never on a fixed short
+// loop, and never another device's (gateway-evidence-carriage/v1). A
+// queue_full refusal hands off no artifact and releases no hold.
+func Handoff(lanes laneWaker, returns *ReturnPublisher) func(deviceID string, kind HandoffKind) {
+	return func(deviceID string, kind HandoffKind) {
+		lanes.NotifyDevice(deviceID)
+		if kind == HandoffAdmitted {
+			returns.ReceiverStateChanged(deviceID)
+		}
+	}
 }
 
 func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byte) error {
@@ -117,6 +161,11 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 		return h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "refused", "malformed", h.now().UnixMilli())
 	}
 	admission, err := h.courier.Admit(kind, artifactBytes)
+	if admission.New {
+		// Durably queued as a new entry: the handoff is not lost to a later
+		// failure, since the runtime's retry finds the bytes already queued.
+		h.handedOff(deviceID, HandoffAdmitted)
+	}
 	if err != nil {
 		if errors.Is(err, faults.ErrUnconfiguredDevice) {
 			// The artifact names an unconfigured device; refused before
@@ -125,7 +174,9 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 			return err
 		}
 		if errors.Is(err, ErrQueueFull) {
-			// A defined, retriable refusal of a full share, not a failure.
+			// A defined, retriable refusal of a full share, not a failure,
+			// and a handoff for the device's lanes.
+			h.handedOff(deviceID, HandoffQueueFull)
 			return h.publishOutboundAck(ctx, deviceID, carriage.ArtifactType, artifactBytes, "refused", "queue_full", h.now().UnixMilli())
 		}
 		if errors.Is(err, errCustodyConstruction) {
@@ -169,6 +220,12 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 		h.notify()
 	}
 	return nil
+}
+
+func (h *RuntimeIngress) handedOff(deviceID string, kind HandoffKind) {
+	if h.handoff != nil {
+		h.handoff(deviceID, kind)
+	}
 }
 
 func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artifactType string, artifactBytes []byte, outcome, reason string, acknowledgedAtMS int64) error {

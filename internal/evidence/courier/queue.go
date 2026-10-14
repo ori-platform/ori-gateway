@@ -342,20 +342,42 @@ func (q *DurableQueue) Enqueue(kind ArtifactType, payload []byte) (QueuedArtifac
 	return q.enqueue(kind, payload)
 }
 
+// enqueueOutbound is Enqueue, also reporting whether the artifact is newly
+// queued rather than an entry already held for the same bytes.
+func (q *DurableQueue) enqueueOutbound(kind ArtifactType, payload []byte) (QueuedArtifact, bool, error) {
+	if !validOutboundArtifactType(kind) {
+		return QueuedArtifact{}, false, fmt.Errorf("evidence: unsupported outbound artifact type %q", kind)
+	}
+	queued, existing, err := q.enqueueOrFind(kind, payload)
+	return queued, err == nil && !existing, err
+}
+
 func (q *DurableQueue) enqueue(kind ArtifactType, payload []byte) (QueuedArtifact, error) {
+	queued, _, err := q.enqueueOrFind(kind, payload)
+	return queued, err
+}
+
+// enqueueOrFind queues payload, or returns the entry already held for the
+// same bytes and reports that it was already held.
+func (q *DurableQueue) enqueueOrFind(kind ArtifactType, payload []byte) (QueuedArtifact, bool, error) {
 	if !validQueueArtifactType(kind) {
-		return QueuedArtifact{}, fmt.Errorf("evidence: unsupported queue artifact type %q", kind)
+		return QueuedArtifact{}, false, fmt.Errorf("evidence: unsupported queue artifact type %q", kind)
 	}
 	if len(payload) == 0 {
-		return QueuedArtifact{}, fmt.Errorf("evidence: artifact payload must not be empty")
+		return QueuedArtifact{}, false, fmt.Errorf("evidence: artifact payload must not be empty")
 	}
 	id := artifactID(kind, payload)
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if existing, ok := q.entries[id]; ok {
-		return recordArtifact(existing), nil
+		return recordArtifact(existing), true, nil
 	}
+	queued, err := q.insertLocked(kind, payload, id)
+	return queued, false, err
+}
+
+func (q *DurableQueue) insertLocked(kind ArtifactType, payload []byte, id string) (QueuedArtifact, error) {
 	device := recordDevice(payload)
 	if q.configured != nil && !q.configured[device] {
 		// Not queue_full: an unconfigured device holds no share to be full.

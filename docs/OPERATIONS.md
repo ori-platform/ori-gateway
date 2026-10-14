@@ -178,6 +178,35 @@ is not conformant. Before quarantining a `409`, confirm with the evidence
 authority's operator that the conflict is real; if it was not, use *Retrying a
 held artifact once* below.
 
+### Authority artifacts returned to the runtime
+
+Receipts, epoch confirmations and custody acknowledgements the gateway carries
+back to a runtime retire only on the runtime's authenticated acknowledgement,
+as `gateway-evidence-carriage/v1` defines it. `applied` retires. A refusal for
+`malformed`, `bad_authenticator`, `binding_mismatch`, `non_contiguous_range`,
+`superseded` or `restatement_conflict` retires. A refusal for
+`unrecognised_version`, `wrong_purpose`, `unknown_key`, `retired_key` or
+`unknown_sequence` keeps the artifact, and so does a refusal naming any other
+reason, which logs `evidence inbound refusal reason unrecognised` with the
+reason quoted and cut at 64 bytes. A kept artifact is carried again when the
+runtime it is for next hands off a new artifact the gateway admits, or on a
+gateway restart, never on `evidence.retry_interval_s`. Another runtime's
+handoff, a carriage the gateway refuses, and a runtime carrying again an
+artifact the gateway already queued, do not carry it again. An acknowledgement that
+does not verify, does not name the queued artifact, or is missing a member or
+carries one with the wrong JSON type, such as a null `reason`, is not a
+decision: the
+artifact is carried again on the retry interval in a newly signed envelope.
+
+The return queue has one head for the whole site, so while an artifact is
+kept every other runtime's returns wait behind it, custody acknowledgements
+included. If the runtime it is for has stopped handing off, for example while
+it is offline, restart the gateway once the condition behind the refusal is
+repaired; the restart carries the kept artifact again. A restart does not
+help when that runtime will never acknowledge again, because it was
+decommissioned or now runs under another device ID: its artifact is carried
+on every retry interval and the site's returns stay blocked behind it.
+
 ### How to see it
 
 The gateway log carries the state whether or not `site_health` is enabled.
