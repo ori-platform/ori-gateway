@@ -384,7 +384,7 @@ registry entry lists, and no issue URL anywhere but that field.
 Every subscription on either broker client belongs to a gateway-api/v2 Payload
 Size family with a maximum and an ingress rate, or `broker.Client.Subscribe`
 refuses it. The client's message wrapper compares a payload's length with the
-family maximum, then applies the sending device's rate (a wildcard
+family maximum, then applies the sending device's message and byte rate (a wildcard
 subscription keeps one per configured device and one shared by every other
 device segment), before the handler runs: a refused payload is never parsed,
 decoded, verified, routed or answered, and changes no state. Refusals are
@@ -409,13 +409,50 @@ Verified by `TestEverySubscriptionHasAPayloadMaximum`,
 `TestARefusedOversizePayloadChangesNothingAndIsNotAnswered`,
 `TestAnOversizePayloadCostsNoParse`, `TestAVolumeOverTheRateIsDroppedAndCounted`,
 `TestIngressRefusalsAreRecordedWithoutContent`,
-`TestAWildcardSubscriptionRatesEachDevice`, `TestRequiredRepliesFitTheFloor`,
+`TestAWildcardSubscriptionRatesEachDevice`,
+`TestAByteBudgetBoundsTheParseWorkEachDeviceCanCause`,
+`TestRequiredRepliesFitTheFloor`,
 `TestInboundEvidenceIsPublishedCanonical`,
 `TestAProviderReturnedErrorIsSentAsTheBoundedErrorResponse`,
 `TestAnAcknowledgementThatDecidesNothingAddsNoReplayState`,
 `TestACancelledExportResponseAddsNoReplayState`,
 `TestAnOversizeAuthorityArtifactHoldsOnlyItsLane` and
 `TestProjectSiteHealthMQTTIngressIsExactlyTheReceivedFamilies`.
+
+22. `GW-22` A runtime-facing payload has one reading.
+Every payload the gateway receives from a runtime is admitted under
+gateway-api/v2's Payload Member Rule in the broker's message wrapper, after
+size and rate and before any handler runs, through `contracts.AdmitPayload`
+and ori-canonicaljson's strict decode: invalid Unicode, malformed JSON,
+nesting past 32, trailing data, a duplicate member, a name equal to another or
+to a defined member under the closed fold, and a value that is not an object
+are refused, unanswered, and logged with the reason only. Each family's defined
+members are `contracts.DefinedMembers`, held equal to the vendored corpus. A
+decrypted export plaintext is admitted the same way before it is read; one
+the rule refuses is logged with its reason and changes nothing: no replay key
+is recorded and the export request stays pending. An
+authority artifact that routes correctly is judged at staging inside the
+inbound message that would carry it; one the rule refuses is not staged and,
+as for an artifact over the inbound maximum, the attempt is an unrecognised
+outcome (evidence-transport/v2): the entry is retained and backs off. No
+inbound message the rule refuses is ever published. Every struct a runtime payload is decoded
+into, or encoded from, names only its family's defined members, so a struct
+decode of an admitted payload reads members by exact name. A member no section
+defines is still tolerated where its section tolerates unknown members.
+Verified by `TestDefinedMembersMatchTheCorpus`,
+`TestPayloadMemberVectorCases`,
+`TestAPayloadTheMemberRuleRefusesChangesNothing`,
+`TestRuntimeFacingStructsNameOnlyDefinedMembers`,
+`TestEvidencePayloadStructsNameOnlyDefinedMembers`,
+`TestExportPayloadStructsNameOnlyDefinedMembers`,
+`TestEveryExportRequestTheClientPublishesIsAdmitted`,
+`TestDecryptedPlaintextIsHeldToTheMemberRule`,
+`TestARefusedExportPlaintextChangesNothing`,
+`TestVerifierFoldsNamesOnlyByTheClosedFold`,
+`TestAnAuthorityArtifactTheMemberRuleRefusesIsUnrecognised`,
+`TestRoutingIsJudgedBeforeTheMemberRule`,
+`TestAnInboundMessageTheMemberRuleRefusesIsNeverPublished` and
+`TestARefusedCoveringReceiptLeavesTheAcceptanceUnrecognised`.
 
 ## Layout
 

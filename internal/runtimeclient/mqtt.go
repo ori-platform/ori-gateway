@@ -9,7 +9,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"math"
 	"sync"
@@ -38,6 +40,7 @@ type requestIDFunc func() (string, error)
 
 // MQTTClient implements Client over runtime MQTT export request/response topics.
 type MQTTClient struct {
+	log                 *slog.Logger
 	broker              mqttBroker
 	qos                 byte
 	requestID           requestIDFunc
@@ -89,6 +92,15 @@ func WithMessageAuth(sharedSecret string, previousSharedSecret string, now func(
 }
 
 // WithMessageEncryption enables AES-GCM decryption for sensitive runtime export responses.
+// WithLogger sets where the client records a response it refuses.
+func WithLogger(log *slog.Logger) MQTTClientOption {
+	return func(c *MQTTClient) {
+		if log != nil {
+			c.log = log
+		}
+	}
+}
+
 func WithMessageEncryption(sharedSecret string) MQTTClientOption {
 	return func(c *MQTTClient) {
 		c.encryptionRequested = true
@@ -110,6 +122,7 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 		broker:     b,
 		qos:        broker.QoSReasoning,
 		requestID:  randomRequestID,
+		log:        slog.Default(),
 		now:        time.Now,
 		pending:    make(map[string]pendingExport),
 		subscribed: make(map[string]bool),
@@ -405,7 +418,9 @@ func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
 
 	if c.verifier == nil {
 		resp, err := c.decodeResponsePayload(raw, pending.req)
-		c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err})
+		if !c.refusedByMemberRule(err) {
+			c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err})
+		}
 		return
 	}
 	// The response is correlated with its pending request under the replay
@@ -417,11 +432,27 @@ func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
 		func(verified map[string]any) (bool, error) {
 			decided = true
 			resp, err := c.decodeResponsePayload(verified, pending.req)
+			// A decrypted plaintext the member rule refuses answers nothing:
+			// the request stays pending and no replay key is recorded.
+			if c.refusedByMemberRule(err) {
+				return false, nil
+			}
 			return c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err}), nil
 		})
 	if err != nil && !decided {
 		c.deliver(requestID, pending.ch, exportResult{err: fmt.Errorf("runtimeclient: verify export response: %w", err)})
 	}
+}
+
+// refusedByMemberRule reports, and logs with its reason only, a response whose
+// decrypted plaintext the Payload Member Rule refuses. Such a response changes
+// no state: it is neither delivered nor recorded (gateway-api/v2).
+func (c *MQTTClient) refusedByMemberRule(err error) bool {
+	refused, ok := errors.AsType[*contracts.MemberRuleError](err)
+	if ok {
+		c.log.Warn("runtime export response refused under the payload member rule", "reason", refused.Reason)
+	}
+	return ok
 }
 
 // deliver hands result to the pending request it answers, if that request is

@@ -127,11 +127,7 @@ func (h *RuntimeIngress) Handle(ctx context.Context, topic string, payload []byt
 		_ = h.courier.queue.NoteUnconfiguredDevice(deviceID)
 		return faults.ErrUnconfiguredDevice
 	}
-	var carriage struct {
-		DeviceID     string `json:"device_id"`
-		ArtifactType string `json:"artifact_type"`
-		ArtifactB64  string `json:"artifact_b64"`
-	}
+	var carriage outboundCarriage
 	if err := refuseAmbiguousMembers(payload, &carriage); err != nil {
 		return fmt.Errorf("evidence: malformed outbound carriage")
 	}
@@ -257,6 +253,13 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		return fmt.Errorf("evidence: publish outbound acknowledgement: %w", err)
 	}
 	return nil
+}
+
+// outboundCarriage is the outbound evidence payload a runtime publishes.
+type outboundCarriage struct {
+	DeviceID     string `json:"device_id"`
+	ArtifactType string `json:"artifact_type"`
+	ArtifactB64  string `json:"artifact_b64"`
 }
 
 // encodeOutboundAck signs and encodes an outbound acknowledgement.

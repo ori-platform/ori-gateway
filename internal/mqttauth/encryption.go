@@ -12,8 +12,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	canonicaljson "github.com/ori-platform/ori-canonicaljson"
 	"strings"
+
+	canonicaljson "github.com/ori-platform/ori-canonicaljson"
+	"github.com/ori-platform/ori-gateway/internal/contracts"
 )
 
 const (
@@ -50,6 +52,21 @@ func (e *Encryptor) Encrypt(value any, messageType string, nonce []byte) (map[st
 	if err != nil {
 		return nil, err
 	}
+	canonical, err := CanonicalJSONWithoutAuth(plain)
+	if err != nil {
+		return nil, err
+	}
+	return e.Seal(canonical, metadata, messageType, nonce)
+}
+
+// Seal encrypts plaintext bytes exactly as given under the export envelope:
+// metadata's request_id, device_id and export_type stay outside and bind the
+// ciphertext as associated data. Encrypt seals a payload's canonical JSON;
+// Seal also lets a test seal bytes no conforming producer would.
+func (e *Encryptor) Seal(plaintext []byte, metadata map[string]string, messageType string, nonce []byte) (map[string]any, error) {
+	if e == nil {
+		return nil, fmt.Errorf("mqtt encryptor is nil")
+	}
 	if len(nonce) != 12 {
 		return nil, fmt.Errorf("mqtt encryption nonce must be 12 bytes")
 	}
@@ -61,15 +78,11 @@ func (e *Encryptor) Encrypt(value any, messageType string, nonce []byte) (map[st
 	if err != nil {
 		return nil, err
 	}
-	canonical, err := CanonicalJSONWithoutAuth(plain)
-	if err != nil {
-		return nil, err
-	}
 	aad, err := encryptionAAD(metadata, messageType)
 	if err != nil {
 		return nil, fmt.Errorf("build encryption aad: %w", err)
 	}
-	ciphertext := gcm.Seal(nil, nonce, canonical, aad)
+	ciphertext := gcm.Seal(nil, nonce, plaintext, aad)
 	return map[string]any{
 		"request_id":  metadata["request_id"],
 		"device_id":   metadata["device_id"],
@@ -134,6 +147,11 @@ func (e *Encryptor) Decrypt(payload map[string]any, messageType string, expected
 	if err != nil {
 		return nil, fmt.Errorf("decrypt payload: %w", err)
 	}
+	// The plaintext is a JSON text in its own right, admitted under the
+	// Payload Member Rule before any member of it is read (gateway-api/v2).
+	if err := admitPlaintext(messageType, plaintext); err != nil {
+		return nil, err
+	}
 	var decoded map[string]any
 	dec := json.NewDecoder(bytes.NewReader(plaintext))
 	dec.UseNumber()
@@ -148,6 +166,20 @@ func (e *Encryptor) Decrypt(payload map[string]any, messageType string, expected
 		return nil, fmt.Errorf("encrypted metadata mismatch")
 	}
 	return decoded, nil
+}
+
+// plaintextFamilies names the payload family whose members a decrypted
+// plaintext is judged against; an encrypted payload of any other message type
+// defines none.
+var plaintextFamilies = map[string]string{
+	contracts.ExportResponseMessageType: contracts.FamilyExportResponse,
+}
+
+func admitPlaintext(messageType string, plaintext []byte) error {
+	if family, ok := plaintextFamilies[messageType]; ok {
+		return contracts.AdmitPayload(family, plaintext)
+	}
+	return contracts.AdmitPayloadWithMembers(nil, plaintext)
 }
 
 func mapWithoutAuth(value any) (map[string]any, error) {

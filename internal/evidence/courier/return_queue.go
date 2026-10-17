@@ -17,6 +17,7 @@ var (
 	errAuthorityArtifactOverMaximum = errors.New("evidence: authority artifact exceeds the inbound maximum")
 	errInboundOverMaximum           = errors.New("evidence: inbound message exceeds its topic maximum")
 	errQueuedArtifactNotCanonical   = errors.New("evidence: queued authority artifact is not canonicalisable")
+	errInboundRefusedByMemberRule   = errors.New("evidence: inbound message refused under the payload member rule")
 )
 
 // DurableAuthoritySink stages exact authority artifacts in a queue separate
@@ -60,6 +61,13 @@ func (s *DurableAuthoritySink) Store(_ context.Context, artifact AuthorityArtifa
 	}
 	if err := decodeRouting(artifact.Payload, &routing); err != nil || routing.DeviceID == "" || routing.DeviceID != artifact.DeviceID {
 		return fmt.Errorf("evidence: authority artifact routing mismatch")
+	}
+	// Staging admits no artifact the gateway could not forward unchanged
+	// without emitting an inbound message the member rule refuses: as one over
+	// the maximum, the attempt is then an unrecognised outcome
+	// (evidence-transport/v2).
+	if err := inboundMemberRefusal(artifact); err != nil {
+		return err
 	}
 	// Staging admits no artifact the inbound hop could not carry: one over
 	// MaxAuthorityArtifactBytes canonical bytes is refused, which the delivery

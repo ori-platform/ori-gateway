@@ -209,6 +209,15 @@ off, artifacts staged before the refusal stay staged, and
 `gateway.evidence_delivery` reads degraded. The device's other lane and every
 other device keep delivering.
 
+An authority artifact that could not be carried to the runtime without
+breaking gateway-api/v2's Payload Member Rule, such as one naming a member
+twice, is not staged either. The gateway logs `evidence authority artifact
+refused under the payload member rule` with its `artifact_type` and `reason`,
+and the attempt is handled exactly as for an oversized artifact: unrecognised,
+the outbound entry kept and backed off, artifacts staged before it kept, and
+`gateway.evidence_delivery` degraded. An artifact that is malformed or names
+another device stays an unrecognised outcome as before.
+
 The return queue has one head for the whole site, so while an artifact is
 kept every other runtime's returns wait behind it, custody acknowledgements
 included. If the runtime it is for has stopped handing off, for example while
@@ -542,14 +551,25 @@ payload is not answered and changes nothing: no reasoning reply, no evidence
 custody or acknowledgement, no heartbeat in the site view. The runtime that
 sent an outbound evidence carriage keeps its bytes and carries it again.
 
-| Topic family | Maximum (bytes) | Rate |
-| --- | --- | --- |
-| `ori/{device_id}/runtime/heartbeat` | 65,536 | 1 a second, bursts of 5, per device |
-| `ori/{device_id}/reasoning/request` | 262,144 | 10 a second, bursts of 20, per device |
-| `ori/{device_id}/tier_c/enrichment/request` | 262,144 | 2 a second, bursts of 10, per device |
-| `ori/{device_id}/export/response/{request_id}` | 4,194,304 | 20 a second, bursts of 64, per device |
-| `ori/{device_id}/evidence/outbound` | 1,572,864 | 20 a second, bursts of 160, per device |
-| `ori/{device_id}/evidence/inbound/ack` | 16,384 | 20 a second, bursts of 64, per device |
+| Topic family | Maximum (bytes) | Messages per device | Bytes per device |
+| --- | --- | --- | --- |
+| `ori/{device_id}/runtime/heartbeat` | 65,536 | 1 a second, bursts of 5 | 128 KiB a second, bursts of 256 KiB |
+| `ori/{device_id}/reasoning/request` | 262,144 | 10 a second, bursts of 20 | 512 KiB a second, bursts of 1 MiB |
+| `ori/{device_id}/tier_c/enrichment/request` | 262,144 | 2 a second, bursts of 10 | 256 KiB a second, bursts of 512 KiB |
+| `ori/{device_id}/export/response/{request_id}` | 4,194,304 | 20 a second, bursts of 64 | 4 MiB a second, bursts of 16 MiB |
+| `ori/{device_id}/evidence/outbound` | 1,572,864 | 20 a second, bursts of 160 | 2 MiB a second, bursts of 4 MiB |
+| `ori/{device_id}/evidence/inbound/ack` | 16,384 | 20 a second, bursts of 64 | 64 KiB a second, bursts of 256 KiB |
+
+A message past either budget is dropped as volume. The byte budget bounds,
+per device, the parsing the gateway does before it authenticates a message.
+Messages naming a device ID outside `gateway.device_ids` share one more set of
+budgets, so a broker client that can publish under any device ID can make the
+gateway parse at most the sum of one set per configured device plus that one,
+before any of it is authenticated; per-device broker ACLs keep each device to
+its own topics. The runtime never resends an export page, so an export page
+dropped as volume leaves that export waiting until the caller's own deadline
+ends it; the export budgets are sized so the runtime's four concurrent pages
+at the maximum fit.
 
 A rate is kept for each device in `gateway.device_ids`. Messages on the
 reasoning and evidence topics that name any other device ID share one rate, so
@@ -567,7 +587,20 @@ number `dropped`. A flood writes at most one line a second for each family and
 reason, counting every refusal since the last line. No line carries payload
 content, a device ID or a topic.
 
-With `site_health` enabled, `gateway.mqtt_ingress` counts both since the
+A payload within its size and rate is then held to gateway-api/v2's Payload
+Member Rule before anything reads it. A payload that is not valid UTF-8, not
+one JSON object, nested deeper than 32, followed by anything but whitespace,
+or that names a member twice or spells a member's name in another case (such
+as `REQUEST_ID` beside or instead of `request_id`) is refused and not answered.
+It is logged as `WARN` `mqtt ingress refused payloads under the payload member
+rule`, with the `family`, the `reason` (`invalid_unicode`, `malformed_json`,
+`nesting_too_deep`, `trailing_data`, `duplicate_member`, `case_variant_member`
+or `not_an_object`) and the number `refused`, paced the same way. These
+refusals are not counted in `mqtt_ingress`. A runtime whose messages are
+refused this way is producing payloads the contract forbids; the reason names
+what to fix.
+
+With `site_health` enabled, `gateway.mqtt_ingress` counts size and volume refusals since the
 gateway started, one member for each family above. Abbreviated to one family:
 
 ```json

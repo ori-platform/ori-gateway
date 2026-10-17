@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
 	"io"
+	"log/slog"
 	"reflect"
 	"strconv"
 	"strings"
@@ -50,6 +51,10 @@ type ReturnPublisher struct {
 	// head is carried. Only that device's receiver state change releases it.
 	heldID     string
 	heldDevice string
+	// log reports a head that can never be carried; stuckID is the head it
+	// last reported, so each is logged once.
+	log     *slog.Logger
+	stuckID string
 	// The head last carried and when, so a wake arriving right after a
 	// publish — the initial timer and a Notify for the same entry — does not
 	// put the same bytes on the wire twice within one retry interval. The
@@ -87,6 +92,13 @@ func NewReturnPublisher(
 		sink: sink, signingClock: signingClock, publish: publish, envelopeSecret: envelopeSecret,
 		verifier: verifier, now: now, retry: retry, wake: make(chan struct{}, 1), after: time.After,
 	}, nil
+}
+
+// SetLogger sets where the publisher reports a head it can never carry.
+func (p *ReturnPublisher) SetLogger(log *slog.Logger) {
+	p.mu.Lock()
+	p.log = log
+	p.mu.Unlock()
 }
 
 // Notify wakes the loop to carry the head, as when a return is queued or the
@@ -160,6 +172,7 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	}
 	payload, err := encodeInbound(deviceID, kind, queued.Payload, signedAt, p.envelopeSecret)
 	if err != nil {
+		p.reportStuck(queued, kind, err)
 		return err
 	}
 	topic, err := contracts.EvidenceInboundTopic(deviceID)
@@ -173,6 +186,27 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	p.lastID, p.lastAt = queued.ID, p.now()
 	p.mu.Unlock()
 	return nil
+}
+
+// reportStuck logs, once per head, a staged artifact that can never be
+// encoded as an inbound message: one staged before staging applied the
+// member rule or the inbound maximum. The return queue has one head for the
+// site, so it blocks every device's returns until an operator removes it.
+func (p *ReturnPublisher) reportStuck(queued QueuedArtifact, kind AuthorityArtifactType, err error) {
+	if !errors.Is(err, errInboundRefusedByMemberRule) && !errors.Is(err, errInboundOverMaximum) &&
+		!errors.Is(err, errQueuedArtifactNotCanonical) {
+		return
+	}
+	p.mu.Lock()
+	log, first := p.log, p.stuckID != queued.ID
+	p.stuckID = queued.ID
+	p.mu.Unlock()
+	if log == nil || !first {
+		return
+	}
+	log.Error("evidence return queue head can never be carried to the runtime; it blocks every return until removed",
+		"artifact_type", string(kind), "artifact_digest", payloadDigest(queued.Payload), "queue_record", queued.ID,
+		"reason", err.Error())
 }
 
 // encodeInbound signs an inbound evidence message and encodes the whole
@@ -198,7 +232,28 @@ func encodeInbound(deviceID string, kind AuthorityArtifactType, artifact []byte,
 	if len(payload) > contracts.PayloadMaxima[contracts.FamilyEvidenceInbound] {
 		return nil, errInboundOverMaximum
 	}
+	// A producer never emits a payload the member rule refuses; an artifact
+	// staged before staging applied the rule is held back here.
+	if err := contracts.AdmitPayload(contracts.FamilyEvidenceInbound, payload); err != nil {
+		return nil, errInboundRefusedByMemberRule
+	}
 	return payload, nil
+}
+
+// inboundMemberRefusal judges an authority artifact as the Payload Member
+// Rule judges the inbound message that would carry it: the artifact exactly as
+// received, inside an envelope of the inbound topic's members, so the depth
+// and members the envelope adds count. The routing values are placeholders of
+// the right type; the rule judges names and structure, not values. It returns
+// the *contracts.MemberRuleError, or nil.
+func inboundMemberRefusal(artifact AuthorityArtifact) error {
+	payload := make([]byte, 0, len(artifact.Payload)+256)
+	payload = append(payload, `{"device_id":"","artifact_type":"`...)
+	payload = append(payload, string(artifact.Type)...)
+	payload = append(payload, `","artifact":`...)
+	payload = append(payload, artifact.Payload...)
+	payload = append(payload, `,"auth":{"scheme":"hmac-sha256","signed_at_ms":1,"signature":"hmac-sha256:"}}`...)
+	return contracts.AdmitPayload(contracts.FamilyEvidenceInbound, payload)
 }
 
 func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {

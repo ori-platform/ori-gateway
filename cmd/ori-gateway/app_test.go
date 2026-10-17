@@ -1707,8 +1707,8 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 		if b == nil {
 			t.Fatal("runtime client broker is nil")
 		}
-		if len(opts) != 2 {
-			t.Fatalf("expected auth and encryption options, got %d", len(opts))
+		if len(opts) != 3 {
+			t.Fatalf("expected auth, encryption and logger options, got %d", len(opts))
 		}
 		return runtimeclient.NewMQTTClient(b, opts...)
 	}

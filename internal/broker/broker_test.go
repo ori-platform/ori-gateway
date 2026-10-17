@@ -117,7 +117,7 @@ func TestConnectAndPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []byte("hello-gateway")
+	want := []byte(`{"hello":"gateway"}`)
 	if err := pub.Publish(ctx, topic, QoSReasoning, false, want); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 		t.Fatal(err)
 	}
 	defer pub.Disconnect(ctx)
-	if err := pub.Publish(ctx, "ori/device-a/evidence/inbound/ack", QoSReasoning, false, []byte("authority-artifact")); err != nil {
+	if err := pub.Publish(ctx, "ori/device-a/evidence/inbound/ack", QoSReasoning, false, []byte(`{"artifact":"authority"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := sub.Connect(ctx); err != nil {
@@ -163,7 +163,7 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 	defer sub.Disconnect(ctx)
 	select {
 	case got := <-received:
-		if string(got) != "authority-artifact" {
+		if string(got) != `{"artifact":"authority"}` {
 			t.Fatalf("queued payload = %q", got)
 		}
 	case <-time.After(5 * time.Second):
@@ -187,7 +187,7 @@ func TestSubscribeReceives(t *testing.T) {
 		if topic != "ori/device-a/runtime/heartbeat" {
 			t.Errorf("unexpected topic %q", topic)
 		}
-		if string(payload) != "ok" {
+		if string(payload) != `{"ok":true}` {
 			t.Errorf("unexpected payload %q", payload)
 		}
 		count.Add(1)
@@ -195,7 +195,7 @@ func TestSubscribeReceives(t *testing.T) {
 	if err := c.Subscribe(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, handler); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Publish(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, false, []byte("ok")); err != nil {
+	if err := c.Publish(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, false, []byte(`{"ok":true}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,11 +298,11 @@ func TestHandlerPanicDoesNotBreakClient(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Publish(ctx, topic, QoSReasoning, false, []byte("1")); err != nil {
+	if err := c.Publish(ctx, topic, QoSReasoning, false, []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if err := c.Publish(ctx, topic, QoSReasoning, false, []byte("2")); err != nil {
+	if err := c.Publish(ctx, topic, QoSReasoning, false, []byte(`{"n":2}`)); err != nil {
 		t.Fatalf("publish after handler panic failed: %v", err)
 	}
 }
@@ -512,7 +512,7 @@ func TestConcurrentSubscribePublish(t *testing.T) {
 	}
 
 	wg.Add(1)
-	if err := c.Publish(ctx, topic, QoSReasoning, false, []byte("x")); err != nil {
+	if err := c.Publish(ctx, topic, QoSReasoning, false, []byte(`{"x":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})

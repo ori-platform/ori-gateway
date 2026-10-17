@@ -270,14 +270,18 @@ func (c *Client) IsConnected() bool {
 
 func (c *Client) wrapHandler(sub subscription) mqtt.MessageHandler {
 	return func(_ mqtt.Client, msg mqtt.Message) {
-		// Size, then rate, before anything else: a refused payload is never
-		// parsed, routed or answered, and is recorded by family and size class
-		// only (gateway-api/v2 Payload Size and Payload Volume).
-		if !sub.gate.admit(msg.Topic(), len(msg.Payload())) {
+		// Size, then rate, then the member rule, before anything else: a
+		// refused payload is never routed, verified or answered, and is
+		// recorded by family and size class or reason only (gateway-api/v2
+		// Payload Size, Payload Volume and Payload Member Rule).
+		if !sub.gate.admitVolume(msg.Topic(), len(msg.Payload())) {
 			return
 		}
 		if msg.Retained() {
 			c.log.Warn("mqtt retained message rejected", "topic", msg.Topic())
+			return
+		}
+		if !sub.gate.admitMembers(msg.Payload()) {
 			return
 		}
 		defer func() {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/evidence/faults"
 	"github.com/ori-platform/ori-gateway/internal/evidence/refusal"
 	"log/slog"
@@ -603,6 +604,10 @@ func (l *deliveryLane) deliverHead(ctx context.Context) (bool, error) {
 	}
 	for _, artifact := range routed {
 		if err := sink.Store(ctx, artifact); err != nil {
+			if refused, ok := errors.AsType[*contracts.MemberRuleError](err); ok {
+				l.w.log.Warn("evidence authority artifact refused under the payload member rule",
+					"artifact_type", string(artifact.Type), "reason", refused.Reason)
+			}
 			// An acceptance whose returned artifacts are not durably staged
 			// is not an acceptance yet: the head stays and backs off, and the
 			// outcome is recorded unrecognised.
