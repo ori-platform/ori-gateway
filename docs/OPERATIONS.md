@@ -567,9 +567,9 @@ budgets, so a broker client that can publish under any device ID can make the
 gateway parse at most the sum of one set per configured device plus that one,
 before any of it is authenticated; per-device broker ACLs keep each device to
 its own topics. The runtime never resends an export page, so an export page
-dropped as volume leaves that export waiting until the caller's own deadline
-ends it; the export budgets are sized so the runtime's four concurrent pages
-at the maximum fit.
+dropped as volume leaves that request unanswered until its wait bound ends it;
+the export budgets are sized so the runtime's four concurrent pages at the
+maximum fit.
 
 A rate is kept for each device in `gateway.device_ids`. Messages on the
 reasoning and evidence topics that name any other device ID share one rate, so
@@ -612,3 +612,26 @@ gateway started, one member for each family above. Abbreviated to one family:
 A non-zero count does not degrade the gateway. A count that keeps rising names
 a runtime that is misconfigured or misbehaving; find it from the broker's own
 logs, since the gateway never records which device sent a refused message.
+
+## Runtime exports time out or are not verified
+
+The gateway reads runtime data (site posture, weekly reports) through export
+requests over MQTT. Each request waits at most 30 seconds, from publishing it,
+for a response it can verify, and one export reads at most 100 pages.
+
+- `WARN runtime export request timed out; no verified response arrived`, with
+  the `device_id`, `export_type` and `request_id` (or `runtime export response
+  subscription timed out`, when the broker did not confirm the subscription in
+  time): no verified answer came in time. The runtime may be stopped or unreachable, or, with
+  `gateway.auth.enabled`, the gateway and runtime may disagree on the shared
+  secret or their clocks may be further apart than the allowed skew: the
+  runtime then either leaves the request unanswered or answers in a way the
+  gateway cannot verify, so a timeout is the only local sign of either. Check the runtime is running, both sides' secret, and both
+  clocks. The request is released; the next posture refresh or report sends a
+  new one.
+- `WARN runtime export response not verified; dropped`, with the `device_id`
+  and `export_type`: a response arrived on the request's topic that did not
+  verify. The request keeps waiting for a verified one. Repeated lines while
+  exports still complete point to another client publishing on runtime topics;
+  check the broker's ACLs.
+

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ const (
 	exportTypeTierCDecisionLog = "tier_c_decision_log"
 	exportTypeReasoningLog     = "reasoning_log"
 	maxExportPages             = 100
+	// defaultExportWait bounds each export request: from publishing it until
+	// a verified response arrives (gateway-api/v2 Export Auth Envelope). With
+	// maxExportPages it bounds an export as a whole.
+	defaultExportWait = 30 * time.Second
 )
 
 type mqttBroker interface {
@@ -41,6 +46,7 @@ type requestIDFunc func() (string, error)
 // MQTTClient implements Client over runtime MQTT export request/response topics.
 type MQTTClient struct {
 	log                 *slog.Logger
+	exportWait          time.Duration
 	broker              mqttBroker
 	qos                 byte
 	requestID           requestIDFunc
@@ -91,7 +97,20 @@ func WithMessageAuth(sharedSecret string, previousSharedSecret string, now func(
 	}
 }
 
-// WithMessageEncryption enables AES-GCM decryption for sensitive runtime export responses.
+// ErrExportTimeout ends an export request no verified response answered
+// within the wait bound.
+var ErrExportTimeout = errors.New("runtimeclient: export request timed out")
+
+// WithExportWait sets the bound on each export request's wait. It is intended
+// for tests; production uses defaultExportWait.
+func WithExportWait(wait time.Duration) MQTTClientOption {
+	return func(c *MQTTClient) {
+		if wait > 0 {
+			c.exportWait = wait
+		}
+	}
+}
+
 // WithLogger sets where the client records a response it refuses.
 func WithLogger(log *slog.Logger) MQTTClientOption {
 	return func(c *MQTTClient) {
@@ -101,6 +120,7 @@ func WithLogger(log *slog.Logger) MQTTClientOption {
 	}
 }
 
+// WithMessageEncryption enables AES-GCM decryption for sensitive runtime export responses.
 func WithMessageEncryption(sharedSecret string) MQTTClientOption {
 	return func(c *MQTTClient) {
 		c.encryptionRequested = true
@@ -123,6 +143,7 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 		qos:        broker.QoSReasoning,
 		requestID:  randomRequestID,
 		log:        slog.Default(),
+		exportWait: defaultExportWait,
 		now:        time.Now,
 		pending:    make(map[string]pendingExport),
 		subscribed: make(map[string]bool),
@@ -283,7 +304,18 @@ func reasoningLogParams(req ReasoningLogRequest) map[string]any {
 }
 
 func (c *MQTTClient) exportAll(ctx context.Context, base exportRequest) ([]map[string]any, error) {
-	if err := c.ensureResponseSubscription(ctx, base.DeviceID); err != nil {
+	// Subscribing is bounded like a request, so a stalled broker never holds
+	// the caller.
+	subscribeCtx, cancel := context.WithTimeoutCause(ctx, c.exportWait, ErrExportTimeout)
+	err := c.ensureResponseSubscription(subscribeCtx, base.DeviceID)
+	expired := errors.Is(context.Cause(subscribeCtx), ErrExportTimeout)
+	cancel()
+	if err != nil {
+		if expired {
+			c.log.Warn("runtime export response subscription timed out",
+				"device_id", base.DeviceID, "export_type", base.ExportType, "wait", c.exportWait)
+			return nil, fmt.Errorf("%w: subscribing for %s after %s", ErrExportTimeout, base.ExportType, c.exportWait)
+		}
 		return nil, err
 	}
 
@@ -378,13 +410,31 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	if err != nil {
 		return exportResponse{}, err
 	}
-	if err := c.broker.Publish(ctx, topic, c.qos, false, payload); err != nil {
+	// The wait is bounded from publishing the request, the publish included,
+	// and nothing received extends it. On expiry the request ends as failed,
+	// is logged, and its pending state is released by the deferred removal; a
+	// later attempt is a new request, newly signed (gateway-api/v2 Export
+	// Auth Envelope).
+	waitCtx, cancel := context.WithTimeoutCause(ctx, c.exportWait, ErrExportTimeout)
+	defer cancel()
+	timedOut := func() (exportResponse, error) {
+		if !errors.Is(context.Cause(waitCtx), ErrExportTimeout) {
+			return exportResponse{}, ctx.Err()
+		}
+		c.log.Warn("runtime export request timed out; no verified response arrived",
+			"device_id", req.DeviceID, "export_type", req.ExportType, "request_id", requestID, "wait", c.exportWait)
+		return exportResponse{}, fmt.Errorf("%w: %s after %s", ErrExportTimeout, req.ExportType, c.exportWait)
+	}
+	if err := c.broker.Publish(waitCtx, topic, c.qos, false, payload); err != nil {
+		if waitCtx.Err() != nil {
+			return timedOut()
+		}
 		return exportResponse{}, fmt.Errorf("runtimeclient: publish export request: %w", err)
 	}
 
 	select {
-	case <-ctx.Done():
-		return exportResponse{}, ctx.Err()
+	case <-waitCtx.Done():
+		return timedOut()
 	case result := <-responseCh:
 		if result.err != nil {
 			return exportResponse{}, result.err
@@ -403,20 +453,27 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	}
 }
 
-func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
-	raw, requestID, err := decodePayloadMap(payload)
-	if err != nil || requestID == "" {
+func (c *MQTTClient) handleResponseMessage(topic string, payload []byte) {
+	// A response is correlated by its topic, which names the device and the
+	// request it answers, and is then verified under that request's device_id
+	// and request_id: one signed for another device or request is not
+	// verified (gateway-api/v2 Export Auth Envelope).
+	deviceID, requestID, ok := exportResponseTopicRouting(topic)
+	if !ok {
 		return
 	}
-
 	c.mu.Lock()
 	pending := c.pending[requestID]
 	c.mu.Unlock()
-	if pending.ch == nil {
+	if pending.ch == nil || pending.req.DeviceID != deviceID {
 		return
 	}
 
 	if c.verifier == nil {
+		raw, _, err := decodePayloadMap(payload)
+		if err != nil {
+			return
+		}
 		resp, err := c.decodeResponsePayload(raw, pending.req)
 		if !c.refusedByMemberRule(err) {
 			c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err})
@@ -428,7 +485,7 @@ func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
 	// request: a response whose request is gone, even one cancelled while it
 	// was being verified, adds no state (gateway-api/v2 Payload Volume).
 	decided := false
-	err = c.verifier.VerifyJSONThenDecide(payload, contracts.ExportResponseMessageType, pending.req.DeviceID, pending.req.RequestID,
+	err := c.verifier.VerifyJSONThenDecide(payload, contracts.ExportResponseMessageType, pending.req.DeviceID, pending.req.RequestID,
 		func(verified map[string]any) (bool, error) {
 			decided = true
 			resp, err := c.decodeResponsePayload(verified, pending.req)
@@ -439,8 +496,12 @@ func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
 			}
 			return c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err}), nil
 		})
+	// A response that is not verified is dropped and logged, and the request
+	// keeps waiting: a broker client cannot end an exchange by publishing on
+	// its response topic (gateway-api/v2 Export Auth Envelope).
 	if err != nil && !decided {
-		c.deliver(requestID, pending.ch, exportResult{err: fmt.Errorf("runtimeclient: verify export response: %w", err)})
+		c.log.Warn("runtime export response not verified; dropped",
+			"device_id", pending.req.DeviceID, "export_type", pending.req.ExportType)
 	}
 }
 
@@ -517,6 +578,17 @@ func (c *MQTTClient) decodeResponsePayload(decoded map[string]any, req exportReq
 		return exportResponse{}, err
 	}
 	return resp, nil
+}
+
+// exportResponseTopicRouting reads the device and request an export response
+// topic names: ori/{device_id}/export/response/{request_id}.
+func exportResponseTopicRouting(topic string) (deviceID, requestID string, ok bool) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 5 || parts[0] != "ori" || parts[2] != "export" || parts[3] != "response" ||
+		parts[1] == "" || parts[4] == "" {
+		return "", "", false
+	}
+	return parts[1], parts[4], true
 }
 
 func decodePayloadMap(payload []byte) (map[string]any, string, error) {

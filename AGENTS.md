@@ -454,6 +454,26 @@ Verified by `TestDefinedMembersMatchTheCorpus`,
 `TestAnInboundMessageTheMemberRuleRefusesIsNeverPublished` and
 `TestARefusedCoveringReceiptLeavesTheAcceptanceUnrecognised`.
 
+23. `GW-23` An export exchange ends only on a verified response or its bound.
+With `gateway.auth.enabled`, `runtimeclient.MQTTClient` verifies an export
+response under the device_id and request_id of the request waiting for it,
+correlated by the response topic, before delivering anything. A response that
+is not verified is dropped and logged, records no replay key, and leaves the
+request waiting, so no broker client can end an exchange by publishing on its
+response topic. Every export request's wait is bounded inside the client, in
+both auth modes: from publishing the request, the publish included, with
+subscribing bounded the same way, and no message received extends it. On
+expiry the request fails with `ErrExportTimeout`, is logged, and releases its
+pending state; a later attempt is a new, newly signed request. The page count
+of one export is bounded, so no caller waits on an export without a bound
+(gateway-api/v2 Export Auth Envelope). Verified by
+`TestAForgedExportResponseLeavesTheExchangePending`,
+`TestASilentRuntimeEndsTheExportAtItsBound`,
+`TestAStalledSubscribeOrPublishEndsAtTheBound`,
+`TestRepeatedForgeriesNeverExtendTheBound`,
+`TestAResponseOnAnotherDevicesTopicNeverAnswers` and
+`TestAnExportRequestsABoundedNumberOfPages`.
+
 ## Layout
 
 ```text
