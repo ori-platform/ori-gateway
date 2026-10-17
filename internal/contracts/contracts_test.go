@@ -147,7 +147,7 @@ func TestTopicHelpersRejectInvalidDeviceIDs(t *testing.T) {
 		}
 	}
 
-	invalidRequestIDs := []string{"req/1", "req 1", "req	1", "req.1"}
+	invalidRequestIDs := []string{"req/1", "req 1", "req	1", "req+1", "", strings.Repeat("a", 129)}
 	for _, requestID := range invalidRequestIDs {
 		if topic, err := ExportResponseTopic("site-a", requestID); err == nil {
 			t.Fatalf("ExportResponseTopic returned %q, expected invalid request_id error", topic)

@@ -124,6 +124,12 @@ func (h *Handler) HandleRequest(ctx context.Context, topic string, payload []byt
 		}
 	}
 	req.Auth = nil
+	// An error response echoes the correlation members, so it is sent only
+	// when they hold their contract form and the reply fits the Payload Size
+	// floor; any other request is refused unanswered.
+	if !contracts.ValidRoutingID(req.RequestID) || !contracts.ValidRoutingID(req.ProposalID) {
+		return fmt.Errorf("enrichment: request_id or proposal_id outside its contract form")
+	}
 	if err := contracts.ValidateTierCEnrichmentRequest(req); err != nil {
 		return h.publishError(req, validationErrorMessage(err))
 	}
@@ -165,6 +171,33 @@ func (h *Handler) publishResponse(req contracts.TierCEnrichmentRequest, resp con
 	if err != nil {
 		return fmt.Errorf("enrichment: response topic: %w", err)
 	}
+	payload, err := h.encodeResponse(req, resp)
+	if err != nil {
+		return err
+	}
+	if len(payload) > contracts.PayloadMaxima[contracts.FamilyEnrichmentResponse] {
+		// A response over its topic's maximum is never published; the family's
+		// error response goes in its place (gateway-api/v2 Payload Size).
+		payload, err = h.encodeResponse(req, contracts.NewTierCEnrichmentErrorResponse(req.RequestID, req.ProposalID, req.DeviceID, contracts.ErrorResponseTooLarge))
+		if err != nil {
+			return err
+		}
+	}
+	publishCtx, cancel := context.WithTimeout(context.Background(), h.publishTimeout)
+	defer cancel()
+	if err := h.publisher.Publish(publishCtx, topic, broker.QoSReasoning, false, payload); err != nil {
+		return fmt.Errorf("enrichment: publish response: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) encodeResponse(req contracts.TierCEnrichmentRequest, resp contracts.TierCEnrichmentResponse) ([]byte, error) {
+	// Every response carrying an error, whoever built it, goes out as the
+	// family's error response: a bounded error and no other free-form content
+	// (gateway-api/v2 Payload Size).
+	if resp.Error != nil {
+		resp = contracts.NewTierCEnrichmentErrorResponse(req.RequestID, req.ProposalID, req.DeviceID, *resp.Error)
+	}
 	resp.Auth = nil
 	if h.signingSecret != "" {
 		auth, err := mqttauth.Sign(
@@ -176,20 +209,15 @@ func (h *Handler) publishResponse(req contracts.TierCEnrichmentRequest, resp con
 			h.signingSecret,
 		)
 		if err != nil {
-			return fmt.Errorf("enrichment: sign response: %w", err)
+			return nil, fmt.Errorf("enrichment: sign response: %w", err)
 		}
 		resp.Auth = &auth
 	}
 	payload, err := json.Marshal(resp)
 	if err != nil {
-		return fmt.Errorf("enrichment: encode response: %w", err)
+		return nil, fmt.Errorf("enrichment: encode response: %w", err)
 	}
-	publishCtx, cancel := context.WithTimeout(context.Background(), h.publishTimeout)
-	defer cancel()
-	if err := h.publisher.Publish(publishCtx, topic, broker.QoSReasoning, false, payload); err != nil {
-		return fmt.Errorf("enrichment: publish response: %w", err)
-	}
-	return nil
+	return payload, nil
 }
 
 func validationErrorMessage(error) string {

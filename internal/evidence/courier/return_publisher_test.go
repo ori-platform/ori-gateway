@@ -62,7 +62,7 @@ func TestReturnPublisherRetiresOnlyAfterAuthenticatedRuntimeDecision(t *testing.
 	); err != nil {
 		t.Fatalf("published authority envelope did not verify: %v", err)
 	}
-	digest := sha256.Sum256(artifact)
+	digest := sha256.Sum256(canonicalBytes(t, artifact))
 	ack := inboundAck{
 		DeviceID: "site-a-edge-01", ArtifactType: "delivery_receipt",
 		ArtifactDigest: "sha256:" + hex.EncodeToString(digest[:]),
@@ -106,7 +106,7 @@ func TestReceiverStateRefusalDoesNotRetireOrShortLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(artifact)
+	digest := sha256.Sum256(canonicalBytes(t, artifact))
 	ack := inboundAck{
 		DeviceID: "site-a-edge-01", ArtifactType: "epoch_confirmation",
 		ArtifactDigest: "sha256:" + hex.EncodeToString(digest[:]),
@@ -152,7 +152,7 @@ func TestMalformedRuntimeDecisionCannotRetireOrBlockAuthorityArtifact(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(artifact)
+	digest := sha256.Sum256(canonicalBytes(t, artifact))
 	ack := inboundAck{DeviceID: "site-a-edge-01", ArtifactType: "delivery_receipt", ArtifactDigest: "sha256:" + hex.EncodeToString(digest[:]), Outcome: "ignored", Reason: "", AcknowledgedAtMS: now.UnixMilli()}
 	auth, err := mqttauth.Sign(ack, contracts.EvidenceInboundAckMessageType, ack.DeviceID, "", now.UnixMilli(), "runtime-gateway-envelope-secret")
 	if err != nil {
@@ -300,7 +300,7 @@ func TestAnAmbiguousRuntimeDecisionRetiresNothing(t *testing.T) {
 	if err := publisher.publishHead(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(artifact)
+	digest := sha256.Sum256(canonicalBytes(t, artifact))
 	decision := map[string]any{
 		"device_id": "site-a-edge-01", "artifact_type": "delivery_receipt",
 		"artifact_digest": "sha256:" + hex.EncodeToString(digest[:]),
@@ -352,7 +352,7 @@ func TestADecisionWithAnAmbiguousAuthenticatorRetiresNothing(t *testing.T) {
 	if err := publisher.publishHead(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(artifact)
+	digest := sha256.Sum256(canonicalBytes(t, artifact))
 	ack := inboundAck{
 		DeviceID: "site-a-edge-01", ArtifactType: "delivery_receipt",
 		ArtifactDigest: "sha256:" + hex.EncodeToString(digest[:]),

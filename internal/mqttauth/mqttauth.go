@@ -100,6 +100,25 @@ func Sign(value any, messageType string, deviceID string, requestID string, sign
 
 // VerifyJSON verifies a signed JSON payload and returns the unsigned payload map.
 func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDeviceID string, expectedRequestID string) (map[string]any, error) {
+	return v.verifyJSON(payload, messageType, expectedDeviceID, expectedRequestID, nil)
+}
+
+// VerifyJSONThenDecide verifies a signed JSON payload, then calls decide with
+// the unsigned payload while holding the replay cache. The payload's replay
+// key is recorded only when decide reports that the payload answered
+// something the receiver holds (applied), so a message that answers nothing
+// adds no state (gateway-api/v2 Payload Volume), while a replay of one that
+// did is still refused. decide's error is returned either way. decide runs
+// under the verifier's lock and must not call this verifier.
+func (v *Verifier) VerifyJSONThenDecide(payload []byte, messageType string, expectedDeviceID string, expectedRequestID string, decide func(unsigned map[string]any) (applied bool, err error)) error {
+	if decide == nil {
+		return fmt.Errorf("mqtt auth decide must not be nil")
+	}
+	_, err := v.verifyJSON(payload, messageType, expectedDeviceID, expectedRequestID, decide)
+	return err
+}
+
+func (v *Verifier) verifyJSON(payload []byte, messageType string, expectedDeviceID string, expectedRequestID string, decide func(map[string]any) (bool, error)) (map[string]any, error) {
 	if v == nil {
 		return nil, fmt.Errorf("mqtt auth verifier is nil")
 	}
@@ -151,7 +170,7 @@ func (v *Verifier) VerifyJSON(payload []byte, messageType string, expectedDevice
 	if !v.signatureMatches(auth.Signature, messageType, expectedDeviceID, expectedRequestID, auth.SignedAtMS, canonical) {
 		return nil, fmt.Errorf("mqtt auth signature mismatch")
 	}
-	if err := v.checkFreshAndRecord(messageType, expectedDeviceID, expectedRequestID, auth); err != nil {
+	if err := v.checkFreshAndRecord(messageType, expectedDeviceID, expectedRequestID, auth, unsigned, decide); err != nil {
 		return nil, err
 	}
 	return unsigned, nil
@@ -229,6 +248,14 @@ func cloneWithoutAuth(payload map[string]any) map[string]any {
 	return unsigned
 }
 
+// ReplayEntries reports how many replay keys the verifier holds, expired
+// ones included until the next verification purges them.
+func (v *Verifier) ReplayEntries() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.seenKeys)
+}
+
 func replayKey(messageType string, deviceID string, requestID string, signedAtMS int64, signature string) string {
 	parts := []string{messageType, deviceID, requestID, fmt.Sprintf("%d", signedAtMS), signature}
 	var b strings.Builder
@@ -240,7 +267,11 @@ func replayKey(messageType string, deviceID string, requestID string, signedAtMS
 	return b.String()
 }
 
-func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requestID string, auth contracts.HeartbeatAuth) error {
+// checkFreshAndRecord refuses a stale or replayed payload and records its
+// replay key: always without decide, and with decide only when decide applied
+// it. decide runs under the replay lock, so two copies of one payload cannot
+// both be applied.
+func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requestID string, auth contracts.HeartbeatAuth, unsigned map[string]any, decide func(map[string]any) (bool, error)) error {
 	now := v.now()
 	signedAt := time.UnixMilli(auth.SignedAtMS)
 	if signedAt.After(now.Add(v.maxSkew)) || signedAt.Before(now.Add(-v.maxSkew)) {
@@ -258,8 +289,15 @@ func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requ
 	if expiresAt, ok := v.seenKeys[key]; ok && expiresAt.After(now) {
 		return fmt.Errorf("mqtt auth replay detected")
 	}
-	v.seenKeys[key] = now.Add(v.replayTTL)
-	return nil
+	if decide == nil {
+		v.seenKeys[key] = now.Add(v.replayTTL)
+		return nil
+	}
+	applied, err := decide(unsigned)
+	if applied {
+		v.seenKeys[key] = now.Add(v.replayTTL)
+	}
+	return err
 }
 
 // maxAmbiguityDepth bounds the nesting refuseAmbiguousMembers walks, the same

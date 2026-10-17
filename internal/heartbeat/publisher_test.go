@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	mqttsrv "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
@@ -91,23 +92,18 @@ func TestHeartbeatPublishes(t *testing.T) {
 
 	ctx := t.Context()
 
-	client, err := broker.New(broker.Options{
-		BrokerURL: brokerURL,
-		ClientID:  "heartbeat-sub",
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
-	if err != nil {
-		t.Fatal(err)
+	// A runtime receives the gateway heartbeat; the gateway's own client never
+	// subscribes to it, so the receiver here is a plain MQTT client.
+	client := mqtt.NewClient(mqtt.NewClientOptions().AddBroker(brokerURL).SetClientID("heartbeat-sub"))
+	if token := client.Connect(); !token.WaitTimeout(5*time.Second) || token.Error() != nil {
+		t.Fatalf("connect heartbeat subscriber: %v", token.Error())
 	}
-	if err := client.Connect(ctx); err != nil {
-		t.Fatal(err)
-	}
-	defer client.Disconnect(ctx)
+	defer client.Disconnect(100)
 
 	received := make(chan contracts.Heartbeat, 1)
-	if err := client.Subscribe(ctx, contracts.GatewayHealthTopic, broker.QoSHeartbeat, func(_ string, payload []byte) {
+	token := client.Subscribe(contracts.GatewayHealthTopic, broker.QoSHeartbeat, func(_ mqtt.Client, msg mqtt.Message) {
 		var beat contracts.Heartbeat
-		if err := json.Unmarshal(payload, &beat); err != nil {
+		if err := json.Unmarshal(msg.Payload(), &beat); err != nil {
 			t.Errorf("unmarshal heartbeat: %v", err)
 			return
 		}
@@ -115,8 +111,9 @@ func TestHeartbeatPublishes(t *testing.T) {
 		case received <- beat:
 		default:
 		}
-	}); err != nil {
-		t.Fatal(err)
+	})
+	if !token.WaitTimeout(5*time.Second) || token.Error() != nil {
+		t.Fatalf("subscribe heartbeat: %v", token.Error())
 	}
 
 	pubClient, err := broker.New(broker.Options{

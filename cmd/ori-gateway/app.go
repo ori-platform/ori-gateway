@@ -267,10 +267,15 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
+	// One count of size and volume refusals for every broker client, projected
+	// as the site's mqtt_ingress posture.
+	ingress := broker.NewIngressStats(deps.logger)
 	client, err := deps.newBroker(broker.Options{
 		BrokerURL: cfg.Gateway.BrokerURL,
 		ClientID:  defaultClientID,
 		Logger:    deps.logger,
+		Ingress:   ingress,
+		Devices:   cfg.Gateway.DeviceIDs,
 	})
 	if err != nil {
 		return fmt.Errorf("construct broker: %w", err)
@@ -288,7 +293,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if cfg.Evidence.Enabled {
 		evidenceBroker, err = deps.newBroker(broker.Options{
 			BrokerURL: cfg.Gateway.BrokerURL, ClientID: defaultEvidenceClientID,
-			Logger: deps.logger, PersistentSession: true,
+			Logger: deps.logger, PersistentSession: true, Ingress: ingress,
+			Devices: cfg.Gateway.DeviceIDs,
 		})
 		if err != nil {
 			return fmt.Errorf("construct evidence broker: %w", err)
@@ -662,6 +668,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				WebhookBridgeEnabled: cfg.WebhookBridge.Enabled,
 				WebhookBridgeReady:   webhookBridgeReady.Load(),
 				EvidenceDelivery:     evidenceDelivery,
+				MQTTIngress:          mqttIngressView(ingress),
 			}
 		}
 		runners.start("site health server", site.NewHealthHandler(
@@ -1174,4 +1181,15 @@ func logInboundAckResult(logger *slog.Logger, err error) {
 	case err != nil:
 		logger.Warn("evidence inbound acknowledgement refused", "error", err)
 	}
+}
+
+// mqttIngressView projects the refusal counts by family; Project completes
+// the family set.
+func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCount {
+	counts := ingress.Snapshot()
+	view := make(map[string]site.MQTTIngressCount, len(counts))
+	for family, count := range counts {
+		view[family] = site.MQTTIngressCount{PayloadTooLarge: count.PayloadTooLarge, VolumeDropped: count.VolumeDropped}
+	}
+	return view
 }

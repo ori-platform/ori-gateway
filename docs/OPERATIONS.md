@@ -198,6 +198,17 @@ carries one with the wrong JSON type, such as a null `reason`, is not a
 decision: the
 artifact is carried again on the retry interval in a newly signed envelope.
 
+The gateway publishes each returned artifact in its canonical JSON form, and
+the runtime's acknowledgement names it by the SHA-256 of those canonical bytes.
+The gateway stages no authority artifact whose canonical form is over 1,048,576
+bytes, the most the inbound topic can carry. Today the evidence channel already
+refuses any authority response over 1,048,576 bytes before reading it, so such
+an artifact cannot arrive; the staging bound stands behind that. Either way the
+attempt is an unrecognised outcome: the outbound entry stays queued and backs
+off, artifacts staged before the refusal stay staged, and
+`gateway.evidence_delivery` reads degraded. The device's other lane and every
+other device keep delivering.
+
 The return queue has one head for the whole site, so while an artifact is
 kept every other runtime's returns wait behind it, custody acknowledgements
 included. If the runtime it is for has stopped handing off, for example while
@@ -521,3 +532,50 @@ It ends in one of three ways:
   unobserved and `degraded`. Before restarting a gateway for any other reason,
   read `GET /health` or the log for a silent `critical` node and resolve it
   first.
+
+## MQTT payloads refused for size or volume
+
+The gateway refuses a runtime's MQTT payload that is longer than its topic's
+maximum in gateway-api/v2 Payload Size before reading any of it, and drops
+messages beyond its own rate for each subscription (Payload Volume). A refused
+payload is not answered and changes nothing: no reasoning reply, no evidence
+custody or acknowledgement, no heartbeat in the site view. The runtime that
+sent an outbound evidence carriage keeps its bytes and carries it again.
+
+| Topic family | Maximum (bytes) | Rate |
+| --- | --- | --- |
+| `ori/{device_id}/runtime/heartbeat` | 65,536 | 1 a second, bursts of 5, per device |
+| `ori/{device_id}/reasoning/request` | 262,144 | 10 a second, bursts of 20, per device |
+| `ori/{device_id}/tier_c/enrichment/request` | 262,144 | 2 a second, bursts of 10, per device |
+| `ori/{device_id}/export/response/{request_id}` | 4,194,304 | 20 a second, bursts of 64, per device |
+| `ori/{device_id}/evidence/outbound` | 1,572,864 | 20 a second, bursts of 160, per device |
+| `ori/{device_id}/evidence/inbound/ack` | 16,384 | 20 a second, bursts of 64, per device |
+
+A rate is kept for each device in `gateway.device_ids`. Messages on the
+reasoning and evidence topics that name any other device ID share one rate, so
+a sender inventing device IDs cannot grow the gateway's memory or starve a
+configured device. A sender that publishes under a configured device's own ID
+draws on that device's rate; per-device broker ACLs are what stop that.
+Neither the maxima nor the rates have a setting. A broker's own message size
+limit should be at most 4,194,304 bytes, so it drops a larger message first.
+
+Each refusal is logged as `WARN`: `mqtt ingress refused payloads over their
+topic maximum`, with the `family`, the number `refused`, their `size_classes`
+(the least power of two not below each length) and the `maximum`, or `mqtt
+ingress dropped messages over the family rate`, with the `family` and the
+number `dropped`. A flood writes at most one line a second for each family and
+reason, counting every refusal since the last line. No line carries payload
+content, a device ID or a topic.
+
+With `site_health` enabled, `gateway.mqtt_ingress` counts both since the
+gateway started, one member for each family above. Abbreviated to one family:
+
+```json
+"mqtt_ingress": {
+  "ori/{device_id}/reasoning/request": {"payload_too_large": 1, "volume_dropped": 0}
+}
+```
+
+A non-zero count does not degrade the gateway. A count that keeps rising names
+a runtime that is misconfigured or misbehaving; find it from the broker's own
+logs, since the gateway never records which device sent a refused message.

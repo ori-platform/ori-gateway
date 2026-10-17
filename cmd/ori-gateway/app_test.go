@@ -118,6 +118,11 @@ func (b *fakeBroker) Subscribe(_ context.Context, topic string, qos byte, handle
 	if err := b.subscribeErrByTopic[topic]; err != nil {
 		return err
 	}
+	// The real client's rule: a topic with no payload maximum is never
+	// subscribed, so a subscription added without one fails every app test.
+	if err := broker.CheckSubscription(topic); err != nil {
+		return err
+	}
 	b.subscribeTopic = topic
 	b.subscribeQoS = qos
 	b.handler = handler
