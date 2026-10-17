@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/config"
@@ -33,6 +34,9 @@ type Options struct {
 	Getenv     func(string) string
 	HTTPClient *http.Client
 	Logger     *slog.Logger
+	// Refusals counts volume refusals for site health; nil gives the server
+	// its own.
+	Refusals *Refusals
 }
 
 type Server struct {
@@ -48,6 +52,9 @@ type Server struct {
 	logger           *slog.Logger
 	now              func() time.Time
 	nonce            func() (string, error)
+	limiter          *limiter
+	refusals         *Refusals
+	refusalLog       refusalLog
 }
 
 func New(cfg config.WebhookBridgeConfig, opts Options) (*Server, error) {
@@ -93,7 +100,20 @@ func New(cfg config.WebhookBridgeConfig, opts Options) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.SenderPerMinute <= 0 || cfg.SenderBurst <= 0 || cfg.GlobalPerMinute <= 0 || cfg.GlobalBurst <= 0 || cfg.MaxSenders <= 0 {
+		return nil, fmt.Errorf("webhook bridge rate limits must be positive")
+	}
+	limit, err := newLimiter(cfg.SenderPerMinute, cfg.SenderBurst, cfg.GlobalPerMinute, cfg.GlobalBurst, cfg.MaxSenders, now())
+	if err != nil {
+		return nil, fmt.Errorf("webhook bridge sender key: %w", err)
+	}
+	refusals := opts.Refusals
+	if refusals == nil {
+		refusals = NewRefusals()
+	}
 	return &Server{
+		limiter:          limit,
+		refusals:         refusals,
 		listenAddr:       cfg.ListenAddr,
 		path:             cfg.Path,
 		targetURL:        cfg.TargetURL,
@@ -166,6 +186,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	// Volume is cut after the source check and before anything is signed or
+	// forwarded. The sender is read only to key the limiter; the body goes on
+	// unchanged.
+	switch s.limiter.admit(senderOf(r.Header.Get("Content-Type"), body), s.now()) {
+	case refusedBySender:
+		s.refusals.sender.Add(1)
+		s.refusalLog.note(s.logger, s.now(), "sender")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	case refusedByGlobal:
+		s.refusals.global.Add(1)
+		s.refusalLog.note(s.logger, s.now(), "global")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	signedAtMS := s.now().UnixMilli()
 	nonce, err := s.nonce()
 	if err != nil {
@@ -202,6 +237,47 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// refusalLog writes at most one line a second for each limit, counting the
+// refusals since the last; refusals inside the interval are flushed when it
+// ends, so none goes unlogged. No line carries a sender, hash or body.
+type refusalLog struct {
+	mu       sync.Mutex
+	last     map[string]time.Time
+	pending  map[string]int
+	flushing map[string]bool
+}
+
+func (r *refusalLog) note(logger *slog.Logger, now time.Time, limit string) {
+	r.mu.Lock()
+	if r.last == nil {
+		r.last, r.pending, r.flushing = map[string]time.Time{}, map[string]int{}, map[string]bool{}
+	}
+	r.pending[limit]++
+	if wait := time.Second - now.Sub(r.last[limit]); wait > 0 {
+		if !r.flushing[limit] {
+			r.flushing[limit] = true
+			time.AfterFunc(wait, func() { r.flush(logger, limit) })
+		}
+		r.mu.Unlock()
+		return
+	}
+	count := r.pending[limit]
+	r.pending[limit], r.last[limit] = 0, now
+	r.mu.Unlock()
+	logger.Warn("webhook bridge refused requests over its rate", "limit", limit, "refused", count)
+}
+
+func (r *refusalLog) flush(logger *slog.Logger, limit string) {
+	r.mu.Lock()
+	count := r.pending[limit]
+	r.pending[limit], r.flushing[limit] = 0, false
+	r.last[limit] = r.last[limit].Add(time.Second)
+	r.mu.Unlock()
+	if count > 0 {
+		logger.Warn("webhook bridge refused requests over its rate", "limit", limit, "refused", count)
+	}
 }
 
 func (s *Server) sourceAllowed(remoteAddr string) bool {

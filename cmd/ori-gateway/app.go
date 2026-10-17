@@ -257,10 +257,12 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	var webhookBridge webhookBridgeRunner
 	var webhookBridgeReady atomic.Bool
+	webhookBridgeRefusals := webhookbridge.NewRefusals()
 	if cfg.WebhookBridge.Enabled {
 		webhookBridge, err = deps.newWebhookBridge(cfg.WebhookBridge, webhookbridge.Options{
-			Logger: deps.logger,
-			Now:    deps.now,
+			Logger:   deps.logger,
+			Now:      deps.now,
+			Refusals: webhookBridgeRefusals,
 		})
 		if err != nil {
 			return fmt.Errorf("construct webhook bridge: %w", err)
@@ -669,8 +671,11 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 				UptimeS:              deps.now().Sub(startedAt).Seconds(),
 				WebhookBridgeEnabled: cfg.WebhookBridge.Enabled,
 				WebhookBridgeReady:   webhookBridgeReady.Load(),
-				EvidenceDelivery:     evidenceDelivery,
-				MQTTIngress:          mqttIngressView(ingress),
+				WebhookBridgeRefused: site.WebhookBridgeRefused{
+					Sender: webhookBridgeRefusals.Sender(), Global: webhookBridgeRefusals.Global(),
+				},
+				EvidenceDelivery: evidenceDelivery,
+				MQTTIngress:      mqttIngressView(ingress),
 			}
 		}
 		runners.start("site health server", site.NewHealthHandler(

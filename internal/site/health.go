@@ -93,16 +93,26 @@ type SiteNodeAlertOutboxPosture struct {
 // projection. It must not contain target URLs, MQTT URLs, env var names, bearer
 // tokens, HMAC secrets, phone numbers, or filesystem paths.
 type GatewayView struct {
-	Status               string                       `json:"status"`
-	ProviderName         string                       `json:"provider_name"`
-	UptimeS              float64                      `json:"uptime_s"`
-	WebhookBridgeEnabled bool                         `json:"webhook_bridge_enabled"`
-	WebhookBridgeReady   bool                         `json:"webhook_bridge_ready"`
+	Status               string  `json:"status"`
+	ProviderName         string  `json:"provider_name"`
+	UptimeS              float64 `json:"uptime_s"`
+	WebhookBridgeEnabled bool    `json:"webhook_bridge_enabled"`
+	WebhookBridgeReady   bool    `json:"webhook_bridge_ready"`
+	// WebhookBridgeRefused counts SMS provider requests the bridge refused for
+	// volume since it started: counts only, never a sender or content.
+	WebhookBridgeRefused WebhookBridgeRefused         `json:"webhook_bridge_refused"`
 	EvidenceDelivery     *GatewayEvidenceDeliveryView `json:"evidence_delivery,omitempty"`
 	// MQTTIngress holds one member per topic family the gateway receives,
 	// named by the family; Project fills every family and drops any other key
 	// (gateway-api/v2 Site Health HTTP Projection).
 	MQTTIngress map[string]MQTTIngressCount `json:"mqtt_ingress"`
+}
+
+// WebhookBridgeRefused is the bridge's volume refusals: by one sender's rate,
+// and by the bridge-wide ceiling.
+type WebhookBridgeRefused struct {
+	Sender uint64 `json:"sender"`
+	Global uint64 `json:"global"`
 }
 
 // MQTTIngressCount is one family's refusals since the gateway started: counts
