@@ -128,6 +128,17 @@ webhook_bridge:
   hmac_secret_env: "ORI_SMS_WEBHOOK_HMAC_SECRET"
   request_timeout_ms: 3000
   max_body_bytes: 65536
+  # Volume bound, applied before anything is signed or forwarded. Per sender
+  # (the provider's `from` read the runtime's way, keyed by a process-local
+  # HMAC, never the number; unreadable shapes share one allowance) it may not be tighter than the runtime's own limit
+  # on approval replies, 10 a minute, burst 5. A message with no sender, such
+  # as a delivery report, and a flood of distinct senders are held by the
+  # global ceiling.
+  sender_per_minute: 10
+  sender_burst: 5
+  global_per_minute: 120
+  global_burst: 20
+  max_senders: 4096 # senders tracked; the least recently seen is evicted
 
 sim:
   enabled: false

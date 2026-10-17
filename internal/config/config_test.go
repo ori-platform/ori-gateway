@@ -1218,6 +1218,12 @@ webhook_bridge:
 	if cfg.WebhookBridge.TargetURL == "" || cfg.WebhookBridge.RuntimeTokenEnv == "" || cfg.WebhookBridge.HMACSecretEnv == "" {
 		t.Fatalf("unexpected bridge config: %#v", cfg.WebhookBridge)
 	}
+	b := cfg.WebhookBridge
+	if b.SenderPerMinute != DefaultWebhookBridgeSenderPerMinute || b.SenderBurst != DefaultWebhookBridgeSenderBurst ||
+		b.GlobalPerMinute != DefaultWebhookBridgeGlobalPerMinute || b.GlobalBurst != DefaultWebhookBridgeGlobalBurst ||
+		b.MaxSenders != DefaultWebhookBridgeMaxSenders {
+		t.Fatalf("rate limit defaults not applied: %#v", b)
+	}
 }
 
 func TestWebhookBridgeRejectsInvalidConfig(t *testing.T) {
@@ -1290,6 +1296,36 @@ webhook_bridge:
     - "0.0.0.0/1"
 `,
 			field: "too broad",
+		},
+		{
+			name:    "sender rate tighter than the runtime's rejected",
+			content: base + "  sender_per_minute: 9\n",
+			field:   "sender_per_minute",
+		},
+		{
+			name:    "sender burst tighter than the runtime's rejected",
+			content: base + "  sender_burst: 4\n",
+			field:   "sender_burst",
+		},
+		{
+			name:    "global ceiling below the sender rate rejected",
+			content: base + "  sender_per_minute: 30\n  global_per_minute: 20\n",
+			field:   "global_per_minute",
+		},
+		{
+			name:    "global burst below the sender burst rejected",
+			content: base + "  sender_burst: 10\n  global_burst: 5\n",
+			field:   "global_burst",
+		},
+		{
+			name:    "no tracked senders rejected",
+			content: base + "  max_senders: 0\n",
+			field:   "max_senders",
+		},
+		{
+			name:    "unbounded tracked senders rejected",
+			content: base + "  max_senders: 65537\n",
+			field:   "max_senders",
 		},
 		{
 			name: "oversized max body rejected",

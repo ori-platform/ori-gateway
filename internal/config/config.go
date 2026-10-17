@@ -38,6 +38,17 @@ const (
 	DefaultWebhookBridgePath             = "/webhooks/sms/africastalking"
 	DefaultWebhookBridgeRequestTimeoutMS = 3000
 	DefaultWebhookBridgeMaxBodyBytes     = 65536
+	// The bridge's volume bound. Per sender it is no tighter than the
+	// runtime's own per-sender limit on approval replies, so an operator
+	// answering several proposals a minute is never refused at the bridge
+	// first. A message naming no sender, such as a delivery report, draws on
+	// the bridge-wide ceiling alone.
+	DefaultWebhookBridgeSenderPerMinute = 10
+	DefaultWebhookBridgeSenderBurst     = 5
+	DefaultWebhookBridgeGlobalPerMinute = 120
+	DefaultWebhookBridgeGlobalBurst     = 20
+	DefaultWebhookBridgeMaxSenders      = 4096
+	maxWebhookBridgeTrackedSenders      = 65536
 
 	ProviderEcho     = "echo"
 	ProviderLlamaCpp = "llama_cpp"
@@ -285,6 +296,14 @@ type WebhookBridgeConfig struct {
 	HMACSecretEnv       string   `yaml:"hmac_secret_env"`
 	RequestTimeoutMS    int      `yaml:"request_timeout_ms"`
 	MaxBodyBytes        int64    `yaml:"max_body_bytes"`
+	// SenderPerMinute and SenderBurst bound each SMS sender, and
+	// GlobalPerMinute and GlobalBurst every forwarded request; MaxSenders caps
+	// the senders whose state is kept.
+	SenderPerMinute int `yaml:"sender_per_minute"`
+	SenderBurst     int `yaml:"sender_burst"`
+	GlobalPerMinute int `yaml:"global_per_minute"`
+	GlobalBurst     int `yaml:"global_burst"`
+	MaxSenders      int `yaml:"max_senders"`
 }
 
 type fileConfig struct {
@@ -324,6 +343,11 @@ type fileWebhookBridgeConfig struct {
 	HMACSecretEnv       string   `yaml:"hmac_secret_env"`
 	RequestTimeoutMS    *int     `yaml:"request_timeout_ms"`
 	MaxBodyBytes        *int64   `yaml:"max_body_bytes"`
+	SenderPerMinute     *int     `yaml:"sender_per_minute"`
+	SenderBurst         *int     `yaml:"sender_burst"`
+	GlobalPerMinute     *int     `yaml:"global_per_minute"`
+	GlobalBurst         *int     `yaml:"global_burst"`
+	MaxSenders          *int     `yaml:"max_senders"`
 }
 
 type fileEvidenceConfig struct {
@@ -730,7 +754,19 @@ func normalizeWebhookBridge(raw fileWebhookBridgeConfig) WebhookBridgeConfig {
 		HMACSecretEnv:       strings.TrimSpace(raw.HMACSecretEnv),
 		RequestTimeoutMS:    requestTimeoutMS,
 		MaxBodyBytes:        maxBodyBytes,
+		SenderPerMinute:     intOrDefault(raw.SenderPerMinute, DefaultWebhookBridgeSenderPerMinute),
+		SenderBurst:         intOrDefault(raw.SenderBurst, DefaultWebhookBridgeSenderBurst),
+		GlobalPerMinute:     intOrDefault(raw.GlobalPerMinute, DefaultWebhookBridgeGlobalPerMinute),
+		GlobalBurst:         intOrDefault(raw.GlobalBurst, DefaultWebhookBridgeGlobalBurst),
+		MaxSenders:          intOrDefault(raw.MaxSenders, DefaultWebhookBridgeMaxSenders),
 	}
+}
+
+func intOrDefault(value *int, fallback int) int {
+	if value == nil {
+		return fallback
+	}
+	return *value
 }
 
 func defaultIfBlank(value string, fallback string) string {
@@ -772,6 +808,19 @@ func validateWebhookBridge(cfg WebhookBridgeConfig) error {
 	}
 	if cfg.MaxBodyBytes <= 0 || cfg.MaxBodyBytes > 1<<20 {
 		return fmt.Errorf("webhook_bridge.max_body_bytes must be between 1 and 1048576")
+	}
+	// The bridge only cuts volume early; it must never be tighter than the
+	// runtime's own per-sender limit on approval replies, or it would refuse
+	// an operator's reply the runtime would admit.
+	if cfg.SenderPerMinute < DefaultWebhookBridgeSenderPerMinute || cfg.SenderBurst < DefaultWebhookBridgeSenderBurst {
+		return fmt.Errorf("webhook_bridge.sender_per_minute and sender_burst must be at least %d and %d",
+			DefaultWebhookBridgeSenderPerMinute, DefaultWebhookBridgeSenderBurst)
+	}
+	if cfg.GlobalPerMinute < cfg.SenderPerMinute || cfg.GlobalBurst < cfg.SenderBurst {
+		return fmt.Errorf("webhook_bridge.global_per_minute and global_burst must be at least the per-sender values")
+	}
+	if cfg.MaxSenders < 1 || cfg.MaxSenders > maxWebhookBridgeTrackedSenders {
+		return fmt.Errorf("webhook_bridge.max_senders must be between 1 and %d", maxWebhookBridgeTrackedSenders)
 	}
 	for _, cidr := range cfg.ProviderSourceCIDRs {
 		prefix, err := netip.ParsePrefix(cidr)

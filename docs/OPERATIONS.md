@@ -635,3 +635,32 @@ for a response it can verify, and one export reads at most 100 pages.
   exports still complete point to another client publishing on runtime topics;
   check the broker's ACLs.
 
+## SMS webhook bridge refuses requests with 429
+
+The SMS webhook bridge bounds how many provider requests it signs and forwards
+to the runtime, after the source check. Each sender (the provider's `from`,
+read the runtime's way; a sender in any shape the bridge cannot read that way
+shares one allowance with every other such sender) may send `webhook_bridge.sender_per_minute` a
+minute, in bursts of `sender_burst` (default 10 and 5, the least allowed,
+matching the runtime's own limit on approval replies; a number's remote
+commands share the same allowance), and the bridge as a whole forwards at
+most `global_per_minute`, in bursts of `global_burst` (default 120 and 20).
+A delivery report, which names no sender, counts against the bridge-wide
+limit only. A
+request past either is answered `429` and not forwarded; the provider may
+retry it. The bridge keeps state for at most `max_senders` senders (default
+4096), forgetting the least recently seen.
+
+The log carries `WARN webhook bridge refused requests over its rate` with the
+`limit` (`sender` or `global`) and the number `refused`, at most once a second
+for each. With `site_health` enabled, `gateway.webhook_bridge_refused` counts
+`sender` and `global` refusals since the gateway started. Neither names a
+sender, a number or message text.
+
+A rising `sender` count is one number texting the site faster than an operator
+would. A rising `global` count is many numbers at once, or a burst of delivery
+reports: replies from the operator may then be refused at the bridge too until
+it eases, without using up the operator's own allowance. The
+bridge decides only volume; which senders may approve a proposal is the
+runtime's decision.
+

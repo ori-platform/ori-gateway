@@ -139,6 +139,30 @@ only to the runtime's local webhook URL. Gateway heartbeat may expose bridge
 readiness and limit posture, but `ready` must reflect bridge-loop liveness rather
 than static config. It must never expose target URLs, env var names, provider
 CIDR values, SMS body content, phone numbers, bearer tokens, or HMAC secrets.
+After the source check and before signing, the bridge bounds volume: a token
+bucket per sender, keyed by HMAC-SHA256, under a key that never leaves the
+process, of the sender read the runtime's way where both readings agree
+(`from`, else `from_number`, from a form or JSON body, digits and `+` only;
+any other shape naming a sender field shares one reserved, limited key), and a
+bridge-wide ceiling. A message naming no sender, such as a delivery report,
+draws on the ceiling alone, and a sender the ceiling refuses keeps its token. A
+refused request is answered 429 and never forwarded. Sender state is capped
+(`max_senders`), evicting the least recently seen. The per-sender limit is
+refused at load if tighter than the runtime's own on approval replies (10 a
+minute, burst 5), and the ceiling if below it; the bridge never decides
+authority or filters by an approver list. Refusals are counted for site health (`webhook_bridge_refused`)
+and logged paced with the limit name only. Verified by
+`TestOneSendersBurstIsRefusedWhileAnotherSenderIsForwarded`,
+`TestEverySpellingOfOneNumberIsOneSender`,
+`TestSendersTheBridgeCannotReadShareOneLimitedBucket`,
+`TestDeliveryReportsDrawOnTheCeilingAlone`,
+`TestAFloodNeverSpendsAnOperatorsOwnAllowance`,
+`TestEveryRefusalIsLoggedEventually`,
+`TestSiteHealthCountsTheBridgesRefusals`,
+`TestDistinctSendersAreHeldByTheGlobalCeilingInBoundedMemory`,
+`TestForwardedBodiesStayExactAndSignedUnderLimiting`,
+`TestRefusalsLogNoSenderHashOrContent` and
+`TestWebhookBridgeRejectsInvalidConfig`.
 
 17. `GW-17` Runtime export clients must match runtime MQTT security posture.
 When `gateway.auth.enabled=true`, export requests must be HMAC-signed and

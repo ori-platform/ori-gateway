@@ -27,6 +27,11 @@ func testConfig(targetURL string) config.WebhookBridgeConfig {
 		HMACSecretEnv:       "WEBHOOK_HMAC_SECRET",
 		RequestTimeoutMS:    1000,
 		MaxBodyBytes:        64,
+		SenderPerMinute:     config.DefaultWebhookBridgeSenderPerMinute,
+		SenderBurst:         config.DefaultWebhookBridgeSenderBurst,
+		GlobalPerMinute:     config.DefaultWebhookBridgeGlobalPerMinute,
+		GlobalBurst:         config.DefaultWebhookBridgeGlobalBurst,
+		MaxSenders:          config.DefaultWebhookBridgeMaxSenders,
 	}
 }
 
