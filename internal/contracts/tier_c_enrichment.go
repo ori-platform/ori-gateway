@@ -58,6 +58,7 @@ func NewTierCEnrichmentErrorResponse(requestID string, proposalID string, device
 	if message == "" {
 		message = "enrichment unavailable"
 	}
+	message = BoundedError(message)
 	return TierCEnrichmentResponse{
 		RequestID:  requestID,
 		ProposalID: proposalID,

@@ -295,36 +295,28 @@ func validateMQTTDeviceID(deviceID string) error {
 }
 
 func validateMQTTRequestID(requestID string) error {
-	if requestID == "" {
-		return fmt.Errorf("request_id must not be empty")
-	}
-	if strings.TrimSpace(requestID) != requestID {
-		return fmt.Errorf("request_id must not contain leading or trailing whitespace")
-	}
-	if strings.ContainsAny(requestID, "/+#") {
-		return fmt.Errorf("request_id must not contain MQTT topic separators or wildcards")
-	}
-	for _, ch := range requestID {
-		if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_' {
-			continue
-		}
-		return fmt.Errorf("request_id must contain only ASCII letters, digits, hyphen, or underscore")
+	if !ValidRoutingID(requestID) {
+		return fmt.Errorf("request_id must be 1 to 128 ASCII letters, digits, '.', '_' or '-'")
 	}
 	return nil
 }
 
+// NewErrorResponse builds a reasoning error response: its error holds at most
+// MaxErrorScalars scalars and its other free-form strings are empty, so it
+// fits the Payload Size floor (gateway-api/v2).
 func NewErrorResponse(requestID string, deviceID string, actionTier string, message string) ReasoningResponse {
+	bounded := BoundedError(message)
 	return ReasoningResponse{
 		RequestID:      requestID,
 		DeviceID:       deviceID,
 		Text:           "",
-		Model:          "gateway",
+		Model:          "",
 		TokensUsed:     0,
 		LatencyMS:      0,
 		Confidence:     0,
 		ActionTier:     actionTier,
 		ProposedAction: nil,
-		Error:          &message,
+		Error:          &bounded,
 	}
 }
 

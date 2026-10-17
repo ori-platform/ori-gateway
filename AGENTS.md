@@ -204,7 +204,9 @@ never be treated as an authority receipt. Delivery envelopes, registrations,
 commissioning authorisations, and checkpoints remain end-to-end signed; the
 gateway does not verify, rewrite, or re-sign them. Authority receipts and epoch
 confirmations remain opaque and must be durably staged before outbound queue
-retirement. The evidence channel shares no authority, keys, storage,
+retirement. The gateway carries them to the runtime re-encoded as canonical
+JSON, which changes no value (gateway-api/v2 Artifact Bytes), and an inbound
+acknowledgement names one by the SHA-256 of those canonical bytes. The evidence channel shares no authority, keys, storage,
 acknowledgement, or failure status with fleet management, and transport errors
 must be reduced before reaching logs or status so the evidence authority's
 identity and endpoint cannot leak.
@@ -377,6 +379,43 @@ Verified offline by `TestEveryVendoredFileMatchesTheManifest`,
 `TestNoTestReadsASiblingCheckout` and `TestPinsLinkEachRequirementToOneIssue`:
 one issue per requirement, each issue serving only the requirements its
 registry entry lists, and no issue URL anywhere but that field.
+
+21. `GW-21` MQTT ingress is bounded before it is read.
+Every subscription on either broker client belongs to a gateway-api/v2 Payload
+Size family with a maximum and an ingress rate, or `broker.Client.Subscribe`
+refuses it. The client's message wrapper compares a payload's length with the
+family maximum, then applies the sending device's rate (a wildcard
+subscription keeps one per configured device and one shared by every other
+device segment), before the handler runs: a refused payload is never parsed,
+decoded, verified, routed or answered, and changes no state. Refusals are
+counted per family, projected as site health `gateway.mqtt_ingress`, and
+logged paced, with family and size class only, never content, device ID or
+topic. No setting raises or lowers a maximum or a rate. Every required reply
+the gateway produces (reasoning and enrichment error responses, the outbound
+evidence acknowledgement, the gateway heartbeat) fits the 4096-byte floor at
+the contract's bounds: an error response, whoever built it, carries an `error`
+of at most 128 scalars and no other free-form content, and a reasoning or
+enrichment request whose `request_id`, or enrichment `proposal_id`, is outside
+`^[A-Za-z0-9._-]{1,128}$` is refused unanswered. A reasoning or enrichment
+response over its maximum is replaced by the error `response_too_large`. An
+inbound evidence acknowledgement that decides nothing the gateway holds, and
+an export response whose request is no longer pending, add no replay state. Inbound evidence is published as canonical JSON, and staging
+admits no authority artifact over 1,048,576 canonical bytes; the evidence
+channel's 1 MiB response cap already refuses one first, so the staging bound
+is defence in depth.
+Verified by `TestEverySubscriptionHasAPayloadMaximum`,
+`TestAPayloadOverItsTopicMaximumIsRefusedBeforeParsing`,
+`TestPayloadSizeVectorCases`,
+`TestARefusedOversizePayloadChangesNothingAndIsNotAnswered`,
+`TestAnOversizePayloadCostsNoParse`, `TestAVolumeOverTheRateIsDroppedAndCounted`,
+`TestIngressRefusalsAreRecordedWithoutContent`,
+`TestAWildcardSubscriptionRatesEachDevice`, `TestRequiredRepliesFitTheFloor`,
+`TestInboundEvidenceIsPublishedCanonical`,
+`TestAProviderReturnedErrorIsSentAsTheBoundedErrorResponse`,
+`TestAnAcknowledgementThatDecidesNothingAddsNoReplayState`,
+`TestACancelledExportResponseAddsNoReplayState`,
+`TestAnOversizeAuthorityArtifactHoldsOnlyItsLane` and
+`TestProjectSiteHealthMQTTIngressIsExactlyTheReceivedFamilies`.
 
 ## Layout
 

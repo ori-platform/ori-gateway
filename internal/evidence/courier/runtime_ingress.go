@@ -245,14 +245,9 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 	if err != nil {
 		return err
 	}
-	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, deviceID, "", signedAt, h.envelopeSecret)
+	encodedAck, err := encodeOutboundAck(ack, signedAt, h.envelopeSecret)
 	if err != nil {
-		return fmt.Errorf("evidence: sign outbound acknowledgement: %w", err)
-	}
-	ack.Auth = &auth
-	encodedAck, err := json.Marshal(ack)
-	if err != nil {
-		return fmt.Errorf("evidence: encode outbound acknowledgement: %w", err)
+		return err
 	}
 	ackTopic, err := contracts.EvidenceOutboundAckTopic(deviceID)
 	if err != nil {
@@ -262,6 +257,20 @@ func (h *RuntimeIngress) publishOutboundAck(ctx context.Context, deviceID, artif
 		return fmt.Errorf("evidence: publish outbound acknowledgement: %w", err)
 	}
 	return nil
+}
+
+// encodeOutboundAck signs and encodes an outbound acknowledgement.
+func encodeOutboundAck(ack outboundAck, signedAt int64, secret string) ([]byte, error) {
+	auth, err := mqttauth.Sign(ack, contracts.EvidenceOutboundAckMessageType, ack.DeviceID, "", signedAt, secret)
+	if err != nil {
+		return nil, fmt.Errorf("evidence: sign outbound acknowledgement: %w", err)
+	}
+	ack.Auth = &auth
+	encoded, err := json.Marshal(ack)
+	if err != nil {
+		return nil, fmt.Errorf("evidence: encode outbound acknowledgement: %w", err)
+	}
+	return encoded, nil
 }
 
 type outboundAck struct {

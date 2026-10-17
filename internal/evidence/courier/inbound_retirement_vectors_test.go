@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	canonicaljson "github.com/ori-platform/ori-canonicaljson"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/specvectors"
@@ -312,7 +313,7 @@ func (r *returnRig) handle(topic string, payload []byte) error {
 // decision signs an acknowledgement from device naming the queued receipt.
 func (r *returnRig) decision(device, outcome, reason string, mutate func(*inboundAck)) []byte {
 	r.t.Helper()
-	digest := sha256.Sum256(r.artifact)
+	digest := sha256.Sum256(canonicalBytes(r.t, r.artifact))
 	ack := inboundAck{
 		DeviceID: device, ArtifactType: string(AuthorityDeliveryReceipt),
 		ArtifactDigest: "sha256:" + hex.EncodeToString(digest[:]),
@@ -372,7 +373,7 @@ func (r *returnRig) carriedAgain(carried [][]byte, artifact []byte) {
 	if err := json.Unmarshal(carried[0], &b); err != nil {
 		r.t.Fatal(err)
 	}
-	if string(b.Artifact) != string(artifact) || a.Auth == nil || b.Auth == nil || b.Auth.SignedAtMS <= a.Auth.SignedAtMS {
+	if string(b.Artifact) != string(canonicalBytes(r.t, artifact)) || a.Auth == nil || b.Auth == nil || b.Auth.SignedAtMS <= a.Auth.SignedAtMS {
 		r.t.Fatal("the artifact was not carried in a newly signed envelope")
 	}
 }
@@ -650,10 +651,20 @@ func TestTheDefaultRetryTimerRedeliversAnUnacknowledgedHead(t *testing.T) {
 		}
 	}
 	a, b := envelopes[0], envelopes[1]
-	if string(a.Artifact) != string(artifact) || string(b.Artifact) != string(artifact) {
+	if string(a.Artifact) != string(canonicalBytes(t, artifact)) || string(b.Artifact) != string(canonicalBytes(t, artifact)) {
 		t.Fatal("the redelivery did not carry the same artifact")
 	}
 	if bytes.Equal(raw[0], raw[1]) || a.Auth == nil || b.Auth == nil || b.Auth.SignedAtMS <= a.Auth.SignedAtMS {
 		t.Fatal("the redelivery was not a newly signed envelope")
 	}
+}
+
+// canonicalBytes is an artifact as the inbound hop carries it.
+func canonicalBytes(t *testing.T, artifact []byte) []byte {
+	t.Helper()
+	canonical, err := canonicaljson.MarshalWire(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
 }

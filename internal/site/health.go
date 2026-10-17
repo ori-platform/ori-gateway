@@ -3,7 +3,11 @@
 
 package site
 
-import "time"
+import (
+	"time"
+
+	"github.com/ori-platform/ori-gateway/internal/contracts"
+)
 
 const (
 	SiteStatusHealthy  = "healthy"
@@ -95,6 +99,18 @@ type GatewayView struct {
 	WebhookBridgeEnabled bool                         `json:"webhook_bridge_enabled"`
 	WebhookBridgeReady   bool                         `json:"webhook_bridge_ready"`
 	EvidenceDelivery     *GatewayEvidenceDeliveryView `json:"evidence_delivery,omitempty"`
+	// MQTTIngress holds one member per topic family the gateway receives,
+	// named by the family; Project fills every family and drops any other key
+	// (gateway-api/v2 Site Health HTTP Projection).
+	MQTTIngress map[string]MQTTIngressCount `json:"mqtt_ingress"`
+}
+
+// MQTTIngressCount is one family's refusals since the gateway started: counts
+// only, with no payload content, device identifier or topic. A non-zero
+// count does not by itself degrade the gateway.
+type MQTTIngressCount struct {
+	PayloadTooLarge uint64 `json:"payload_too_large"`
+	VolumeDropped   uint64 `json:"volume_dropped"`
 }
 
 // GatewayEvidenceDeliveryView is the safe operational projection of the
@@ -225,6 +241,12 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	for _, n := range nodes {
 		status = max(status, projectedSeverity(n.Status))
 	}
+
+	ingress := make(map[string]MQTTIngressCount, len(contracts.ReceivedFamilies))
+	for _, family := range contracts.ReceivedFamilies {
+		ingress[family] = gateway.MQTTIngress[family]
+	}
+	gateway.MQTTIngress = ingress
 
 	return SiteHealth{
 		GeneratedAtMS: nowMS,

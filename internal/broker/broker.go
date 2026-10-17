@@ -41,12 +41,21 @@ type Options struct {
 	// Zero values use 1s initial and 30s max.
 	ReconnectInitial time.Duration
 	ReconnectMax     time.Duration
+
+	// Ingress counts every subscription's size and volume refusals. One value
+	// is shared by every client of a process; nil gives the client its own.
+	Ingress *IngressStats
+
+	// Devices are the configured device IDs: a wildcard subscription keeps a
+	// rate for each, and one shared by every other device segment.
+	Devices []string
 }
 
 // Client wraps Eclipse Paho with explicit connection lifecycle and subscription tracking.
 type Client struct {
-	opts Options
-	log  *slog.Logger
+	opts    Options
+	log     *slog.Logger
+	ingress *IngressStats
 
 	mu            sync.Mutex
 	connected     bool
@@ -57,6 +66,7 @@ type Client struct {
 type subscription struct {
 	qos     byte
 	handler MessageHandler
+	gate    *ingressGate
 }
 
 // New validates options and constructs a Client. Call Connect before Subscribe or Publish.
@@ -92,9 +102,14 @@ func New(opts Options) (*Client, error) {
 	pahoOpts.SetConnectRetryInterval(reconnectInitial)
 	pahoOpts.SetMaxReconnectInterval(reconnectMax)
 
+	ingress := opts.Ingress
+	if ingress == nil {
+		ingress = NewIngressStats(log)
+	}
 	c := &Client{
 		opts:          opts,
 		log:           log,
+		ingress:       ingress,
 		subscriptions: make(map[string]subscription),
 	}
 
@@ -168,6 +183,8 @@ func (c *Client) Disconnect(ctx context.Context) error {
 
 // Subscribe registers a handler for topic. Duplicate subscribe with the same topic and qos is a no-op.
 // A second subscribe for the same topic with a different handler returns ErrSubscriptionExists.
+// A topic outside the gateway-api/v2 Payload Size table, or without an ingress
+// rate, cannot be subscribed: every message is bounded before its handler runs.
 func (c *Client) Subscribe(ctx context.Context, topic string, qos byte, handler MessageHandler) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -180,6 +197,10 @@ func (c *Client) Subscribe(ctx context.Context, topic string, qos byte, handler 
 	}
 	if handler == nil {
 		return fmt.Errorf("broker: handler must not be nil")
+	}
+	gate, err := newIngressGate(topic, c.opts.Devices, c.ingress, time.Now)
+	if err != nil {
+		return err
 	}
 
 	c.mu.Lock()
@@ -195,10 +216,11 @@ func (c *Client) Subscribe(ctx context.Context, topic string, qos byte, handler 
 		c.mu.Unlock()
 		return ErrSubscriptionExists
 	}
-	c.subscriptions[topic] = subscription{qos: qos, handler: handler}
+	sub := subscription{qos: qos, handler: handler, gate: gate}
+	c.subscriptions[topic] = sub
 	c.mu.Unlock()
 
-	token := c.paho.Subscribe(topic, qos, c.wrapHandler(handler))
+	token := c.paho.Subscribe(topic, qos, c.wrapHandler(sub))
 	if err := waitToken(ctx, token); err != nil {
 		c.mu.Lock()
 		delete(c.subscriptions, topic)
@@ -246,8 +268,14 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
-func (c *Client) wrapHandler(handler MessageHandler) mqtt.MessageHandler {
+func (c *Client) wrapHandler(sub subscription) mqtt.MessageHandler {
 	return func(_ mqtt.Client, msg mqtt.Message) {
+		// Size, then rate, before anything else: a refused payload is never
+		// parsed, routed or answered, and is recorded by family and size class
+		// only (gateway-api/v2 Payload Size and Payload Volume).
+		if !sub.gate.admit(msg.Topic(), len(msg.Payload())) {
+			return
+		}
 		if msg.Retained() {
 			c.log.Warn("mqtt retained message rejected", "topic", msg.Topic())
 			return
@@ -257,7 +285,7 @@ func (c *Client) wrapHandler(handler MessageHandler) mqtt.MessageHandler {
 				c.log.Warn("mqtt message handler panic", "topic", msg.Topic(), "recover", r)
 			}
 		}()
-		handler(msg.Topic(), msg.Payload())
+		sub.handler(msg.Topic(), msg.Payload())
 	}
 }
 
@@ -276,7 +304,7 @@ func (c *Client) resubscribeAll() {
 	c.mu.Unlock()
 
 	for _, item := range subs {
-		token := c.paho.Subscribe(item.topic, item.sub.qos, c.wrapHandler(item.sub.handler))
+		token := c.paho.Subscribe(item.topic, item.sub.qos, c.wrapHandler(item.sub))
 		if !token.WaitTimeout(10 * time.Second) {
 			c.log.Warn("mqtt resubscribe timed out", "topic", item.topic)
 			continue

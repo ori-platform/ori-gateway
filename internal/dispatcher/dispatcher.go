@@ -212,18 +212,18 @@ func (d *Dispatcher) publishResponse(req contracts.ReasoningRequest, resp contra
 	if err != nil {
 		return fmt.Errorf("dispatcher: response topic: %w", err)
 	}
-	resp.Confidence = math.Round(resp.Confidence*confidenceDecimals) / confidenceDecimals
-	resp.Auth = nil
-	if d.signingSecret != "" {
-		auth, err := mqttauth.Sign(resp, contracts.ReasoningResponseMessageType, req.DeviceID, req.RequestID, d.now().UnixMilli(), d.signingSecret)
-		if err != nil {
-			return fmt.Errorf("dispatcher: sign response: %w", err)
-		}
-		resp.Auth = &auth
-	}
-	payload, err := json.Marshal(resp)
+	payload, err := d.encodeResponse(req, resp)
 	if err != nil {
-		return fmt.Errorf("dispatcher: encode response: %w", err)
+		return err
+	}
+	if len(payload) > contracts.PayloadMaxima[contracts.FamilyReasoningResponse] {
+		// A response over its topic's maximum is never published; the family's
+		// error response goes in its place, so the runtime does not wait out
+		// its timeout (gateway-api/v2 Payload Size).
+		payload, err = d.encodeResponse(req, contracts.NewErrorResponse(req.RequestID, req.DeviceID, req.ActionTierHint, contracts.ErrorResponseTooLarge))
+		if err != nil {
+			return err
+		}
 	}
 	publishCtx, cancel := context.WithTimeout(context.Background(), d.publishTimeout)
 	defer cancel()
@@ -231,6 +231,29 @@ func (d *Dispatcher) publishResponse(req contracts.ReasoningRequest, resp contra
 		return fmt.Errorf("dispatcher: publish response: %w", err)
 	}
 	return nil
+}
+
+func (d *Dispatcher) encodeResponse(req contracts.ReasoningRequest, resp contracts.ReasoningResponse) ([]byte, error) {
+	// Every response carrying an error, whoever built it, goes out as the
+	// family's error response: a bounded error and no other free-form content
+	// (gateway-api/v2 Payload Size).
+	if resp.Error != nil {
+		resp = contracts.NewErrorResponse(req.RequestID, req.DeviceID, req.ActionTierHint, *resp.Error)
+	}
+	resp.Confidence = math.Round(resp.Confidence*confidenceDecimals) / confidenceDecimals
+	resp.Auth = nil
+	if d.signingSecret != "" {
+		auth, err := mqttauth.Sign(resp, contracts.ReasoningResponseMessageType, req.DeviceID, req.RequestID, d.now().UnixMilli(), d.signingSecret)
+		if err != nil {
+			return nil, fmt.Errorf("dispatcher: sign response: %w", err)
+		}
+		resp.Auth = &auth
+	}
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		return nil, fmt.Errorf("dispatcher: encode response: %w", err)
+	}
+	return payload, nil
 }
 
 func providerErrorMessage(err error) string {

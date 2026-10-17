@@ -108,7 +108,7 @@ func TestConnectAndPublish(t *testing.T) {
 	}
 	defer pub.Disconnect(ctx)
 
-	const topic = "ori/test/device-a/reasoning/response"
+	const topic = "ori/device-a/reasoning/request"
 	received := make(chan []byte, 1)
 	handler := func(_ string, payload []byte) {
 		received <- append([]byte(nil), payload...)
@@ -142,7 +142,7 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 		t.Fatal(err)
 	}
 	received := make(chan []byte, 1)
-	if err := sub.Subscribe(ctx, "ori/device-a/evidence/inbound", QoSReasoning, func(_ string, payload []byte) {
+	if err := sub.Subscribe(ctx, "ori/device-a/evidence/inbound/ack", QoSReasoning, func(_ string, payload []byte) {
 		received <- append([]byte(nil), payload...)
 	}); err != nil {
 		t.Fatal(err)
@@ -154,7 +154,7 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 		t.Fatal(err)
 	}
 	defer pub.Disconnect(ctx)
-	if err := pub.Publish(ctx, "ori/device-a/evidence/inbound", QoSReasoning, false, []byte("authority-artifact")); err != nil {
+	if err := pub.Publish(ctx, "ori/device-a/evidence/inbound/ack", QoSReasoning, false, []byte("authority-artifact")); err != nil {
 		t.Fatal(err)
 	}
 	if err := sub.Connect(ctx); err != nil {
@@ -184,7 +184,7 @@ func TestSubscribeReceives(t *testing.T) {
 
 	var count atomic.Int32
 	handler := func(topic string, payload []byte) {
-		if topic != "ori/gateway/health" {
+		if topic != "ori/device-a/runtime/heartbeat" {
 			t.Errorf("unexpected topic %q", topic)
 		}
 		if string(payload) != "ok" {
@@ -192,10 +192,10 @@ func TestSubscribeReceives(t *testing.T) {
 		}
 		count.Add(1)
 	}
-	if err := c.Subscribe(ctx, "ori/gateway/health", QoSHeartbeat, handler); err != nil {
+	if err := c.Subscribe(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, handler); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Publish(ctx, "ori/gateway/health", QoSHeartbeat, false, []byte("ok")); err != nil {
+	if err := c.Publish(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, false, []byte("ok")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -226,7 +226,7 @@ func TestDisconnectClean(t *testing.T) {
 	if err := c.Publish(ctx, "ori/gateway/health", QoSHeartbeat, false, nil); err != ErrNotConnected {
 		t.Fatalf("publish err = %v, want ErrNotConnected", err)
 	}
-	if err := c.Subscribe(ctx, "ori/gateway/health", QoSHeartbeat, func(string, []byte) {}); err != ErrNotConnected {
+	if err := c.Subscribe(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, func(string, []byte) {}); err != ErrNotConnected {
 		t.Fatalf("subscribe err = %v, want ErrNotConnected", err)
 	}
 }
@@ -236,7 +236,7 @@ func TestSubscribeBeforeConnect(t *testing.T) {
 	defer stop()
 
 	c := testClient(t, brokerURL, "pre-1", Options{})
-	err := c.Subscribe(context.Background(), "ori/gateway/health", QoSHeartbeat, func(string, []byte) {})
+	err := c.Subscribe(context.Background(), "ori/device-a/runtime/heartbeat", QoSHeartbeat, func(string, []byte) {})
 	if err != ErrNotConnected {
 		t.Fatalf("got %v, want ErrNotConnected", err)
 	}
@@ -265,7 +265,7 @@ func TestDuplicateSubscribeIdempotent(t *testing.T) {
 	defer c.Disconnect(ctx)
 
 	handler := func(string, []byte) {}
-	topic := "ori/test/device-b/reasoning/request"
+	topic := "ori/device-b/reasoning/request"
 	if err := c.Subscribe(ctx, topic, QoSReasoning, handler); err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +292,7 @@ func TestHandlerPanicDoesNotBreakClient(t *testing.T) {
 	}
 	defer c.Disconnect(ctx)
 
-	topic := "ori/test/panic-topic"
+	topic := "ori/panic-device/runtime/heartbeat"
 	if err := c.Subscribe(ctx, topic, QoSReasoning, func(string, []byte) {
 		panic("boom")
 	}); err != nil {
@@ -504,7 +504,7 @@ func TestConcurrentSubscribePublish(t *testing.T) {
 	}
 	defer c.Disconnect(ctx)
 
-	topic := "ori/test/concurrent"
+	topic := "ori/concurrent/evidence/outbound"
 	var wg sync.WaitGroup
 	handler := func(string, []byte) { wg.Done() }
 	if err := c.Subscribe(ctx, topic, QoSReasoning, handler); err != nil {
@@ -677,7 +677,7 @@ func TestSubscribeRespectsDeadline(t *testing.T) {
 	defer cancel()
 	time.Sleep(2 * time.Nanosecond)
 
-	err := c.Subscribe(subCtx, "ori/gateway/health", QoSHeartbeat, func(string, []byte) {})
+	err := c.Subscribe(subCtx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, func(string, []byte) {})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Subscribe: got %v, want %v", err, context.DeadlineExceeded)
 	}
@@ -707,11 +707,20 @@ func TestWrapHandlerRejectsRetainedMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
-	handler := c.wrapHandler(func(string, []byte) {
+	handler := c.wrapHandler(gatedSubscription(t, c, "ori/dev-01/runtime/heartbeat", func(string, []byte) {
 		called = true
-	})
+	}))
 	handler(nil, retainedTestMessage{topic: "ori/dev-01/runtime/heartbeat", payload: []byte("stale"), retained: true})
 	if called {
 		t.Fatal("retained message should not reach application handler")
 	}
+}
+
+func gatedSubscription(t *testing.T, c *Client, topic string, handler MessageHandler) subscription {
+	t.Helper()
+	gate, err := newIngressGate(topic, nil, c.ingress, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return subscription{qos: QoSReasoning, handler: handler, gate: gate}
 }

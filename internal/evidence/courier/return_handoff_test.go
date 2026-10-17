@@ -279,7 +279,7 @@ func TestARefusedAdmissionReleasesNoHold(t *testing.T) {
 func TestAStaleDecisionNeverReplacesAnotherHeadsHold(t *testing.T) {
 	next := validReceiptBytes(rigDevice, 2, 2)
 	r := newReturnRig(t, next)
-	nextDigest := sha256.Sum256(next)
+	nextDigest := sha256.Sum256(canonicalBytes(t, next))
 	holdX := r.decision(rigDevice, "refused", "unknown_key", nil)
 	retireX := r.decision(rigDevice, "applied", "", nil)
 	holdY := r.decision(rigDevice, "refused", "unknown_key", func(a *inboundAck) {
@@ -556,7 +556,7 @@ func TestARestartCarriesAHeldHeadAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	var envelope inboundEnvelope
-	if len(carried) != 1 || json.Unmarshal(carried[0], &envelope) != nil || string(envelope.Artifact) != string(r.artifact) {
+	if len(carried) != 1 || json.Unmarshal(carried[0], &envelope) != nil || string(envelope.Artifact) != string(canonicalBytes(t, r.artifact)) {
 		t.Fatalf("the restarted publisher carried %d envelopes, want the held head", len(carried))
 	}
 }

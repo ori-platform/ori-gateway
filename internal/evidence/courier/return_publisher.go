@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	canonicaljson "github.com/ori-platform/ori-canonicaljson"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 )
@@ -149,9 +150,6 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	envelope := inboundEnvelope{
-		DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(queued.Payload),
-	}
 	// Every delivery attempt is a newly signed envelope, across restarts too:
 	// the durable clock guarantees a later signed_at_ms than any earlier
 	// attempt, so a retained entry re-emitted under a regressed clock cannot
@@ -160,12 +158,7 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	auth, err := mqttauth.Sign(envelope, contracts.EvidenceInboundMessageType, deviceID, "", signedAt, p.envelopeSecret)
-	if err != nil {
-		return err
-	}
-	envelope.Auth = &auth
-	payload, err := json.Marshal(envelope)
+	payload, err := encodeInbound(deviceID, kind, queued.Payload, signedAt, p.envelopeSecret)
 	if err != nil {
 		return err
 	}
@@ -182,66 +175,106 @@ func (p *ReturnPublisher) publishHead(ctx context.Context) error {
 	return nil
 }
 
+// encodeInbound signs an inbound evidence message and encodes the whole
+// payload, auth included, as canonical JSON, so the artifact occupies exactly
+// its canonical bytes and staging's bound keeps the payload within its topic
+// maximum (gateway-api/v2 Payload Size).
+func encodeInbound(deviceID string, kind AuthorityArtifactType, artifact []byte, signedAt int64, secret string) ([]byte, error) {
+	envelope := inboundEnvelope{DeviceID: deviceID, ArtifactType: string(kind), Artifact: json.RawMessage(artifact)}
+	auth, err := mqttauth.Sign(envelope, contracts.EvidenceInboundMessageType, deviceID, "", signedAt, secret)
+	if err != nil {
+		return nil, errQueuedArtifactNotCanonical
+	}
+	envelope.Auth = &auth
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := canonicaljson.MarshalWire(encoded)
+	if err != nil {
+		// The canonicaliser's error can quote a member name from the artifact.
+		return nil, errQueuedArtifactNotCanonical
+	}
+	if len(payload) > contracts.PayloadMaxima[contracts.FamilyEvidenceInbound] {
+		return nil, errInboundOverMaximum
+	}
+	return payload, nil
+}
+
 func (p *ReturnPublisher) HandleAck(topic string, payload []byte) error {
 	deviceID, err := contracts.DeviceIDFromEvidenceInboundAckTopic(topic)
 	if err != nil {
 		return err
 	}
-	if _, err := p.verifier.VerifyJSON(payload, contracts.EvidenceInboundAckMessageType, deviceID, ""); err != nil {
-		return err
-	}
+	// The replay key is recorded only for an acknowledgement that decides the
+	// queued artifact: one that names nothing the gateway holds adds no state
+	// (gateway-api/v2 Payload Volume).
+	return p.verifier.VerifyJSONThenDecide(payload, contracts.EvidenceInboundAckMessageType, deviceID, "",
+		func(map[string]any) (bool, error) { return p.decideAck(deviceID, payload) })
+}
+
+// decideAck applies an authenticated acknowledgement to the queued head. It
+// reports whether the acknowledgement decided that head, retiring or holding
+// it.
+func (p *ReturnPublisher) decideAck(deviceID string, payload []byte) (bool, error) {
 	var ack inboundAck
 	if err := refuseAmbiguousMembers(payload, &ack); err != nil {
-		return fmt.Errorf("evidence: malformed inbound acknowledgement")
+		return false, fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
 	if err := requireInboundAckTypes(payload); err != nil {
-		return fmt.Errorf("evidence: malformed inbound acknowledgement")
+		return false, fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ack); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return fmt.Errorf("evidence: malformed inbound acknowledgement")
+		return false, fmt.Errorf("evidence: malformed inbound acknowledgement")
 	}
 	// The verifier already binds the body's device_id to the topic; this is defence in depth.
 	if ack.DeviceID != deviceID || ack.AcknowledgedAtMS <= 0 {
-		return fmt.Errorf("evidence: inbound acknowledgement binding mismatch")
+		return false, fmt.Errorf("evidence: inbound acknowledgement binding mismatch")
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	queued, ok := p.sink.queue.Peek()
 	if !ok {
-		return fmt.Errorf("evidence: acknowledgement names an empty return queue")
+		return false, fmt.Errorf("evidence: acknowledgement names an empty return queue")
 	}
 	if p.peeked != nil {
 		p.peeked()
 	}
 	queuedDevice, queuedType, err := authorityQueueRouting(queued)
 	if err != nil {
-		return err
+		return false, err
 	}
-	digest := sha256.Sum256(queued.Payload)
+	// The acknowledgement names the artifact by its canonical bytes, the bytes
+	// the runtime received (gateway-api/v2 Inbound Evidence Delivery).
+	canonical, err := canonicaljson.MarshalWire(queued.Payload)
+	if err != nil {
+		return false, errQueuedArtifactNotCanonical
+	}
+	digest := sha256.Sum256(canonical)
 	if queuedDevice != deviceID || string(queuedType) != ack.ArtifactType || ack.ArtifactDigest != "sha256:"+hex.EncodeToString(digest[:]) {
-		return fmt.Errorf("evidence: acknowledgement does not name the queued authority artifact")
+		return false, fmt.Errorf("evidence: acknowledgement does not name the queued authority artifact")
 	}
 	retire, recognised, err := inboundDecision(ack.Outcome, ack.Reason)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !retire {
 		p.heldID, p.heldDevice = queued.ID, queuedDevice
 		if !recognised {
-			return NewUnrecognisedInboundReasonError(ack.Reason)
+			return true, NewUnrecognisedInboundReasonError(ack.Reason)
 		}
-		return nil
+		return true, nil
 	}
 	if err := p.sink.queue.Remove(queued.ID); err != nil {
-		return err
+		return false, err
 	}
 	if p.heldID == queued.ID {
 		p.heldID, p.heldDevice = "", ""
 	}
 	p.Notify()
-	return nil
+	return true, nil
 }
 
 // ErrUnrecognisedInboundReason reports a refusal whose reason is outside the

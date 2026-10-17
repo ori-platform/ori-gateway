@@ -5,8 +5,18 @@ package courier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	canonicaljson "github.com/ori-platform/ori-canonicaljson"
+	"github.com/ori-platform/ori-gateway/internal/contracts"
+)
+
+var (
+	errAuthorityArtifactOverMaximum = errors.New("evidence: authority artifact exceeds the inbound maximum")
+	errInboundOverMaximum           = errors.New("evidence: inbound message exceeds its topic maximum")
+	errQueuedArtifactNotCanonical   = errors.New("evidence: queued authority artifact is not canonicalisable")
 )
 
 // DurableAuthoritySink stages exact authority artifacts in a queue separate
@@ -51,7 +61,17 @@ func (s *DurableAuthoritySink) Store(_ context.Context, artifact AuthorityArtifa
 	if err := decodeRouting(artifact.Payload, &routing); err != nil || routing.DeviceID == "" || routing.DeviceID != artifact.DeviceID {
 		return fmt.Errorf("evidence: authority artifact routing mismatch")
 	}
-	_, err := s.queue.enqueue(kind, artifact.Payload)
+	// Staging admits no artifact the inbound hop could not carry: one over
+	// MaxAuthorityArtifactBytes canonical bytes is refused, which the delivery
+	// attempt records as an unrecognised outcome (gateway-api/v2 Payload Size).
+	canonical, err := canonicaljson.MarshalWire(artifact.Payload)
+	if err != nil {
+		return fmt.Errorf("evidence: authority artifact is not canonicalisable")
+	}
+	if len(canonical) > contracts.MaxAuthorityArtifactBytes {
+		return errAuthorityArtifactOverMaximum
+	}
+	_, err = s.queue.enqueue(kind, artifact.Payload)
 	return err
 }
 

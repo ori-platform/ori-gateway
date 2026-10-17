@@ -123,7 +123,7 @@
         "request_id": "interop-6",
         "device_id": "site-a",
         "text": "",
-        "model": "gateway",
+        "model": "",
         "tokens_used": 0,
         "latency_ms": 0,
         "confidence": 0,
@@ -133,7 +133,7 @@
         "auth": {
           "scheme": "hmac-sha256",
           "signed_at_ms": 1700000000000,
-          "signature": "hmac-sha256:3c153b54325603ba82f71f66b423ecb78486163dfd6321bace5b79f0e31eb492"
+          "signature": "hmac-sha256:3adc4d85527dd1f1fad1adf233bb0348e0eee9e76d26e3f4a8ce5d39a48de159"
         }
       }
     }

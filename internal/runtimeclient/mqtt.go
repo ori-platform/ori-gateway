@@ -358,6 +358,9 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	if err != nil {
 		return exportResponse{}, err
 	}
+	if len(payload) > contracts.PayloadMaxima[contracts.FamilyExportRequest] {
+		return exportResponse{}, fmt.Errorf("runtimeclient: export request exceeds its topic maximum")
+	}
 	topic, err := contracts.ExportRequestTopic(req.DeviceID)
 	if err != nil {
 		return exportResponse{}, err
@@ -400,11 +403,40 @@ func (c *MQTTClient) handleResponseMessage(_ string, payload []byte) {
 		return
 	}
 
-	resp, err := c.decodeResponsePayload(payload, raw, pending.req)
-	result := exportResult{resp: resp, err: err}
+	if c.verifier == nil {
+		resp, err := c.decodeResponsePayload(raw, pending.req)
+		c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err})
+		return
+	}
+	// The response is correlated with its pending request under the replay
+	// lock, and its replay key recorded only when it is delivered to that
+	// request: a response whose request is gone, even one cancelled while it
+	// was being verified, adds no state (gateway-api/v2 Payload Volume).
+	decided := false
+	err = c.verifier.VerifyJSONThenDecide(payload, contracts.ExportResponseMessageType, pending.req.DeviceID, pending.req.RequestID,
+		func(verified map[string]any) (bool, error) {
+			decided = true
+			resp, err := c.decodeResponsePayload(verified, pending.req)
+			return c.deliver(requestID, pending.ch, exportResult{resp: resp, err: err}), nil
+		})
+	if err != nil && !decided {
+		c.deliver(requestID, pending.ch, exportResult{err: fmt.Errorf("runtimeclient: verify export response: %w", err)})
+	}
+}
+
+// deliver hands result to the pending request it answers, if that request is
+// still pending and not yet answered, and reports whether it did.
+func (c *MQTTClient) deliver(requestID string, ch chan exportResult, result exportResult) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending[requestID].ch != ch {
+		return false
+	}
 	select {
-	case pending.ch <- result:
+	case ch <- result:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -424,15 +456,9 @@ func (c *MQTTClient) encodeRequest(req exportRequest) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-func (c *MQTTClient) decodeResponsePayload(payload []byte, raw map[string]any, req exportRequest) (exportResponse, error) {
-	decoded := raw
-	if c.verifier != nil {
-		verified, err := c.verifier.VerifyJSON(payload, contracts.ExportResponseMessageType, req.DeviceID, req.RequestID)
-		if err != nil {
-			return exportResponse{}, fmt.Errorf("runtimeclient: verify export response: %w", err)
-		}
-		decoded = verified
-	}
+// decodeResponsePayload reads a response already verified, when message auth
+// is configured.
+func (c *MQTTClient) decodeResponsePayload(decoded map[string]any, req exportRequest) (exportResponse, error) {
 
 	if isSensitiveExport(req.ExportType) {
 		if c.encryptor != nil {
