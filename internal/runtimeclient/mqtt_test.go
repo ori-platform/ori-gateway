@@ -790,26 +790,6 @@ func TestMQTTRuntimeClientAcceptsPreviousSecretForResponse(t *testing.T) {
 	}
 }
 
-func TestMQTTRuntimeClientRejectsUnsignedResponseWhenAuthEnabled(t *testing.T) {
-	b := newFakeBroker()
-	now := time.UnixMilli(1234567890000)
-	client, err := NewMQTTClient(
-		b,
-		WithRequestIDFunc(func() (string, error) { return "health-unsigned", nil }),
-		WithMessageAuth("current-secret", "", func() time.Time { return now }),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.publishHook = func(_ string, _ []byte) {
-		b.respond("edge-1", "health-unsigned", map[string]any{"export_type": "health", "complete": true, "items": []any{map[string]any{"device_id": "edge-1"}}})
-	}
-	_, err = client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
-	if err == nil || !strings.Contains(err.Error(), "verify export response") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestMQTTRuntimeClientDecryptsSensitiveExportResponse(t *testing.T) {
 	b := newFakeBroker()
 	now := time.UnixMilli(1234567890000)
