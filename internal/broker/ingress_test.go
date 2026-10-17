@@ -363,7 +363,7 @@ func TestIngressRefusalsAreRecordedWithoutContent(t *testing.T) {
 			deliver(oversize)
 		}
 		for range IngressRates[family].Burst + 200 {
-			deliver([]byte(marker))
+			deliver([]byte(`{"m":"` + marker + `"}`))
 		}
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -419,5 +419,36 @@ func TestSizeClassIsTheLeastPowerOfTwoNotBelowTheLength(t *testing.T) {
 		if got := contracts.SizeClass(length); got != want {
 			t.Errorf("SizeClass(%d) = %d, want %d", length, got, want)
 		}
+	}
+}
+
+// TestAByteBudgetBoundsTheParseWorkEachDeviceCanCause sends payloads at the
+// family maximum until the device's byte budget is spent: the next is dropped
+// as volume, while a payload at the maximum always fits a full budget.
+func TestAByteBudgetBoundsTheParseWorkEachDeviceCanCause(t *testing.T) {
+	for _, family := range contracts.ReceivedFamilies {
+		t.Run(family, func(t *testing.T) {
+			rate := IngressRates[family]
+			maximum := contracts.PayloadMaxima[family]
+			if rate.BurstBytes < maximum {
+				t.Fatalf("burst %d bytes is below the family maximum %d", rate.BurstBytes, maximum)
+			}
+			r := newIngressRig(t)
+			deliver := r.subscription(t, ingressTopics[family])
+			payload := jsonObjectPayload(maximum)
+			fits := min(rate.BurstBytes/maximum, rate.Burst)
+			for i := range fits {
+				if !deliver(payload) {
+					t.Fatalf("payload %d within the budget was dropped", i)
+				}
+			}
+			if fits < rate.Burst && deliver(payload) {
+				t.Fatal("a payload past the byte budget was handled")
+			}
+			r.advance(time.Duration(float64(maximum) / rate.BytesPerSecond * float64(time.Second)))
+			if !deliver(payload) {
+				t.Fatal("a payload after the budget refilled was dropped")
+			}
+		})
 	}
 }

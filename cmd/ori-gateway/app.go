@@ -324,6 +324,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct runtime export client options: %w", err)
 		}
+		runtimeClientOptions = append(runtimeClientOptions, runtimeclient.WithLogger(deps.logger))
 		runtimeExportClient, err = deps.newRuntimeClient(client, runtimeClientOptions...)
 		if err != nil {
 			return fmt.Errorf("construct runtime export client: %w", err)
@@ -424,6 +425,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct evidence return publisher: %w", err)
 		}
+		returnPublisher.SetLogger(deps.logger)
 		evidenceIngress.SetReturnNotifier(returnPublisher.Notify)
 		evidenceIngress.SetHandoff(courier.Handoff(evidenceWorker, returnPublisher))
 		evidenceIngress.SetFaultRecorder(evidenceFaults)

@@ -4,6 +4,7 @@
 package broker
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -27,10 +28,16 @@ const (
 const ingressLogInterval = time.Second
 
 // IngressRate is the rate at which a subscription processes messages:
-// PerSecond sustained, Burst at once.
+// PerSecond messages sustained and Burst at once, and BytesPerSecond payload
+// bytes sustained and BurstBytes at once. The byte budget bounds the parse
+// work the member rule does before authentication, which grows with a
+// payload's length; BurstBytes is at least the family maximum, so one
+// payload at the maximum is always within it.
 type IngressRate struct {
-	PerSecond float64
-	Burst     int
+	PerSecond      float64
+	Burst          int
+	BytesPerSecond float64
+	BurstBytes     int
 }
 
 // IngressRates are the gateway's own rates for each family it receives,
@@ -41,20 +48,22 @@ type IngressRate struct {
 // configuration the runtime controls changes one.
 var IngressRates = map[string]IngressRate{
 	// A runtime heartbeats every few seconds at most.
-	contracts.FamilyRuntimeHeartbeat: {PerSecond: 1, Burst: 5},
+	contracts.FamilyRuntimeHeartbeat: {PerSecond: 1, Burst: 5, BytesPerSecond: 128 << 10, BurstBytes: 256 << 10},
 	// A runtime sends one request per gateway escalation.
-	contracts.FamilyReasoningRequest: {PerSecond: 10, Burst: 20},
+	contracts.FamilyReasoningRequest: {PerSecond: 10, Burst: 20, BytesPerSecond: 512 << 10, BurstBytes: 1 << 20},
 	// An enrichment request follows an operator's Tier C proposal.
-	contracts.FamilyEnrichmentRequest: {PerSecond: 2, Burst: 10},
-	// Export responses answer the gateway's own paged requests.
-	contracts.FamilyExportResponse: {PerSecond: 20, Burst: 64},
+	contracts.FamilyEnrichmentRequest: {PerSecond: 2, Burst: 10, BytesPerSecond: 256 << 10, BurstBytes: 512 << 10},
+	// Export responses answer the gateway's own paged requests, one page each.
+	// The runtime never resends a page and serves at most four requests at
+	// once, so the burst holds four pages at the maximum.
+	contracts.FamilyExportResponse: {PerSecond: 20, Burst: 64, BytesPerSecond: 4 << 20, BurstBytes: 16 << 20},
 	// One runtime drain pass publishes up to about 151 carriages back to back
 	// (50 envelopes, a checkpoint, 50 registrations, 50 re-offers); a dropped
 	// carriage is retried by its runtime, which keeps its bytes.
-	contracts.FamilyEvidenceOutbound: {PerSecond: 20, Burst: 160},
+	contracts.FamilyEvidenceOutbound: {PerSecond: 20, Burst: 160, BytesPerSecond: 2 << 20, BurstBytes: 4 << 20},
 	// An inbound acknowledgement follows a carriage the gateway sent; a
 	// dropped one leaves the artifact queued and carried again.
-	contracts.FamilyEvidenceInboundAck: {PerSecond: 20, Burst: 64},
+	contracts.FamilyEvidenceInboundAck: {PerSecond: 20, Burst: 64, BytesPerSecond: 64 << 10, BurstBytes: 256 << 10},
 }
 
 // CheckSubscription reports whether topic may be subscribed: it must belong to
@@ -70,7 +79,9 @@ func CheckSubscription(topic string) error {
 	return nil
 }
 
-// IngressCount is one family's refusals since the process started.
+// IngressCount is one family's size and volume refusals since the process
+// started: the counts site health projects. A member rule refusal is logged
+// with its reason, not counted here.
 type IngressCount struct {
 	PayloadTooLarge uint64
 	VolumeDropped   uint64
@@ -130,9 +141,10 @@ func (s *IngressStats) refuse(family, reason string, length int) {
 		count = &IngressCount{}
 		s.counts[family] = count
 	}
-	if reason == RefusalPayloadTooLarge {
+	switch reason {
+	case RefusalPayloadTooLarge:
 		count.PayloadTooLarge++
-	} else {
+	case RefusalVolumeDropped:
 		count.VolumeDropped++
 	}
 	key := ingressLogKey{family: family, reason: reason}
@@ -196,8 +208,13 @@ func (s *IngressStats) write(key ingressLogKey, line ingressLine) {
 			"maximum", contracts.PayloadMaxima[key.family])
 		return
 	}
-	s.log.Warn("mqtt ingress dropped messages over the family rate",
-		"family", key.family, "dropped", line.count)
+	if key.reason == RefusalVolumeDropped {
+		s.log.Warn("mqtt ingress dropped messages over the family rate",
+			"family", key.family, "dropped", line.count)
+		return
+	}
+	s.log.Warn("mqtt ingress refused payloads under the payload member rule",
+		"family", key.family, "reason", key.reason, "refused", line.count)
 }
 
 // ingressGate admits one subscription's messages: size first, then the rate
@@ -223,7 +240,12 @@ type ingressGate struct {
 
 type ingressBucket struct {
 	tokens float64
+	bytes  float64
 	last   time.Time
+}
+
+func newIngressBucket(rate IngressRate, now time.Time) *ingressBucket {
+	return &ingressBucket{tokens: float64(rate.Burst), bytes: float64(rate.BurstBytes), last: now}
 }
 
 func newIngressGate(topic string, devices []string, stats *IngressStats, now func() time.Time) (*ingressGate, error) {
@@ -241,11 +263,11 @@ func newIngressGate(topic string, devices []string, stats *IngressStats, now fun
 		now:       now,
 		perDevice: deviceSegment(topic) == "+",
 		buckets:   make(map[string]*ingressBucket),
-		overflow:  &ingressBucket{tokens: float64(rate.Burst), last: start},
+		overflow:  newIngressBucket(rate, start),
 	}
 	if g.perDevice {
 		for _, device := range devices {
-			g.buckets[device] = &ingressBucket{tokens: float64(rate.Burst), last: start}
+			g.buckets[device] = newIngressBucket(rate, start)
 		}
 	}
 	return g, nil
@@ -260,9 +282,25 @@ func deviceSegment(topic string) string {
 	return segments[1]
 }
 
-// admit reads nothing of the payload but its length, and nothing of the
-// topic but its device segment.
-func (g *ingressGate) admit(topic string, length int) bool {
+// admitMembers applies the Payload Member Rule to a payload size and rate
+// have admitted. The broker's wrapper calls admitVolume, discards a retained
+// message, then calls this.
+func (g *ingressGate) admitMembers(payload []byte) bool {
+	var refused *contracts.MemberRuleError
+	if err := contracts.AdmitPayload(g.family, payload); errors.As(err, &refused) {
+		g.stats.refuse(g.family, refused.Reason, len(payload))
+		return false
+	} else if err != nil {
+		g.stats.refuse(g.family, contracts.ReasonMalformedJSON, len(payload))
+		return false
+	}
+	return true
+}
+
+// admitVolume applies size, then the sending device's message and byte rate.
+// It reads nothing of the payload but its length, and nothing of the topic but
+// its device segment.
+func (g *ingressGate) admitVolume(topic string, length int) bool {
 	if length > g.maximum {
 		g.stats.refuse(g.family, RefusalPayloadTooLarge, length)
 		return false
@@ -276,15 +314,14 @@ func (g *ingressGate) admit(topic string, length int) bool {
 		}
 	}
 	if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
-		b.tokens += elapsed * g.rate.PerSecond
-		if burst := float64(g.rate.Burst); b.tokens > burst {
-			b.tokens = burst
-		}
+		b.tokens = min(float64(g.rate.Burst), b.tokens+elapsed*g.rate.PerSecond)
+		b.bytes = min(float64(g.rate.BurstBytes), b.bytes+elapsed*g.rate.BytesPerSecond)
 	}
 	b.last = now
-	admitted := b.tokens >= 1
+	admitted := b.tokens >= 1 && b.bytes >= float64(length)
 	if admitted {
 		b.tokens--
+		b.bytes -= float64(length)
 	}
 	g.mu.Unlock()
 	if !admitted {

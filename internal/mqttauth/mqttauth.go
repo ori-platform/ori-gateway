@@ -300,61 +300,17 @@ func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requ
 	return err
 }
 
-// maxAmbiguityDepth bounds the nesting refuseAmbiguousMembers walks, the same
-// bound encoding/json applies.
-const maxAmbiguityDepth = 10000
-
-// refuseAmbiguousMembers refuses a payload holding, in any object at any
-// depth, two members whose names are equal or differ only in case. The
-// authenticator covers each member as written, while encoding/json keeps the
-// last duplicate and matches a struct field without regard to case, so either
-// would let a verified message be read as something its signer did not write.
+// refuseAmbiguousMembers applies the Payload Member Rule's refusals that need
+// no contract names: invalid Unicode, malformed JSON, nesting past 32, trailing
+// data, a member named twice, two names in one object equal under the closed
+// fold, and a payload that is not an object. The authenticator covers each
+// member as written, while encoding/json keeps the last duplicate and matches
+// a struct field without regard to case, so either would let a verified
+// message be read as something its signer did not write. The broker applies
+// the full rule, with each family's members, before any handler runs.
 func refuseAmbiguousMembers(payload []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	if err := walkMembers(decoder, 0); err != nil {
+	if err := contracts.AdmitPayloadWithMembers(nil, payload); err != nil {
 		return fmt.Errorf("ambiguous mqtt auth payload: %w", err)
-	}
-	return nil
-}
-
-func walkMembers(decoder *json.Decoder, depth int) error {
-	if depth > maxAmbiguityDepth {
-		return fmt.Errorf("nested too deeply")
-	}
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	switch token {
-	case json.Delim('{'):
-		var names []string
-		for decoder.More() {
-			key, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			name, _ := key.(string)
-			for _, seen := range names {
-				if strings.EqualFold(seen, name) {
-					return fmt.Errorf("member %q is named more than once", name)
-				}
-			}
-			names = append(names, name)
-			if err := walkMembers(decoder, depth+1); err != nil {
-				return err
-			}
-		}
-		_, err = decoder.Token()
-		return err
-	case json.Delim('['):
-		for decoder.More() {
-			if err := walkMembers(decoder, depth+1); err != nil {
-				return err
-			}
-		}
-		_, err = decoder.Token()
-		return err
 	}
 	return nil
 }
