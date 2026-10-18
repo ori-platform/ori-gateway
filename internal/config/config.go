@@ -82,6 +82,9 @@ type GatewayConfig struct {
 	Auth               GatewayAuthConfig       `yaml:"auth"`
 	Custody            GatewayCustodyConfig    `yaml:"custody"`
 	Encryption         GatewayEncryptionConfig `yaml:"encryption"`
+	// StateDirectory is the gateway's own durable state, today its signing
+	// clock: a private directory, required when Auth is enabled.
+	StateDirectory string `yaml:"state_directory"`
 }
 
 type GatewayAuthConfig struct {
@@ -324,6 +327,7 @@ type fileGatewayConfig struct {
 	Auth               GatewayAuthConfig       `yaml:"auth"`
 	Custody            GatewayCustodyConfig    `yaml:"custody"`
 	Encryption         GatewayEncryptionConfig `yaml:"encryption"`
+	StateDirectory     string                  `yaml:"state_directory"`
 }
 
 type fileProviderConfig struct {
@@ -385,8 +389,35 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("validate config %q: %w", path, err)
 	}
+	if err := validateStateDirectory(cfg); err != nil {
+		return Config{}, fmt.Errorf("validate config %q: %w", path, err)
+	}
 
 	return cfg, nil
+}
+
+// validateStateDirectory keeps the gateway's own state apart from evidence
+// storage: the state directory may not be, contain, or sit inside an evidence
+// queue directory.
+func validateStateDirectory(cfg Config) error {
+	state := cfg.Gateway.StateDirectory
+	if state == "" || !cfg.Evidence.Enabled {
+		return nil
+	}
+	for _, queue := range []string{cfg.Evidence.QueueDirectory, cfg.Evidence.ReturnQueueDirectory} {
+		if queue == "" {
+			continue
+		}
+		if pathsOverlap(filepath.Clean(state), filepath.Clean(queue)) {
+			return fmt.Errorf("gateway.state_directory must be separate from the evidence queue directories")
+		}
+	}
+	return nil
+}
+
+func pathsOverlap(a, b string) bool {
+	sep := string(filepath.Separator)
+	return a == b || strings.HasPrefix(a, b+sep) || strings.HasPrefix(b, a+sep)
 }
 
 func (f *fileConfig) normalize() (Config, error) {
@@ -402,7 +433,8 @@ func (f *fileConfig) normalize() (Config, error) {
 			Custody: GatewayCustodyConfig{
 				SecretEnv: strings.TrimSpace(f.Gateway.Custody.SecretEnv),
 			},
-			Encryption: f.Gateway.Encryption,
+			Encryption:     f.Gateway.Encryption,
+			StateDirectory: strings.TrimSpace(f.Gateway.StateDirectory),
 		},
 		Provider: normalizeProviderStrings(ProviderConfig{
 			Name:     f.Provider.Name,
@@ -453,6 +485,14 @@ func (f *fileConfig) normalize() (Config, error) {
 	}
 	if cfg.Gateway.Encryption.Enabled && !cfg.Gateway.Auth.Enabled {
 		return Config{}, fmt.Errorf("gateway.encryption.enabled requires gateway.auth.enabled")
+	}
+	// A gateway that signs keeps its signing clock durable, so a restart never
+	// repeats a signing time (gateway-api/v2 Envelope Freshness and Replay).
+	if cfg.Gateway.Auth.Enabled && cfg.Gateway.StateDirectory == "" {
+		return Config{}, fmt.Errorf("gateway.state_directory is required when gateway.auth.enabled is true")
+	}
+	if cfg.Gateway.StateDirectory != "" && !filepath.IsAbs(cfg.Gateway.StateDirectory) {
+		return Config{}, fmt.Errorf("gateway.state_directory must be an absolute path")
 	}
 
 	if f.Gateway.HeartbeatIntervalS == nil {

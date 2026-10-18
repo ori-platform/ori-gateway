@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,6 +59,7 @@ func memberRuleThroughTheGateway(t *testing.T, signed bool) {
 	if signed {
 		t.Setenv("GATEWAY_ENVELOPE", secret)
 		cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+		cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	}
 	var logs syncBuffer
 	prov := &fakeProvider{healthy: true}

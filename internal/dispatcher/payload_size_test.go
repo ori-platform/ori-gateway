@@ -6,6 +6,7 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -134,5 +135,23 @@ func TestAProviderReturnedErrorIsSentAsTheBoundedErrorResponse(t *testing.T) {
 			!strings.HasPrefix(message, *resp.Error) || resp.Text != "" || resp.Model != "" || resp.RequestID != "req-1" {
 			t.Fatalf("%d bytes, response %+v; want the bounded, correlated error response", len(payload), resp)
 		}
+	}
+}
+
+// TestAResponseThatCannotBeEncodedIsAnsweredWithAnError has a provider
+// return a NaN confidence, which JSON cannot carry: the request is still
+// answered, with the family's correlated error response.
+func TestAResponseThatCannotBeEncodedIsAnsweredWithAnError(t *testing.T) {
+	pub := &fakePublisher{}
+	prov := &fakeProvider{response: contracts.ReasoningResponse{
+		RequestID: "req-1", Text: "x", Model: "m", Confidence: math.NaN(), ActionTier: contracts.ActionTierC,
+	}}
+	d := newTestDispatcher(t, pub, prov, Options{ProviderTimeoutMS: 1000})
+	if err := d.HandleRequest(context.Background(), "ori/site-a/reasoning/request", validPayload(t, nil)); err != nil {
+		t.Fatalf("HandleRequest = %v, want the request answered", err)
+	}
+	resp := pub.publishedResponse(t)
+	if resp.Error == nil || resp.RequestID != "req-1" {
+		t.Fatalf("response = %+v, want a correlated error response", resp)
 	}
 }

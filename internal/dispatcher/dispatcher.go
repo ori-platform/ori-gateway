@@ -28,6 +28,10 @@ var (
 	errProviderPanic = errors.New("provider panic")
 	// Refused before any side effect and never answered on the response topic.
 	errUnauthenticated = errors.New("unauthenticated reasoning request")
+	// ErrPublishResponse is a reply the dispatcher could not publish for a
+	// request it accepted: the one failure the gateway escalates under GW-6.
+	// A request it refuses, malformed, unauthenticated or not fresh, is not.
+	ErrPublishResponse = errors.New("dispatcher: publish response")
 )
 
 // confidenceDecimals bounds `confidence` to four decimal places at emission.
@@ -50,6 +54,7 @@ type Dispatcher struct {
 	verifier        *mqttauth.Verifier
 	signingSecret   string
 	now             func() time.Time
+	signingClock    *mqttauth.SigningClock
 
 	mu       sync.Mutex
 	inFlight map[string]struct{}
@@ -64,6 +69,9 @@ type Options struct {
 	AuthVerifier  *mqttauth.Verifier
 	SigningSecret string
 	Now           func() time.Time
+	// SigningClock issues every signed_at_ms; nil gives the component its own
+	// in-process clock, which never repeats a value within the process.
+	SigningClock *mqttauth.SigningClock
 }
 
 // New constructs a Dispatcher.
@@ -104,6 +112,7 @@ func New(publisher Publisher, reasoningProvider provider.Provider, opts Options)
 		verifier:        opts.AuthVerifier,
 		signingSecret:   signingSecret,
 		now:             now,
+		signingClock:    signingClockOrOwn(opts.SigningClock, now),
 		inFlight:        map[string]struct{}{},
 	}, nil
 }
@@ -214,21 +223,24 @@ func (d *Dispatcher) publishResponse(req contracts.ReasoningRequest, resp contra
 	}
 	payload, err := d.encodeResponse(req, resp)
 	if err != nil {
-		return err
-	}
-	if len(payload) > contracts.PayloadMaxima[contracts.FamilyReasoningResponse] {
+		// A response that cannot be encoded, such as one carrying a NaN, is
+		// answered by the family's error response, still correlated (GW-2).
+		payload, err = d.encodeResponse(req, contracts.NewErrorResponse(req.RequestID, req.DeviceID, req.ActionTierHint, "provider returned invalid response"))
+	} else if len(payload) > contracts.PayloadMaxima[contracts.FamilyReasoningResponse] {
 		// A response over its topic's maximum is never published; the family's
 		// error response goes in its place, so the runtime does not wait out
 		// its timeout (gateway-api/v2 Payload Size).
 		payload, err = d.encodeResponse(req, contracts.NewErrorResponse(req.RequestID, req.DeviceID, req.ActionTierHint, contracts.ErrorResponseTooLarge))
-		if err != nil {
-			return err
-		}
+	}
+	if err != nil {
+		// No reply can be built for an accepted request: a delivery failure,
+		// escalated under GW-6 like one that cannot be published.
+		return fmt.Errorf("%w: %w", ErrPublishResponse, err)
 	}
 	publishCtx, cancel := context.WithTimeout(context.Background(), d.publishTimeout)
 	defer cancel()
 	if err := d.publisher.Publish(publishCtx, topic, broker.QoSReasoning, false, payload); err != nil {
-		return fmt.Errorf("dispatcher: publish response: %w", err)
+		return fmt.Errorf("%w: %w", ErrPublishResponse, err)
 	}
 	return nil
 }
@@ -243,7 +255,7 @@ func (d *Dispatcher) encodeResponse(req contracts.ReasoningRequest, resp contrac
 	resp.Confidence = math.Round(resp.Confidence*confidenceDecimals) / confidenceDecimals
 	resp.Auth = nil
 	if d.signingSecret != "" {
-		auth, err := mqttauth.Sign(resp, contracts.ReasoningResponseMessageType, req.DeviceID, req.RequestID, d.now().UnixMilli(), d.signingSecret)
+		auth, err := mqttauth.Sign(resp, contracts.ReasoningResponseMessageType, req.DeviceID, req.RequestID, d.signingClock.Next(), d.signingSecret)
 		if err != nil {
 			return nil, fmt.Errorf("dispatcher: sign response: %w", err)
 		}
@@ -267,4 +279,11 @@ func providerErrorMessage(err error) string {
 		return "provider panic"
 	}
 	return "provider error"
+}
+
+func signingClockOrOwn(clock *mqttauth.SigningClock, now func() time.Time) *mqttauth.SigningClock {
+	if clock != nil {
+		return clock
+	}
+	return mqttauth.NewSigningClock(now, nil, nil)
 }

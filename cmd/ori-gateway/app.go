@@ -30,6 +30,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
 	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
+	"github.com/ori-platform/ori-gateway/internal/gatewaystate"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
@@ -269,6 +270,31 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
+	// One signing clock for every envelope the gateway signs outside the
+	// evidence path, so no two are signed at one value (gateway-api/v2
+	// Envelope Freshness and Replay, Senders). A gateway that signs keeps its
+	// mark in its own state directory, independent of evidence forwarding; a
+	// mark an earlier release kept in the outbound evidence queue directory is
+	// carried forward, so upgrading never resets the clock. A directory that is
+	// not private, not the gateway's, corrupt or not writable refuses the start.
+	var durableSigningClock mqttauth.DurableClock
+	if cfg.Gateway.Auth.Enabled {
+		stateDir, err := gatewaystate.Open(cfg.Gateway.StateDirectory)
+		if err != nil {
+			return fmt.Errorf("open gateway state directory: %w", err)
+		}
+		legacyDir := ""
+		if cfg.Evidence.Enabled {
+			legacyDir = cfg.Evidence.QueueDirectory
+		}
+		clock, err := gatewaystate.OpenSigningClock(stateDir, legacyDir, deps.now)
+		if err != nil {
+			return err
+		}
+		durableSigningClock = clock
+	}
+	signingClock := mqttauth.NewSigningClock(deps.now, durableSigningClock, deps.logger)
+
 	// One count of size and volume refusals for every broker client, projected
 	// as the site's mqtt_ingress posture.
 	ingress := broker.NewIngressStats(deps.logger)
@@ -326,7 +352,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct runtime export client options: %w", err)
 		}
-		runtimeClientOptions = append(runtimeClientOptions, runtimeclient.WithLogger(deps.logger))
+		runtimeClientOptions = append(runtimeClientOptions, runtimeclient.WithLogger(deps.logger),
+			runtimeclient.WithSigningClock(signingClock))
 		runtimeExportClient, err = deps.newRuntimeClient(client, runtimeClientOptions...)
 		if err != nil {
 			return fmt.Errorf("construct runtime export client: %w", err)
@@ -380,9 +407,22 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Posture fetches run per device off the broker callback, and each signs
+	// an export request from the durable signing clock. They are owned here:
+	// once shutdown begins none starts, and runGateway never returns while
+	// one is still running (GW-15).
+	postureDebounce := newPostureDebouncer()
+	defer func() {
+		cancel()
+		postureDebounce.close()
+		// The signing clock extends its durable reservation in the
+		// background; no such write outlives runGateway.
+		signingClock.Close()
+	}()
 	runners := newSupervisedRunners(runCtx)
 	shutdownRunners := func() {
 		cancel()
+		postureDebounce.close()
 		_ = runners.wait()
 	}
 
@@ -478,6 +518,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			Logger:        deps.logger,
 			Auth:          heartbeatAuth,
 			WebhookBridge: webhookBridgePostureProbe(cfg.WebhookBridge, webhookBridgeReady.Load),
+			SigningClock:  signingClock,
 		},
 	)
 	if err != nil {
@@ -488,7 +529,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
 
-	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now}
+	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now, SigningClock: signingClock}
 	if gatewaySecrets.Enabled {
 		verifier, err := mqttauth.NewVerifier(mqttauth.Config{
 			SharedSecret:         gatewaySecrets.CurrentSecret,
@@ -516,6 +557,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err := client.Subscribe(runCtx, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 		if err := reasoningDispatcher.HandleRequest(runCtx, topic, payload); err != nil {
 			deps.logger.Warn("reasoning request handling failed", "topic", topic, "error", err)
+			// Only a reply that could not be delivered counts toward the
+			// escalation (GW-6). A refused request, malformed, unauthenticated
+			// or not fresh, neither counts nor resets the count, so no sender
+			// can end the gateway or mask a delivery failure by sending junk.
+			if !errors.Is(err, dispatcher.ErrPublishResponse) {
+				return
+			}
 			requestFailureMu.Lock()
 			requestFailures++
 			failures := requestFailures
@@ -581,7 +629,6 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
-	postureDebounce := newPostureDebouncer()
 	for _, deviceID := range cfg.Gateway.DeviceIDs {
 		topic, err := contracts.RuntimeNodeHeartbeatTopic(deviceID)
 		if err != nil {
@@ -615,7 +662,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment provider: %w", err)
 		}
-		enrichmentOptions := enrichment.Options{Logger: deps.logger, Now: deps.now}
+		enrichmentOptions := enrichment.Options{Logger: deps.logger, Now: deps.now, SigningClock: signingClock}
 		if gatewaySecrets.Enabled {
 			verifier, err := mqttauth.NewVerifier(mqttauth.Config{
 				SharedSecret:         gatewaySecrets.CurrentSecret,
@@ -689,6 +736,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return disconnectBroker(client, &disconnect)
 	case err := <-runners.done():
 		cancel()
+		postureDebounce.close()
 		if ctx.Err() != nil {
 			return disconnectBroker(client, &disconnect)
 		}
@@ -1090,6 +1138,8 @@ func (s staticProviderStatus) Healthy(ctx context.Context) bool {
 type postureDebouncer struct {
 	mu       sync.Mutex
 	inflight map[string]bool
+	closed   bool
+	running  sync.WaitGroup
 }
 
 func newPostureDebouncer() *postureDebouncer {
@@ -1097,21 +1147,33 @@ func newPostureDebouncer() *postureDebouncer {
 }
 
 // tryStart marks deviceID as in-flight and returns true if no fetch was already
-// running. Returns false (and does nothing) if a fetch is already in flight.
+// running and the debouncer is not closed. Returns false (and does nothing)
+// otherwise. A true result must be paired with done.
 func (d *postureDebouncer) tryStart(deviceID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.inflight[deviceID] {
+	if d.closed || d.inflight[deviceID] {
 		return false
 	}
 	d.inflight[deviceID] = true
+	d.running.Add(1)
 	return true
 }
 
 func (d *postureDebouncer) done(deviceID string) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	delete(d.inflight, deviceID)
+	d.mu.Unlock()
+	d.running.Done()
+}
+
+// close refuses every later fetch and waits for those running to finish. It
+// may be called more than once.
+func (d *postureDebouncer) close() {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	d.running.Wait()
 }
 
 func fetchAndUpsertPosture(ctx context.Context, rc runtimeclient.Client, registry *site.Registry, deviceID string, logger *slog.Logger) {

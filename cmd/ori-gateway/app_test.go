@@ -445,6 +445,7 @@ func TestGatewayAuthSecretPassesToHeartbeatOptions(t *testing.T) {
 		Enabled:         true,
 		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
 	}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()
@@ -489,6 +490,7 @@ func TestGatewayAuthMissingSecretStopsBeforeHeartbeat(t *testing.T) {
 		Enabled:         true,
 		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
 	}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()
@@ -812,6 +814,7 @@ func TestEvidenceUsesDedicatedPersistentBrokerSession(t *testing.T) {
 	t.Setenv("EVIDENCE_SECRET", "evidence-ingest-secret-with-at-least-32-bytes")
 	cfg := validConfig()
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
 	cfg.Evidence = config.EvidenceConfig{
 		Enabled: true, QueueDirectory: filepath.Join(t.TempDir(), "outbound"),
@@ -999,6 +1002,7 @@ func TestMainRuntimeHeartbeatVerifiesSignedPayloadWhenGatewayAuthEnabled(t *test
 		Enabled:         true,
 		SharedSecretEnv: "CUSTOM_GATEWAY_SECRET",
 	}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()
@@ -1688,6 +1692,7 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 	t.Setenv("GEMINI_API_KEY", "gemini-key")
 	cfg := validConfig()
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_SECRET_CURRENT"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Gateway.Encryption.Enabled = true
 	cfg.Reporting = config.ReportingConfig{
 		Provider:     config.ReportingProviderGemini,
@@ -1707,8 +1712,8 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 		if b == nil {
 			t.Fatal("runtime client broker is nil")
 		}
-		if len(opts) != 3 {
-			t.Fatalf("expected auth, encryption and logger options, got %d", len(opts))
+		if len(opts) != 4 {
+			t.Fatalf("expected auth, encryption, logger and signing clock options, got %d", len(opts))
 		}
 		return runtimeclient.NewMQTTClient(b, opts...)
 	}
@@ -2138,6 +2143,7 @@ func TestGatewaySiteHealthIncludesEnabledEvidenceDelivery(t *testing.T) {
 	cfg := validConfig()
 	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
 	cfg.Evidence = config.EvidenceConfig{
 		Enabled: true, QueueDirectory: queueDirectory,
@@ -2524,6 +2530,7 @@ func TestMainTierCEnrichmentUnderGatewayAuthDropsUnsignedAndSignsResponses(t *te
 	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
 	cfg := validConfig()
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Reporting = config.ReportingConfig{
 		Provider:        config.ReportingProviderGemini,
 		Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
@@ -2633,6 +2640,7 @@ func TestMainReasoningUnderGatewayAuthDropsUnsignedAndSignsResponses(t *testing.
 	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
 	cfg := validConfig()
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()

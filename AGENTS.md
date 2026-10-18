@@ -24,8 +24,9 @@ publish-failure paths must still preserve the original `request_id` whenever the
 incoming request is valid enough to correlate. Verified by:
 `TestDispatcherTimeoutErrorResponse`, `TestDispatcherProviderErrorResponse`,
 `TestDispatcherProviderPanicResponse`,
-`TestDispatcherProviderInvalidResponsePublishesErrorResponse`, and
-`TestDispatcherPublishFailureIsSurfaced`.
+`TestDispatcherProviderInvalidResponsePublishesErrorResponse`,
+`TestDispatcherPublishFailureIsSurfaced`, and
+`TestAResponseThatCannotBeEncodedIsAnsweredWithAnError`.
 
 3. `GW-3` Providers must satisfy one shared interface.
 Provider-specific settings belong in config, not in the provider interface.
@@ -47,9 +48,14 @@ keeping Tier D evaluation and actuation APIs out of this repository.
 If heartbeat publication cannot continue, the gateway must report failure or
 exit rather than silently appearing available.
 The gateway process must also surface repeated reasoning-response delivery
-failures instead of logging forever while dropping all replies. Verified by
-`TestHeartbeatFailureLimit`, `TestGatewayHeartbeatFailureReturnsError`, and
-`TestMainEscalatesRepeatedRequestHandlerFailures`.
+failures instead of logging forever while dropping all replies. Only a reply
+it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
+a request it refuses, malformed, unauthenticated or not fresh, neither counts
+nor resets the count, so no sender can end the gateway by sending junk.
+Verified by `TestHeartbeatFailureLimit`,
+`TestGatewayHeartbeatFailureReturnsError`,
+`TestMainEscalatesRepeatedRequestHandlerFailures`, and
+`TestMalformedReasoningRequestsNeverStopTheGateway`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
@@ -121,14 +127,20 @@ later stages from starting. Shutdown must cancel background work and disconnect
 the broker. Long-running app tasks must be supervised through the shared
 `errgroup`-backed supervisor rather than open-coded result channels, so adding a
 new runner does not require updating every early-return drain path by hand.
+Posture fetches, started per device from the runtime heartbeat callback, are
+owned by the same shutdown: once it begins none starts, and `runGateway` does
+not return while one is still running, since each signs an export request from
+the durable signing clock.
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
 `TestGatewayStartupSubscribeFailureCancelsHeartbeatAndDisconnects`,
 `TestMainStartsHeartbeatBeforeSubscribe`, `TestGracefulShutdown`,
 `TestSupervisedRunnersReportsRunnerErrors`,
-`TestSupervisedRunnersWaitsForAllRunners`, and
-`TestSupervisedRunnersUnexpectedNilReturnIsError`.
+`TestSupervisedRunnersWaitsForAllRunners`,
+`TestSupervisedRunnersUnexpectedNilReturnIsError`,
+`TestShutdownWaitsForAPostureFetchesSigningWrite`, and
+`TestAClosedPostureDebouncerStartsNothing`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
@@ -497,6 +509,49 @@ of one export is bounded, so no caller waits on an export without a bound
 `TestRepeatedForgeriesNeverExtendTheBound`,
 `TestAResponseOnAnotherDevicesTopicNeverAnswers` and
 `TestAnExportRequestsABoundedNumberOfPages`.
+
+24. `GW-24` Envelope freshness and replay follow gateway-api/v2.
+Every runtime-gateway HMAC envelope the gateway verifies is checked in the
+contract's order, stale, future, below the replay floor, replay, each refused
+under its own name (`mqttauth.ErrStaleTimestamp`, `ErrFutureTimestamp`,
+`ErrBeforeReplayFloor`, `ErrReplayDetected`). A key is kept until its envelope
+is stale; `replay_ttl_ms` is only a lower bound. Every dropped or evicted key
+raises the floor past it in the same step, and a full verifier evicts its key
+with the smallest signing time. The gateway stores neither its floor nor its
+keys, so each verifier starts its floor at its clock: an envelope signed before
+the start is refused, and the contract's stated limits for a receiver that
+stores nothing apply. A family that records only once an envelope answers
+something rechecks the floor and replay in one step with recording, and a
+recorded key is never un-recorded. A refusal below a floor ahead of the stale
+bound is logged with the floor and the clock. Skew is fixed at 5 minutes.
+Every envelope the gateway signs takes `signed_at_ms` from a signing clock: the
+evidence families from their own durable clocks, and the heartbeat, reasoning
+and enrichment responses and export requests from one shared
+`mqttauth.SigningClock`. Within a process no clock repeats a value. A gateway
+that signs keeps the shared clock's mark in `gateway.state_directory`, which
+is required when `gateway.auth.enabled` and is owned by `internal/gatewaystate`
+alone: private (0700, the gateway's user, never a symlink), marked as the
+gateway's, apart from evidence storage, and confers no authority. The mark is
+persisted a second ahead of what is issued, at startup and then in the
+background, so signing never waits on the disk within a reservation and a
+restart never repeats a value; a mark an earlier build kept in the outbound
+evidence queue directory is carried forward and removed. A directory that is
+not the gateway's, a corrupt mark or a directory that cannot be written
+refuses the start; a write that fails later is logged once and signing goes on
+from the in-process value. A signing time more than the skew ahead of the wall
+clock is logged as a warning. Verified by
+`TestReplayVectorCases`, `TestAKeyIsKeptUntilItsEnvelopeIsStale`,
+`TestADroppedKeyRaisesTheFloor`, `TestAStartFloorRefusesWhatWasSignedBefore`,
+`TestFreshnessReasonsAreNamedApart`, `TestSignersNeverRepeatASignedAt`,
+`TestHeartbeatsNeverShareASigningTime`,
+`TestTheDurableMarkIsWrittenAboutOnceASecond`,
+`TestARestartResumesAboveEveryReservation`,
+`TestTheValueOnePastAReservationIsPersisted`,
+`TestASigningClockAheadOfTheWallIsReported`,
+`TestEverySignerSharesTheGatewaysSigningClock` and
+`TestASignedAtNeverRepeatsAcrossARestart`,
+`TestSigningNeverWaitsOnTheDiskWithinAReservation`, and the
+`internal/gatewaystate` tests.
 
 ## Layout
 

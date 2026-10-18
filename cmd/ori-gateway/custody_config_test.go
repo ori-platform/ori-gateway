@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,7 @@ func TestCustodyConfigurationIsValidatedDuringStartup(t *testing.T) {
 
 			cfg := validConfig()
 			cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: envelopeEnv}
+			cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 			cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: custodyEnv}
 
 			fb := newFakeBroker()
@@ -130,6 +132,7 @@ func TestWellFormedCustodyConfigurationStartsTheGateway(t *testing.T) {
 		Enabled:         true,
 		SharedSecretEnv: "ORI_TEST_STARTUP_ENVELOPE_SECRET",
 	}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "ORI_TEST_STARTUP_CUSTODY_SECRET"}
 
 	fb := newFakeBroker()

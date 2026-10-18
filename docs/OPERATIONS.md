@@ -664,3 +664,60 @@ it eases, without using up the operator's own allowance. The
 bridge decides only volume; which senders may approve a proposal is the
 runtime's decision.
 
+## Signed messages refused as stale, future or below the replay floor
+
+With `gateway.auth.enabled`, every signed MQTT message the gateway receives
+from a runtime is checked for freshness and replay before anything else uses
+it, against a skew of 5 minutes. A refusal names one of four reasons:
+`stale_timestamp` (signed more than 5 minutes before the gateway's clock),
+`future_timestamp` (more than 5 minutes after), `before_replay_floor` (signed
+before the gateway's replay floor) or `replay_detected` (a message already
+accepted, sent again).
+
+The gateway keeps its replay floor and the messages it has accepted in memory
+only. Each start sets the floor to the start time, so a message a runtime
+signed just before the gateway started is refused once as
+`before_replay_floor`; the runtime's next message is signed afresh and is
+accepted. A runtime whose clock runs behind the gateway's has its messages
+refused after a start until its clock passes the start time: keep both clocks
+synchronised. When a refusal comes from a floor ahead of the clock, the
+gateway logs `WARN mqtt auth refused an envelope below the replay floor, which
+is ahead of the clock's stale bound` with `floor_ms` and `t_ms`; it clears
+once the clock passes the floor.
+
+Every message the gateway signs takes its signing time from a clock that never
+issues the same value twice. Its mark is kept in `gateway.state_directory`
+(`.ori-signed-at-messages`), written about once a second off the signing path,
+so a restart resumes above it even with the clock set back. The state
+directory is required when `gateway.auth.enabled` is true. Provision it before
+the first start, private to the gateway's user:
+
+```sh
+sudo install -d -m 0700 -o "$GATEWAY_USER" -g "$GATEWAY_GROUP" /var/lib/ori-gateway/state
+```
+
+or let the gateway create it (0700) under a parent it may write. The gateway
+refuses to start when the directory is a symlink, is readable or writable by
+group or other users, is owned by another user, is not empty and not marked as
+the gateway's (`.ori-gateway-state-v1`), holds a corrupt mark, or cannot be
+written. It must not be, or sit inside, an evidence queue directory. On the
+first start after upgrading from a build that kept the mark in the outbound
+evidence queue directory, the gateway carries that mark forward and removes
+it there. If the file cannot be written while the gateway runs, it logs `WARN
+signing clock could not be persisted; signing from the in-process clock` and
+keeps signing.
+
+That mark means a clock that once ran fast is not forgotten at a restart: the
+gateway keeps signing just above it. When it is more than 5 minutes ahead of
+the wall clock, runtimes refuse what the gateway signs as `future_timestamp`
+(the gateway looks unreachable and Tier 3 falls back), and the gateway logs
+`WARN signing clock is ahead of the wall clock by more than receivers' skew`
+with `signed_at_ms` and `wall_ms`. It clears by itself once the wall clock
+passes `signed_at_ms`. To clear it sooner, correct the clock, stop the gateway,
+delete `.ori-signed-at-messages` from the gateway state directory and start it
+again. A message signed at the same time as one before the restart,
+with the same content, is then refused once as a replay; and a runtime whose
+replay floor was raised past the gateway's earlier signing times refuses the
+gateway's messages as `before_replay_floor` until its own clock passes that
+floor, at most 5 minutes.
+

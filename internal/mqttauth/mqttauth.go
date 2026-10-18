@@ -9,7 +9,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +23,17 @@ import (
 const signaturePrefix = "hmac-sha256:"
 
 const (
-	defaultMaxSkew   = 5 * time.Minute
+	// defaultMaxSkew is the skew the gateway receives under; it is fixed, as
+	// gateway configuration offers no setting for it.
+	defaultMaxSkew = 5 * time.Minute
+	// defaultReplayTTL is a lower bound on retention from receipt; a key is
+	// kept until its envelope is stale whatever it is (gateway-api/v2
+	// Envelope Freshness and Replay).
 	defaultReplayTTL = 5 * time.Minute
+	// defaultMaxKeys bounds the held keys. A full verifier drops the key with
+	// the smallest signing time, raising the floor past it, rather than
+	// refusing a new envelope.
+	defaultMaxKeys = 131072
 )
 
 // Config controls HMAC verification for site-local runtime/gateway MQTT messages.
@@ -32,6 +43,10 @@ type Config struct {
 	MaxSkew              time.Duration
 	ReplayTTL            time.Duration
 	Now                  func() time.Time
+	// MaxKeys bounds the held keys; zero is defaultMaxKeys.
+	MaxKeys int
+	// Logger receives the before_replay_floor warning; nil is slog.Default.
+	Logger *slog.Logger
 }
 
 // Verifier validates signed MQTT envelopes and rejects short-window replays.
@@ -42,8 +57,12 @@ type Verifier struct {
 	replayTTL            time.Duration
 	now                  func() time.Time
 
-	mu       sync.Mutex
-	seenKeys map[string]time.Time
+	log *slog.Logger
+
+	mu sync.Mutex
+	// replay is the freshness and replay state. The gateway stores neither
+	// its floor nor its keys, so each run starts its floor at its clock.
+	replay *replayState
 }
 
 // NewVerifier builds a verifier with bounded in-memory replay protection.
@@ -68,13 +87,23 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	if previousSecret != "" && hmac.Equal([]byte(previousSecret), []byte(secret)) {
 		return nil, fmt.Errorf("mqtt auth previous shared secret must differ from shared secret")
 	}
+	maxKeys := cfg.MaxKeys
+	if maxKeys <= 0 {
+		maxKeys = defaultMaxKeys
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Verifier{
 		sharedSecret:         secret,
 		previousSharedSecret: previousSecret,
 		maxSkew:              maxSkew,
 		replayTTL:            replayTTL,
 		now:                  now,
-		seenKeys:             map[string]time.Time{},
+		log:                  logger,
+		replay: newReplayState(maxSkew.Milliseconds(), replayTTL.Milliseconds(), false, maxKeys,
+			now().UnixMilli()),
 	}, nil
 }
 
@@ -253,7 +282,7 @@ func cloneWithoutAuth(payload map[string]any) map[string]any {
 func (v *Verifier) ReplayEntries() int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return len(v.seenKeys)
+	return len(v.replay.keys)
 }
 
 func replayKey(messageType string, deviceID string, requestID string, signedAtMS int64, signature string) string {
@@ -272,32 +301,39 @@ func replayKey(messageType string, deviceID string, requestID string, signedAtMS
 // it. decide runs under the replay lock, so two copies of one payload cannot
 // both be applied.
 func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requestID string, auth contracts.HeartbeatAuth, unsigned map[string]any, decide func(map[string]any) (bool, error)) error {
-	now := v.now()
-	signedAt := time.UnixMilli(auth.SignedAtMS)
-	if signedAt.After(now.Add(v.maxSkew)) || signedAt.Before(now.Add(-v.maxSkew)) {
-		return fmt.Errorf("mqtt auth signed_at_ms outside allowed skew")
-	}
-
 	key := replayKey(messageType, deviceID, requestID, auth.SignedAtMS, auth.Signature)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	for seenKey, expiresAt := range v.seenKeys {
-		if !expiresAt.After(now) {
-			delete(v.seenKeys, seenKey)
-		}
-	}
-	if expiresAt, ok := v.seenKeys[key]; ok && expiresAt.After(now) {
-		return fmt.Errorf("mqtt auth replay detected")
+	t := v.now().UnixMilli()
+	v.replay.prune(t)
+	if err := v.replay.check(key, auth.SignedAtMS, t); err != nil {
+		v.warnFloorAhead(err, t)
+		return err
 	}
 	if decide == nil {
-		v.seenKeys[key] = now.Add(v.replayTTL)
+		v.replay.record(key, auth.SignedAtMS, t)
 		return nil
 	}
+	// The decision runs under the same lock, so checks 3 and 4 still hold
+	// when the key is recorded: no drop or floor raise can come between.
 	applied, err := decide(unsigned)
 	if applied {
-		v.seenKeys[key] = now.Add(v.replayTTL)
+		if recheck := v.replay.recheck(key, auth.SignedAtMS); recheck != nil {
+			return recheck
+		}
+		v.replay.record(key, auth.SignedAtMS, t)
 	}
 	return err
+}
+
+// warnFloorAhead logs a refusal below a floor that is ahead of the stale
+// bound, the only local record of a restart, a clock step or an eviction that
+// is refusing fresh envelopes.
+func (v *Verifier) warnFloorAhead(err error, t int64) {
+	if errors.Is(err, ErrBeforeReplayFloor) && v.replay.floor > t-v.replay.skew {
+		v.log.Warn("mqtt auth refused an envelope below the replay floor, which is ahead of the clock's stale bound",
+			"floor_ms", v.replay.floor, "t_ms", t)
+	}
 }
 
 // refuseAmbiguousMembers applies the Payload Member Rule's refusals that need

@@ -46,6 +46,7 @@ type requestIDFunc func() (string, error)
 // MQTTClient implements Client over runtime MQTT export request/response topics.
 type MQTTClient struct {
 	log                 *slog.Logger
+	signingClock        *mqttauth.SigningClock
 	exportWait          time.Duration
 	broker              mqttBroker
 	qos                 byte
@@ -111,6 +112,16 @@ func WithExportWait(wait time.Duration) MQTTClientOption {
 	}
 }
 
+// WithSigningClock sets the clock that issues every export request's
+// signed_at_ms; without it the client keeps its own in-process clock.
+func WithSigningClock(clock *mqttauth.SigningClock) MQTTClientOption {
+	return func(c *MQTTClient) {
+		if clock != nil {
+			c.signingClock = clock
+		}
+	}
+}
+
 // WithLogger sets where the client records a response it refuses.
 func WithLogger(log *slog.Logger) MQTTClientOption {
 	return func(c *MQTTClient) {
@@ -150,6 +161,9 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 	}
 	for _, opt := range opts {
 		opt(client)
+	}
+	if client.signingClock == nil {
+		client.signingClock = mqttauth.NewSigningClock(client.now, nil, client.log)
 	}
 	if client.optionErr != nil {
 		return nil, fmt.Errorf("runtimeclient: %w", client.optionErr)
@@ -540,7 +554,7 @@ func (c *MQTTClient) encodeRequest(req exportRequest) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	auth, err := mqttauth.Sign(payload, contracts.ExportRequestMessageType, req.DeviceID, req.RequestID, c.now().UnixMilli(), c.authSecret)
+	auth, err := mqttauth.Sign(payload, contracts.ExportRequestMessageType, req.DeviceID, req.RequestID, c.signingClock.Next(), c.authSecret)
 	if err != nil {
 		return nil, err
 	}
