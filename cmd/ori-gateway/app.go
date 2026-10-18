@@ -277,28 +277,31 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// mark an earlier release kept in the outbound evidence queue directory is
 	// carried forward, so upgrading never resets the clock. A directory that is
 	// not private, not the gateway's, corrupt or not writable refuses the start.
+	// The run holds the state directory exclusively: a second gateway on it is
+	// refused, and the hold is released last, once every signer has stopped.
 	var durableSigningClock mqttauth.DurableClock
 	if cfg.Gateway.Auth.Enabled {
-		stateDir, err := gatewaystate.Open(cfg.Gateway.StateDirectory)
-		if err != nil {
-			return fmt.Errorf("open gateway state directory: %w", err)
-		}
 		legacyDir := ""
 		if cfg.Evidence.Enabled {
 			legacyDir = cfg.Evidence.QueueDirectory
 		}
-		clock, err := gatewaystate.OpenSigningClock(stateDir, legacyDir, deps.now)
+		owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory, legacyDir, deps.now)
 		if err != nil {
-			return err
+			return fmt.Errorf("open gateway state directory: %w", err)
 		}
-		durableSigningClock = clock
+		defer func() { _ = owner.Close() }()
+		durableSigningClock = owner.SigningClock()
 	}
 	signingClock := mqttauth.NewSigningClock(deps.now, durableSigningClock, deps.logger)
+	// Every broker callback runs through one gate. Shutdown closes it, which
+	// refuses any later callback and waits for those running, before any
+	// state they may sign or write is released (GW-15).
+	callbacks := newCallbackGate()
 
 	// One count of size and volume refusals for every broker client, projected
 	// as the site's mqtt_ingress posture.
 	ingress := broker.NewIngressStats(deps.logger)
-	client, err := deps.newBroker(broker.Options{
+	rawClient, err := deps.newBroker(broker.Options{
 		BrokerURL: cfg.Gateway.BrokerURL,
 		ClientID:  defaultClientID,
 		Logger:    deps.logger,
@@ -308,6 +311,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err != nil {
 		return fmt.Errorf("construct broker: %w", err)
 	}
+	client := callbacks.wrap(rawClient)
 	if err := client.Connect(ctx); err != nil {
 		return fmt.Errorf("connect broker: %w", err)
 	}
@@ -319,7 +323,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}()
 	var evidenceBroker brokerClient
 	if cfg.Evidence.Enabled {
-		evidenceBroker, err = deps.newBroker(broker.Options{
+		rawEvidenceBroker, err := deps.newBroker(broker.Options{
 			BrokerURL: cfg.Gateway.BrokerURL, ClientID: defaultEvidenceClientID,
 			Logger: deps.logger, PersistentSession: true, Ingress: ingress,
 			Devices: cfg.Gateway.DeviceIDs,
@@ -327,6 +331,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct evidence broker: %w", err)
 		}
+		evidenceBroker = callbacks.wrap(rawEvidenceBroker)
 		if err := evidenceBroker.Connect(ctx); err != nil {
 			return fmt.Errorf("connect evidence broker: %w", err)
 		}
@@ -414,6 +419,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	postureDebounce := newPostureDebouncer()
 	defer func() {
 		cancel()
+		callbacks.close()
 		postureDebounce.close()
 		// The signing clock extends its durable reservation in the
 		// background; no such write outlives runGateway.
@@ -1261,4 +1267,52 @@ func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCo
 		view[family] = site.MQTTIngressCount{PayloadTooLarge: count.PayloadTooLarge, VolumeDropped: count.VolumeDropped}
 	}
 	return view
+}
+
+// callbackGate admits broker callbacks while the gateway runs and joins them
+// at shutdown: once closed it refuses every later callback, and close returns
+// only when every callback it admitted has returned.
+type callbackGate struct {
+	mu      sync.Mutex
+	closed  bool
+	running sync.WaitGroup
+}
+
+func newCallbackGate() *callbackGate { return &callbackGate{} }
+
+func (g *callbackGate) enter() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	g.running.Add(1)
+	return true
+}
+
+func (g *callbackGate) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+	g.running.Wait()
+}
+
+// wrap returns b with every handler it subscribes run through the gate.
+func (g *callbackGate) wrap(b brokerClient) brokerClient {
+	return &gatedBroker{brokerClient: b, gate: g}
+}
+
+type gatedBroker struct {
+	brokerClient
+	gate *callbackGate
+}
+
+func (b *gatedBroker) Subscribe(ctx context.Context, topic string, qos byte, handler broker.MessageHandler) error {
+	return b.brokerClient.Subscribe(ctx, topic, qos, func(topic string, payload []byte) {
+		if !b.gate.enter() {
+			return
+		}
+		defer b.gate.running.Done()
+		handler(topic, payload)
+	})
 }

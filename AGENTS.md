@@ -127,10 +127,12 @@ later stages from starting. Shutdown must cancel background work and disconnect
 the broker. Long-running app tasks must be supervised through the shared
 `errgroup`-backed supervisor rather than open-coded result channels, so adding a
 new runner does not require updating every early-return drain path by hand.
-Posture fetches, started per device from the runtime heartbeat callback, are
-owned by the same shutdown: once it begins none starts, and `runGateway` does
-not return while one is still running, since each signs an export request from
-the durable signing clock.
+Every broker callback, on both broker clients, runs through one callback gate,
+and posture fetches started from the runtime heartbeat callback are owned the
+same way: once shutdown begins none starts, and `runGateway` does not return
+while one is still running, since any of them may sign from the durable signing
+clock. The signing clock is closed after them, and a closed clock never writes
+its durable mark.
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
@@ -139,8 +141,10 @@ Verified by `TestMainStartupMissingConfig`,
 `TestSupervisedRunnersReportsRunnerErrors`,
 `TestSupervisedRunnersWaitsForAllRunners`,
 `TestSupervisedRunnersUnexpectedNilReturnIsError`,
-`TestShutdownWaitsForAPostureFetchesSigningWrite`, and
-`TestAClosedPostureDebouncerStartsNothing`.
+`TestShutdownWaitsForAPostureFetchesSigningWrite`,
+`TestShutdownJoinsEveryBrokerCallback`,
+`TestAClosedPostureDebouncerStartsNothing`, and
+`TestAClosedClockNeverWritesDurably`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
@@ -531,7 +535,10 @@ and enrichment responses and export requests from one shared
 that signs keeps the shared clock's mark in `gateway.state_directory`, which
 is required when `gateway.auth.enabled` and is owned by `internal/gatewaystate`
 alone: private (0700, the gateway's user, never a symlink), marked as the
-gateway's, apart from evidence storage, and confers no authority. The mark is
+gateway's, apart from evidence storage, and confers no authority. A run holds
+it exclusively (`gatewaystate.Acquire`, an OS lock taken before any mark is
+read and released by the OS if the process dies), so a second gateway on the
+same directory is refused and two clocks never share a mark. The mark is
 persisted a second ahead of what is issued, at startup and then in the
 background, so signing never waits on the disk within a reservation and a
 restart never repeats a value; a mark an earlier build kept in the outbound

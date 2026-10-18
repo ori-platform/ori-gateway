@@ -102,15 +102,60 @@ func ensureMarker(dir string) error {
 	return f.Close()
 }
 
-// OpenSigningClock opens the signing clock's mark in the state directory and
-// persists it once before any envelope is signed. That write proves the
-// directory writable, and carries forward a mark an earlier release kept in
-// the outbound evidence queue directory (legacyDir, empty when there is
-// none), so upgrading never resets the clock. A corrupt or unreadable mark,
-// in either place, or a directory that cannot be written refuses the start.
-// Once persisted, the legacy mark is removed: the state directory is its one
-// owner.
-func OpenSigningClock(dir, legacyDir string, now func() time.Time) (*signingclock.Clock, error) {
+// Owner is the gateway's exclusive hold on its state directory for the life
+// of a run. It holds an OS lock on the directory, released by the OS if the
+// process dies, so two gateways never share one signing clock; the clock it
+// opens is the run's only one. Close releases the lock; it is called once
+// every signer has stopped.
+type Owner struct {
+	dir   string
+	lock  *os.File
+	clock *signingclock.Clock
+}
+
+// Acquire opens the state directory, takes its exclusive lock, and opens the
+// signing clock: its mark is persisted once before any envelope is signed,
+// which proves the directory writable and carries forward a mark an earlier
+// build kept in the outbound evidence queue directory (legacyDir, empty when
+// there is none), so upgrading never resets the clock. The lock is taken
+// before any mark is read, so a second owner is refused before it reads or
+// migrates anything. A corrupt or unreadable mark, in either place, or a
+// directory that cannot be written refuses the start. Once persisted, the
+// legacy mark is removed: the state directory is its one owner.
+func Acquire(dir, legacyDir string, now func() time.Time) (*Owner, error) {
+	dir, err := Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := lockDirectory(dir)
+	if err != nil {
+		return nil, err
+	}
+	owner := &Owner{dir: dir, lock: lock}
+	clock, err := owner.openSigningClock(legacyDir, now)
+	if err != nil {
+		_ = owner.Close()
+		return nil, err
+	}
+	owner.clock = clock
+	return owner, nil
+}
+
+// SigningClock is the run's durable signing clock.
+func (o *Owner) SigningClock() *signingclock.Clock { return o.clock }
+
+// Close releases the exclusive lock. The caller has stopped every signer.
+func (o *Owner) Close() error {
+	if o == nil || o.lock == nil {
+		return nil
+	}
+	err := o.lock.Close()
+	o.lock = nil
+	return err
+}
+
+func (o *Owner) openSigningClock(legacyDir string, now func() time.Time) (*signingclock.Clock, error) {
+	dir := o.dir
 	clock, err := signingclock.OpenMessages(dir, now)
 	if err != nil {
 		return nil, fmt.Errorf("open gateway signing clock: %w", err)

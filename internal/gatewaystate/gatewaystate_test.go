@@ -5,6 +5,7 @@ package gatewaystate
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -114,7 +115,7 @@ func TestOpenSigningClockRefusesACorruptMark(t *testing.T) {
 	if err := os.WriteFile(signingclock.MessagesPath(dir), []byte("not a number"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenSigningClock(dir, "", time.Now); err == nil {
+	if _, err := Acquire(dir, "", time.Now); err == nil {
 		t.Fatal("a corrupt signing clock mark was accepted")
 	}
 }
@@ -131,8 +132,8 @@ func TestOpenSigningClockRefusesAnUnwritableDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	if _, err := OpenSigningClock(dir, "", time.Now); err == nil || !strings.Contains(err.Error(), "not writable") {
-		t.Fatalf("OpenSigningClock = %v, want the unwritable directory refused", err)
+	if _, err := Acquire(dir, "", time.Now); err == nil {
+		t.Fatalf("Acquire = %v, want the unwritable directory refused", err)
 	}
 }
 
@@ -156,22 +157,80 @@ func TestUpgradingCarriesTheEvidenceDirectoryMarkForward(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := Open(filepath.Join(base, "state"))
+	dir := filepath.Join(base, "state")
+	owner, err := Acquire(dir, legacy, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	clock, err := OpenSigningClock(dir, legacy, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if clock.Last() <= legacyMark {
-		t.Fatalf("state mark %d, not above the legacy mark %d", clock.Last(), legacyMark)
+	first := owner.SigningClock().Last()
+	if first <= legacyMark {
+		t.Fatalf("state mark %d, not above the legacy mark %d", first, legacyMark)
 	}
 	if _, err := os.Stat(signingclock.MessagesPath(legacy)); !os.IsNotExist(err) {
 		t.Fatalf("the legacy mark was left behind: %v", err)
 	}
-	reopened, err := OpenSigningClock(dir, legacy, now)
-	if err != nil || reopened.Last() <= clock.Last() {
-		t.Fatalf("reopened at %d (%v), want above %d", reopened.Last(), err, clock.Last())
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
 	}
+	reopened, err := Acquire(dir, legacy, now)
+	if err != nil || reopened.SigningClock().Last() <= first {
+		t.Fatalf("reopened (%v), want a mark above %d", err, first)
+	}
+	_ = reopened.Close()
+}
+
+// TestASecondOwnerIsRefused acquires the state directory and then tries a
+// second time, as a second gateway would: the second is refused before it
+// reads or migrates any mark, and acquires once the first has closed.
+func TestASecondOwnerIsRefused(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "state")
+	legacy := filepath.Join(base, "evidence-outbound")
+	if err := os.Mkdir(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Acquire(dir, "", time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(signingclock.MessagesPath(legacy), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(dir, legacy, time.Now); err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("a second owner = %v, want refused as in use", err)
+	}
+	if _, err := os.Stat(signingclock.MessagesPath(legacy)); err != nil {
+		t.Fatal("the refused owner migrated the legacy mark")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Acquire(dir, "", time.Now)
+	if err != nil {
+		t.Fatalf("after the first owner closed: %v", err)
+	}
+	_ = second.Close()
+}
+
+// TestADeadOwnerNeverBlocksTheNextStart acquires the state directory in a
+// child process that exits without closing, as a crashed gateway would: the
+// OS releases its hold, and the next start acquires the directory.
+func TestADeadOwnerNeverBlocksTheNextStart(t *testing.T) {
+	if dir := os.Getenv("ORI_GATEWAYSTATE_CHILD_DIR"); dir != "" {
+		if _, err := Acquire(dir, "", time.Now); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0) // exits holding the lock, never closing it
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	child := exec.Command(os.Args[0], "-test.run=^TestADeadOwnerNeverBlocksTheNextStart$")
+	child.Env = append(os.Environ(), "ORI_GATEWAYSTATE_CHILD_DIR="+dir)
+	if out, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("child owner: %v\n%s", err, out)
+	}
+	owner, err := Acquire(dir, "", time.Now)
+	if err != nil {
+		t.Fatalf("after the owning process died: %v", err)
+	}
+	_ = owner.Close()
 }

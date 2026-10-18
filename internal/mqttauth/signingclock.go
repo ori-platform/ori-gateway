@@ -50,14 +50,15 @@ type SigningClock struct {
 	durable DurableClock
 	log     *slog.Logger
 
-	mu        sync.Mutex
-	last      int64
-	reserved  int64
-	warned    bool
-	ahead     bool
-	extending bool
-	closed    bool
-	extension sync.WaitGroup
+	mu           sync.Mutex
+	last         int64
+	reserved     int64
+	warned       bool
+	ahead        bool
+	extending    bool
+	closed       bool
+	closedWarned bool
+	extension    sync.WaitGroup
 }
 
 // NewSigningClock returns a clock over now, persisted through durable when it
@@ -105,7 +106,14 @@ func (c *SigningClock) Next() int64 {
 	defer c.mu.Unlock()
 	wall := c.now().UnixMilli()
 	at := max(wall, c.last+1)
-	if c.durable != nil {
+	if c.durable != nil && c.closed {
+		// No write outlives the clock's owner: a value signed after Close is
+		// issued in-process and reported, and its owner has a bug to fix.
+		if !c.closedWarned {
+			c.closedWarned = true
+			c.log.Error("signing clock used after it was closed; signing from the in-process clock")
+		}
+	} else if c.durable != nil {
 		switch {
 		case at > c.reserved:
 			// Past the reservation: persist before issuing.
@@ -143,8 +151,9 @@ func (c *SigningClock) extend(at int64) {
 	c.warned = false
 }
 
-// Close starts no further background extension and waits for one in flight,
-// so no write to the durable clock outlives its owner.
+// Close stops every further durable write, background or not, and waits for
+// an extension in flight, so no write to the durable clock outlives its
+// owner.
 func (c *SigningClock) Close() {
 	c.mu.Lock()
 	c.closed = true

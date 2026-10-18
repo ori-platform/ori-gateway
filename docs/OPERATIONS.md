@@ -700,7 +700,11 @@ or let the gateway create it (0700) under a parent it may write. The gateway
 refuses to start when the directory is a symlink, is readable or writable by
 group or other users, is owned by another user, is not empty and not marked as
 the gateway's (`.ori-gateway-state-v1`), holds a corrupt mark, or cannot be
-written. It must not be, or sit inside, an evidence queue directory. On the
+written. It must not be, or sit inside, an evidence queue directory, and it
+belongs to one gateway: a running gateway holds an exclusive lock on it
+(`.ori-gateway-state.lock`), so a second gateway started on the same directory
+refuses to start with `gateway state directory is in use by another gateway`.
+The lock is released when the gateway exits, however it exits. On the
 first start after upgrading from a build that kept the mark in the outbound
 evidence queue directory, the gateway carries that mark forward and removes
 it there. If the file cannot be written while the gateway runs, it logs `WARN

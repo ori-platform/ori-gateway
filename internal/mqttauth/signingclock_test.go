@@ -215,3 +215,22 @@ func TestTheValueOnePastAReservationIsPersisted(t *testing.T) {
 		t.Fatalf("after a restart the clock issued %d, not above %d", at, issued)
 	}
 }
+
+// TestAClosedClockNeverWritesDurably closes the clock and then signs past its
+// reservation: nothing reaches the durable clock, and the misuse is logged.
+func TestAClosedClockNeverWritesDurably(t *testing.T) {
+	wall := time.UnixMilli(1_787_000_000_000)
+	durable := &flakyDurable{}
+	logs := &bytes.Buffer{}
+	clock := NewSigningClock(func() time.Time { return wall }, durable, slog.New(slog.NewTextHandler(logs, nil)))
+	clock.Close()
+	stored := durable.storedMark()
+	wall = wall.Add(time.Minute)
+	clock.Next()
+	if durable.storedMark() != stored {
+		t.Fatal("a closed clock wrote its durable mark")
+	}
+	if !strings.Contains(logs.String(), "used after it was closed") {
+		t.Fatalf("the misuse was not logged:\n%s", logs.String())
+	}
+}

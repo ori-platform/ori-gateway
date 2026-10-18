@@ -6,8 +6,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"github.com/ori-platform/ori-gateway/internal/enrichment"
+	"github.com/ori-platform/ori-gateway/internal/provider"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -330,4 +333,117 @@ func TestAClosedPostureDebouncerStartsNothing(t *testing.T) {
 		t.Fatal("a closed debouncer started a fetch")
 	}
 	d.close() // closing again is harmless
+}
+
+// heldProvider holds a reasoning or enrichment request inside the provider
+// until released, as a slow model would.
+type heldProvider struct {
+	fakeProvider
+	fakeTierCEnrichmentProvider
+	entered, release chan struct{}
+}
+
+func (p *heldProvider) Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
+	close(p.entered)
+	<-p.release
+	return p.fakeProvider.Reason(ctx, req)
+}
+
+func (p *heldProvider) EnrichTierC(ctx context.Context, req contracts.TierCEnrichmentRequest) (contracts.TierCEnrichmentResponse, error) {
+	close(p.entered)
+	<-p.release
+	return p.fakeTierCEnrichmentProvider.EnrichTierC(ctx, req)
+}
+
+// TestShutdownJoinsEveryBrokerCallback holds a signed reasoning request, then
+// an enrichment request, inside its provider and stops the gateway:
+// runGateway does not return until the callback has signed its reply, with
+// the clock moved past its reservation so that reply writes the durable mark,
+// and the mark never changes after runGateway has returned.
+func TestShutdownJoinsEveryBrokerCallback(t *testing.T) {
+	for _, family := range []string{"reasoning", "enrichment"} {
+		t.Run(family, func(t *testing.T) {
+			const secret = "runtime-gateway-envelope-secret"
+			t.Setenv("GATEWAY_ENVELOPE", secret)
+			var wallMS atomic.Int64
+			wallMS.Store(1_787_000_000_000)
+			cfg := validConfig()
+			cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+			cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
+			cfg.Reporting = config.ReportingConfig{
+				Provider:        config.ReportingProviderGemini,
+				Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+				TierCEnrichment: config.TierCEnrichmentConfig{Enabled: true},
+			}
+			held := &heldProvider{fakeProvider: fakeProvider{healthy: true}, entered: make(chan struct{}), release: make(chan struct{})}
+			fb := newFakeBroker()
+			deps := baseDeps(t, cfg, fb, &held.fakeProvider, newFakeHeartbeat())
+			deps.logger = slog.New(slog.DiscardHandler)
+			deps.now = func() time.Time { return time.UnixMilli(wallMS.Load()) }
+			deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return held, nil }
+			deps.newTierCEnrichmentProvider = func(config.ReportingConfig) (enrichment.Provider, error) { return held, nil }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+			topic, filter := "ori/dev-01/reasoning/request", contracts.GatewayReasoningRequestTopicFilter
+			var payload []byte
+			if family == "reasoning" {
+				req := contracts.ReasoningRequest{RequestID: "held", DeviceID: "dev-01", SensorType: "s", TriggerName: "t",
+					Prompt: "p", ActionTierHint: contracts.ActionTierA, TimeoutMS: 60000}
+				auth, err := mqttauth.Sign(req, contracts.ReasoningRequestMessageType, "dev-01", req.RequestID, wallMS.Load(), secret)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Auth = &auth
+				payload = mustJSON(t, req)
+			} else {
+				topic, filter = "ori/dev-01/tier_c/enrichment/request", "ori/dev-01/tier_c/enrichment/request"
+				var req contracts.TierCEnrichmentRequest
+				if err := json.Unmarshal(validTierCEnrichmentRequestPayload(t), &req); err != nil {
+					t.Fatal(err)
+				}
+				req.TimeoutMS = 60000
+				auth, err := mqttauth.Sign(req, contracts.TierCEnrichmentRequestMessageType, "dev-01", req.RequestID, wallMS.Load(), secret)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Auth = &auth
+				payload = mustJSON(t, req)
+			}
+			waitUntil(t, "the subscription", func() bool { return fb.handlerFor(filter) != nil })
+			handled := make(chan struct{})
+			go func() { defer close(handled); fb.handlerFor(filter)(topic, payload) }()
+			select {
+			case <-held.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the provider never received the request")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				close(held.release)
+				t.Fatalf("runGateway returned (%v) while a %s callback was still running", err, family)
+			case <-time.After(200 * time.Millisecond):
+			}
+			wallMS.Add(10_000) // past the reservation: the reply writes the mark
+			close(held.release)
+			<-handled
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("runGateway did not return once the callback finished")
+			}
+			mark := signingclock.MessagesPath(cfg.Gateway.StateDirectory)
+			before, err := os.ReadFile(mark)
+			if err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			after, err := os.ReadFile(mark)
+			if err != nil || string(before) != string(after) {
+				t.Fatalf("the durable mark changed after runGateway returned: %s -> %s (%v)", before, after, err)
+			}
+		})
+	}
 }
