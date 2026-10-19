@@ -557,7 +557,8 @@ found and the wall clock plus 1,000 ms, and refuses if that write fails; every
 later mark is the later of the wall clock plus 1,000 ms and the value being
 issued, never measured from an earlier mark, so restarts accumulate no lead.
 Marks are extended in the background, so signing never waits on the disk
-within a reservation; a value past it is persisted before it is issued, after
+within a reservation, and only an extension that would move the mark forward
+starts, so after a step back the coverage already persisted is used up first; a value past it is persisted before it is issued, after
 any extension in flight, and no persisted mark falls. A start whose first
 value would reach the ceiling is refused, and `Next` refuses a value at it
 (`ErrSigningClockExhausted`) or after `Close` (`ErrSigningClockClosed`). A
@@ -585,6 +586,7 @@ the wall clock is logged as a warning. Verified by
 `TestExtensionsKeepALeadAsTheWallClockMoves`,
 `TestAStateDirectoryThatRefusesStopsTheStartBeforeTheBroker`,
 `TestAMarkIsAtMostSixtyFourBytes`,
+`TestARollbackUsesUpTheCoverageAlreadyPersistedFirst`,
 `TestARestartResumesAboveEveryReservation`,
 `TestTheValueOnePastAReservationIsPersisted`,
 `TestASigningClockAheadOfTheWallIsReported`,

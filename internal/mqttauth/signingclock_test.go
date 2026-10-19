@@ -290,8 +290,11 @@ func TestSigningNeverWaitsOnTheDiskWithinAReservation(t *testing.T) {
 	mark.block = release
 	mark.mu.Unlock()
 	issued := make(chan struct{})
+	// The wall clock moves a millisecond per value, so an extension starts
+	// half way through the reservation and would move the mark forward.
 	go func() {
 		for range signingReservation - 1 {
+			wall.add(time.Millisecond)
 			mark.next(t, clock)
 		}
 		close(issued)
@@ -328,9 +331,10 @@ func TestAWriteNeverLandsBelowAValueAlreadyIssued(t *testing.T) {
 	mark.blockOnce, mark.held = release, held
 	mark.fail = true
 	mark.mu.Unlock()
-	// Use more than half the reservation, which starts an extension that is
-	// held.
+	// Use more than half the reservation as the wall clock moves, which
+	// starts an extension that is held.
 	for range signingReservation/2 + 2 {
+		wall.add(time.Millisecond)
 		mark.next(t, clock)
 	}
 	clock.mu.Lock()
@@ -616,11 +620,12 @@ func TestAnExtensionThatSucceedsEndsAFailureEpisode(t *testing.T) {
 	mark := newMemMark(t, wall)
 	logs := &bytes.Buffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
-	// Each step uses 300 ms of a reservation the wall clock does not move, so
-	// every step past its half starts an extension.
+	// Each step moves the wall clock 300 ms, a millisecond per value, so
+	// every step past a reservation's half starts an extension.
 	step := func(fail bool) {
 		mark.setFail(fail)
 		for range 300 {
+			wall.add(time.Millisecond)
 			mark.next(t, clock)
 		}
 		settle(clock)
@@ -630,11 +635,52 @@ func TestAnExtensionThatSucceedsEndsAFailureEpisode(t *testing.T) {
 	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
 		t.Fatalf("%d warnings after a failed extension:\n%s", n, logs.String())
 	}
-	wall.add(time.Second)
+	// No value passes the reservation, so only an extension can end the
+	// episode, and only a later extension can start the next.
 	step(false)
-	wall.add(time.Second)
 	step(true)
+	if writes := mark.writeCount(); writes != 2 {
+		t.Fatalf("%d writes, want the start's and one extension's", writes)
+	}
 	if n := strings.Count(logs.String(), "could not be persisted"); n != 2 {
 		t.Fatalf("%d warnings, want a second after an extension succeeded:\n%s", n, logs.String())
+	}
+}
+
+// TestARollbackUsesUpTheCoverageAlreadyPersistedFirst signs at a wall clock of
+// 10,000 under a mark of 11,000, then rolls the wall clock back to 0: the
+// values the mark already covers are issued with no write and no extension,
+// and once that coverage is used up every value is persisted before it is
+// issued.
+func TestARollbackUsesUpTheCoverageAlreadyPersistedFirst(t *testing.T) {
+	wall := &testWall{at: time.UnixMilli(10_000)}
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	if got := mark.mark(); got != 11_000 {
+		t.Fatalf("start mark %d, want 11000", got)
+	}
+	if at := mark.next(t, clock); at != 10_000 {
+		t.Fatalf("first value %d, want 10000", at)
+	}
+	wall.at = time.UnixMilli(0)
+	for want := int64(10_001); want <= 11_000; want++ {
+		if at := mark.next(t, clock); at != want {
+			t.Fatalf("issued %d, want %d", at, want)
+		}
+		clock.mu.Lock()
+		extending := clock.extension != nil
+		clock.mu.Unlock()
+		if extending {
+			t.Fatalf("an extension started at %d while the persisted mark still covered it", want)
+		}
+	}
+	if n := mark.writeCount(); n != 1 {
+		t.Fatalf("%d writes while the persisted mark covered every value, want the start's only", n)
+	}
+	for i := int64(1); i <= 3; i++ {
+		at := mark.next(t, clock)
+		if at != 11_000+i || mark.mark() != at || mark.writeCount() != int(1+i) {
+			t.Fatalf("issued %d under mark %d after %d writes; want each value persisted before it is issued", at, mark.mark(), mark.writeCount())
+		}
 	}
 }

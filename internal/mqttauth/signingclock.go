@@ -170,7 +170,10 @@ func (c *SigningClock) Next() (int64, error) {
 					c.reserved = max(c.reserved, mark)
 					c.warned = false
 				}
-			case c.reserved-at < signingReservation/2 && c.extension == nil:
+			case c.reserved-at < signingReservation/2 && c.extension == nil && reservationFor(wall, at) > c.reserved:
+				// Only an extension that would move the mark forward is
+				// started: after a step back, the coverage already persisted
+				// is used up first.
 				c.extension = make(chan struct{})
 				go c.extend(c.extension)
 			}

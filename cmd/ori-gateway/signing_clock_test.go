@@ -635,13 +635,14 @@ func TestAStateDirectoryThatRefusesStopsTheStartBeforeTheBroker(t *testing.T) {
 // done.
 func TestShutdownWaitsForTheGatewaysOwnExtension(t *testing.T) {
 	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
-	frozen := time.UnixMilli(1_787_000_000_000)
+	var wallMS atomic.Int64
+	wallMS.Store(1_787_000_000_000)
 	cfg := validConfig()
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
 	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	deps := baseDeps(t, cfg, newFakeBroker(), &fakeProvider{healthy: true}, newFakeHeartbeat())
 	deps.logger = slog.New(slog.DiscardHandler)
-	deps.now = func() time.Time { return frozen }
+	deps.now = func() time.Time { return time.UnixMilli(wallMS.Load()) }
 	paused := &pausedDurable{entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan struct{})}
 	deps.signingMark = func(mark mqttauth.DurableMark) mqttauth.DurableMark {
 		paused.inner = mark
@@ -663,9 +664,10 @@ func TestShutdownWaitsForTheGatewaysOwnExtension(t *testing.T) {
 		t.Fatal("the heartbeat was not built")
 	}
 	paused.armed.Store(true)
-	// Under a frozen clock the reservation is 1,000 values; more than half
-	// of it starts the extension.
+	// The wall clock moves a millisecond per value, so using more than half
+	// the reservation starts an extension that moves the mark forward.
 	for range 502 {
+		wallMS.Add(1)
 		if _, err := signer.Next(); err != nil {
 			t.Fatal(err)
 		}
