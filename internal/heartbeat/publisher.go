@@ -107,7 +107,7 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 
 	signingClock := opts.SigningClock
 	if signingClock == nil {
-		signingClock = mqttauth.NewSigningClock(now, nil, log)
+		signingClock = mqttauth.NewSigningClock(now, log)
 	}
 	return &Publisher{
 		publish:      publish,
@@ -223,7 +223,10 @@ func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 
 	// The heartbeat is signed at its timestamp, so it comes from the signing
 	// clock, which never issues a value twice.
-	timestampMS := p.signingClock.Next()
+	timestampMS, err := p.signingClock.Next()
+	if err != nil {
+		return nil, fmt.Errorf("heartbeat: timestamp: %w", err)
+	}
 
 	beat := contracts.Heartbeat{
 		Status:        status,

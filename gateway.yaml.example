@@ -4,11 +4,12 @@ gateway:
     - "ori-edge-site-a-01"
   heartbeat_interval_s: 30
   # The gateway's own durable state: today the mark of the clock it signs
-  # every envelope from, so a restart never repeats a signing time. Required
-  # when auth.enabled is true. Provision it private to the gateway's user
+  # every envelope outside evidence forwarding from, so a restart never
+  # repeats a signing time. Required when auth.enabled is true. Provision it
+  # private to the gateway's user
   # (install -d -m 0700 -o <user> -g <group> /var/lib/ori-gateway/state), or
-  # let the gateway create it; it must not be or sit inside an evidence queue
-  # directory.
+  # let the gateway create it; it must not be, contain or sit inside an
+  # evidence queue directory.
   state_directory: "/var/lib/ori-gateway/state"
   auth:
     enabled: false

@@ -89,8 +89,11 @@ type appDependencies struct {
 	// authorityTrustOwner is the one user besides root trusted to own the
 	// authority CA bundle and the directories above it: zero, root, outside tests.
 	authorityTrustOwner int
-	logger              *slog.Logger
-	now                 func() time.Time
+	// signingMark, when set by a test, wraps the state directory's mark
+	// before the signing clock uses it, as a slow disk would.
+	signingMark func(mqttauth.DurableMark) mqttauth.DurableMark
+	logger      *slog.Logger
+	now         func() time.Time
 }
 
 func defaultDependencies() appDependencies {
@@ -273,26 +276,27 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// One signing clock for every envelope the gateway signs outside the
 	// evidence path, so no two are signed at one value (gateway-api/v2
 	// Envelope Freshness and Replay, Senders). A gateway that signs keeps its
-	// mark in its own state directory, independent of evidence forwarding; a
-	// mark an earlier release kept in the outbound evidence queue directory is
-	// carried forward, so upgrading never resets the clock. A directory that is
-	// not private, not the gateway's, corrupt or not writable refuses the start.
+	// mark in its own state directory, independent of evidence forwarding
+	// (gateway-config/v2 gateway.state_directory). A directory that is not
+	// private, not the gateway's, corrupt or not writable refuses the start.
 	// The run holds the state directory exclusively: a second gateway on it is
 	// refused, and the hold is released last, once every signer has stopped.
-	var durableSigningClock mqttauth.DurableClock
+	signingClock := mqttauth.NewSigningClock(deps.now, deps.logger)
 	if cfg.Gateway.Auth.Enabled {
-		legacyDir := ""
-		if cfg.Evidence.Enabled {
-			legacyDir = cfg.Evidence.QueueDirectory
-		}
-		owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory, legacyDir, deps.now)
+		owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory)
 		if err != nil {
 			return fmt.Errorf("open gateway state directory: %w", err)
 		}
 		defer func() { _ = owner.Close() }()
-		durableSigningClock = owner.SigningClock()
+		var mark mqttauth.DurableMark = owner.Mark()
+		if deps.signingMark != nil {
+			mark = deps.signingMark(mark)
+		}
+		signingClock, err = mqttauth.NewDurableSigningClock(deps.now, mark, deps.logger)
+		if err != nil {
+			return fmt.Errorf("open gateway signing clock: %w", err)
+		}
 	}
-	signingClock := mqttauth.NewSigningClock(deps.now, durableSigningClock, deps.logger)
 	// Every broker callback runs through one gate. Shutdown closes it, which
 	// refuses any later callback and waits for those running, before any
 	// state they may sign or write is released (GW-15).

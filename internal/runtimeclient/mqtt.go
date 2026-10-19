@@ -163,7 +163,7 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 		opt(client)
 	}
 	if client.signingClock == nil {
-		client.signingClock = mqttauth.NewSigningClock(client.now, nil, client.log)
+		client.signingClock = mqttauth.NewSigningClock(client.now, client.log)
 	}
 	if client.optionErr != nil {
 		return nil, fmt.Errorf("runtimeclient: %w", client.optionErr)
@@ -554,7 +554,11 @@ func (c *MQTTClient) encodeRequest(req exportRequest) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	auth, err := mqttauth.Sign(payload, contracts.ExportRequestMessageType, req.DeviceID, req.RequestID, c.signingClock.Next(), c.authSecret)
+	signedAt, err := c.signingClock.Next()
+	if err != nil {
+		return nil, err
+	}
+	auth, err := mqttauth.Sign(payload, contracts.ExportRequestMessageType, req.DeviceID, req.RequestID, signedAt, c.authSecret)
 	if err != nil {
 		return nil, err
 	}

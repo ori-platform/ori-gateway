@@ -24,7 +24,6 @@ const (
 	FilePrefix               = ".ori-signed-at-"
 	outboundAckSigningName   = FilePrefix + "outbound-ack"
 	inboundReturnSigningName = FilePrefix + "inbound-return"
-	messagesSigningName      = FilePrefix + "messages"
 )
 
 // Clock issues signed_at_ms for one family of gateway-signed
@@ -52,18 +51,6 @@ func OpenAck(dir string, now func() time.Time) (*Clock, error) {
 // different message types and retired by different acknowledgements.
 func OpenReturn(dir string, now func() time.Time) (*Clock, error) {
 	return openSigningClock(dir, inboundReturnSigningName, now)
-}
-
-// OpenMessages loads the clock every other gateway signer shares (the
-// gateway heartbeat, reasoning and enrichment responses, and export requests)
-// from dir, the gateway state directory.
-func OpenMessages(dir string, now func() time.Time) (*Clock, error) {
-	return openSigningClock(dir, messagesSigningName, now)
-}
-
-// MessagesPath is where OpenMessages keeps its mark in dir.
-func MessagesPath(dir string) string {
-	return filepath.Join(dir, messagesSigningName)
 }
 
 func openSigningClock(dir, name string, now func() time.Time) (*Clock, error) {
@@ -101,23 +88,9 @@ func openSigningClock(dir, name string, now func() time.Time) (*Clock, error) {
 // must not be signed with a time that could be issued again after a restart,
 // so persistence failure refuses the time rather than returning it.
 func (c *Clock) Next() (int64, error) {
-	return c.NextAtLeast(0)
-}
-
-// Last is the last value persisted, the mark a restart resumes above.
-func (c *Clock) Last() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.last
-}
-
-// NextAtLeast is Next, never below least: a caller that issued a later value
-// while this clock could not persist keeps the stored mark from falling
-// behind what it issued.
-func (c *Clock) NextAtLeast(least int64) (int64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	at := max(c.now().UnixMilli(), least)
+	at := c.now().UnixMilli()
 	if at <= c.last {
 		at = c.last + 1
 	}

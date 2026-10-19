@@ -415,9 +415,24 @@ func validateStateDirectory(cfg Config) error {
 	return nil
 }
 
+// pathsOverlap reports whether one clean path is the other or inside it,
+// compared on whole components.
 func pathsOverlap(a, b string) bool {
+	return pathWithin(a, b) || pathWithin(b, a)
+}
+
+// pathWithin reports whether the clean path a is dir or inside it. The root is
+// the one clean path that already ends in a separator, and it contains every
+// path.
+func pathWithin(a, dir string) bool {
+	if a == dir {
+		return true
+	}
 	sep := string(filepath.Separator)
-	return a == b || strings.HasPrefix(a, b+sep) || strings.HasPrefix(b, a+sep)
+	if !strings.HasSuffix(dir, sep) {
+		dir += sep
+	}
+	return strings.HasPrefix(a, dir)
 }
 
 func (f *fileConfig) normalize() (Config, error) {

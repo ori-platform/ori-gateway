@@ -685,10 +685,12 @@ gateway logs `WARN mqtt auth refused an envelope below the replay floor, which
 is ahead of the clock's stale bound` with `floor_ms` and `t_ms`; it clears
 once the clock passes the floor.
 
-Every message the gateway signs takes its signing time from a clock that never
-issues the same value twice. Its mark is kept in `gateway.state_directory`
-(`.ori-signed-at-messages`), written about once a second off the signing path,
-so a restart resumes above it even with the clock set back. The state
+Every message the gateway signs outside evidence forwarding takes its signing
+time from a clock that never issues the same value twice. Its mark is kept in
+`gateway.state_directory` (`.ori-signed-at-messages`), at most one second past
+the wall clock and written about once a second off the signing path, so a
+restart resumes above it even with the clock set back, and a gateway that
+restarts over and over never drifts ahead of the wall clock. The state
 directory is required when `gateway.auth.enabled` is true. Provision it before
 the first start, private to the gateway's user:
 
@@ -700,22 +702,34 @@ or let the gateway create it (0700) under a parent it may write. The gateway
 refuses to start when the directory is a symlink, is readable or writable by
 group or other users, is owned by another user, is not empty and not marked as
 the gateway's (`.ori-gateway-state-v1`), holds a corrupt mark, or cannot be
-written. It must not be, or sit inside, an evidence queue directory, and it
+written. A directory holding only the lock file and staged
+`.ori-gateway-state-v1.*` files, as an interrupted first start leaves it, is
+adopted. A corrupt marker is not repaired by the gateway: check that the
+directory is the gateway's, then delete the marker. It must not be, contain, or
+sit inside an evidence queue directory, and it
 belongs to one gateway: a running gateway holds an exclusive lock on it
 (`.ori-gateway-state.lock`), so a second gateway started on the same directory
 refuses to start with `gateway state directory is in use by another gateway`.
-The lock is released when the gateway exits, however it exits. On the
-first start after upgrading from a build that kept the mark in the outbound
-evidence queue directory, the gateway carries that mark forward and removes
-it there. If the file cannot be written while the gateway runs, it logs `WARN
-signing clock could not be persisted; signing from the in-process clock` and
-keeps signing.
+The lock is released when the gateway exits, however it exits. No file in an
+evidence queue directory is read for this clock. If the file cannot be written
+while the gateway runs, it logs `WARN signing clock could not be persisted;
+signing from the in-process clock` with the error, once each time writes start
+failing, keeps signing, and retries the write with every message it signs past
+the last saved mark, the heartbeat at least once per `heartbeat_interval_s`;
+a restart before a write succeeds can repeat a signing time issued meanwhile,
+which runtimes refuse as a replay or, after evicting it, as
+`before_replay_floor` until the gateway's clock passes their floor. A mark so
+large that the clock would run out (at or above 9223372036854773806) refuses the
+start as corrupt or `signing clock exhausted`; it can only be written by hand.
 
 That mark means a clock that once ran fast is not forgotten at a restart: the
-gateway keeps signing just above it. When it is more than 5 minutes ahead of
+gateway keeps signing just above it. While its signing time is a second or
+more ahead of the wall clock, every message it signs waits for its mark to be
+written to disk first, so a slow disk slows every signed message until the
+wall clock catches up. When it is more than 5 minutes ahead of
 the wall clock, runtimes refuse what the gateway signs as `future_timestamp`
 (the gateway looks unreachable and Tier 3 falls back), and the gateway logs
-`WARN signing clock is ahead of the wall clock by more than receivers' skew`
+`WARN signing clock is ahead of the wall clock by more than receivers' default skew`
 with `signed_at_ms` and `wall_ms`. It clears by itself once the wall clock
 passes `signed_at_ms`. To clear it sooner, correct the clock, stop the gateway,
 delete `.ori-signed-at-messages` from the gateway state directory and start it

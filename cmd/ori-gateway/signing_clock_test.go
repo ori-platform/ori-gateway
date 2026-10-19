@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,7 +21,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
-	"github.com/ori-platform/ori-gateway/internal/evidence/signingclock"
+	"github.com/ori-platform/ori-gateway/internal/gatewaystate"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
@@ -69,7 +70,10 @@ func TestASignedAtNeverRepeatsAcrossARestart(t *testing.T) {
 			t.Fatal("the heartbeat was not built")
 		}
 		for i := range issue {
-			at := signer.Next()
+			at, err := signer.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
 			if i == 0 {
 				first = at
 			}
@@ -84,6 +88,79 @@ func TestASignedAtNeverRepeatsAcrossARestart(t *testing.T) {
 	firstAfter, _ := run(start.Add(-time.Hour), 1)
 	if firstAfter <= lastBefore {
 		t.Fatalf("after a restart with the clock set back the gateway signed at %d, not after %d", firstAfter, lastBefore)
+	}
+}
+
+// TestAMarkInTheEvidenceQueueDirectoryIsNeverRead leaves a message clock mark
+// in the outbound evidence queue directory, where no build ever kept one:
+// corrupt, the start is not refused, and far ahead, the clock does not move
+// to it. The file is left as it was.
+func TestAMarkInTheEvidenceQueueDirectoryIsNeverRead(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	t.Setenv("GATEWAY_CUSTODY", "gateway-custody-secret-with-at-least-32-bytes")
+	t.Setenv("EVIDENCE_ENDPOINT", "https://127.0.0.1:1/v1/evidence/artifacts")
+	t.Setenv("EVIDENCE_CLIENT", "site-gateway-a")
+	t.Setenv("EVIDENCE_SECRET", "evidence-ingest-secret-with-at-least-32-bytes")
+	wall := time.UnixMilli(1_787_000_000_000)
+	for _, body := range []string{"corrupt", "9000000000000000"} {
+		t.Run(body, func(t *testing.T) {
+			dir := t.TempDir()
+			outbound := filepath.Join(dir, "outbound")
+			cfg := validConfig()
+			cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+			cfg.Gateway.StateDirectory = filepath.Join(dir, "gateway-state")
+			cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
+			cfg.Evidence = config.EvidenceConfig{
+				Enabled: true, QueueDirectory: outbound,
+				ReturnQueueDirectory: filepath.Join(dir, "returned"), MaxItems: 10,
+				MaxBytes: 8 << 20, RetryIntervalS: 60, BackoffBaseS: 60, BackoffMaxS: 60, StoreProbeIntervalS: 900,
+				EndpointEnv: "EVIDENCE_ENDPOINT", ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
+			}
+			// The first run creates the queue directory as the courier owns it.
+			run := func() int64 {
+				t.Helper()
+				deps := baseDeps(t, cfg, newFakeBroker(), &fakeProvider{healthy: true}, newFakeHeartbeat())
+				deps.logger = slog.New(slog.DiscardHandler)
+				deps.now = func() time.Time { return wall }
+				deps.newBroker = func(broker.Options) (brokerClient, error) { return newFakeBroker(), nil }
+				signers := make(chan *mqttauth.SigningClock, 1)
+				deps.newHeartbeat = func(_ heartbeat.PublishFunc, _ heartbeat.ProviderStatus, _ heartbeat.SIMStatus, opts heartbeat.Options) (heartbeatRunner, error) {
+					signers <- opts.SigningClock
+					return newFakeHeartbeat(), nil
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan error, 1)
+				go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+				defer func() { cancel(); <-done }()
+				var signer *mqttauth.SigningClock
+				select {
+				case signer = <-signers:
+				case err := <-done:
+					done <- err
+					t.Fatalf("the start was refused: %v", err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the heartbeat was not built")
+				}
+				at, err := signer.Next()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return at
+			}
+			run()
+			stray := filepath.Join(outbound, ".ori-signed-at-messages")
+			if err := os.WriteFile(stray, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// The first run left the state directory's mark one reservation
+			// past the frozen wall clock; the second resumes one past it.
+			if at, want := run(), wall.UnixMilli()+1001; at != want {
+				t.Fatalf("signed at %d after the stray mark, want %d, one past the state directory's mark", at, want)
+			}
+			if got, err := os.ReadFile(stray); err != nil || string(got) != body {
+				t.Fatalf("the stray mark was touched: %q, %v", got, err)
+			}
+		})
 	}
 }
 
@@ -164,7 +241,11 @@ func TestEverySignerSharesTheGatewaysSigningClock(t *testing.T) {
 	signer := <-signers
 	var issued int64
 	for range 10 {
-		issued = signer.Next()
+		at, err := signer.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		issued = at
 	}
 	waitUntil(t, "the subscriptions", func() bool {
 		return fb.handlerFor("ori/dev-01/tier_c/enrichment/request") != nil && fb.handlerFor("ori/dev-01/runtime/heartbeat") != nil
@@ -226,22 +307,22 @@ func TestEverySignerSharesTheGatewaysSigningClock(t *testing.T) {
 // pausedDurable holds the durable signing clock's write until released, as a
 // slow disk would.
 type pausedDurable struct {
-	inner                   mqttauth.DurableClock
+	inner                   mqttauth.DurableMark
 	armed                   atomic.Bool
 	entered, release, wrote chan struct{}
 }
 
-func (d *pausedDurable) Last() int64 { return d.inner.Last() }
+func (d *pausedDurable) Found() (int64, bool) { return d.inner.Found() }
 
-func (d *pausedDurable) NextAtLeast(least int64) (int64, error) {
+func (d *pausedDurable) Persist(mark int64) error {
 	if !d.armed.CompareAndSwap(true, false) {
-		return d.inner.NextAtLeast(least)
+		return d.inner.Persist(mark)
 	}
 	close(d.entered)
 	<-d.release
-	at, err := d.inner.NextAtLeast(least)
+	err := d.inner.Persist(mark)
 	close(d.wrote)
-	return at, err
+	return err
 }
 
 // TestShutdownWaitsForAPostureFetchesSigningWrite moves the clock past the
@@ -271,17 +352,22 @@ func TestShutdownWaitsForAPostureFetchesSigningWrite(t *testing.T) {
 		MaxBytes: 8 << 20, RetryIntervalS: 60, BackoffBaseS: 60, BackoffMaxS: 60, StoreProbeIntervalS: 900,
 		EndpointEnv: "EVIDENCE_ENDPOINT", ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
 	}
-	real, err := signingclock.OpenMessages(outbound, now)
+	owner, err := gatewaystate.Acquire(filepath.Join(t.TempDir(), "posture-state"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	paused := &pausedDurable{inner: real, entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan struct{})}
+	t.Cleanup(func() { _ = owner.Close() })
+	paused := &pausedDurable{inner: owner.Mark(), entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan struct{})}
 	fb := newFakeBroker()
 	deps := baseDeps(t, cfg, fb, &fakeProvider{healthy: true}, newFakeHeartbeat())
 	deps.now = now
 	deps.logger = slog.New(slog.DiscardHandler)
 	deps.newRuntimeClient = func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
-		opts = append(opts, runtimeclient.WithSigningClock(mqttauth.NewSigningClock(now, paused, deps.logger)))
+		clock, err := mqttauth.NewDurableSigningClock(now, paused, deps.logger)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, runtimeclient.WithSigningClock(clock))
 		return runtimeclient.NewMQTTClient(b, opts...)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -434,7 +520,7 @@ func TestShutdownJoinsEveryBrokerCallback(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("runGateway did not return once the callback finished")
 			}
-			mark := signingclock.MessagesPath(cfg.Gateway.StateDirectory)
+			mark := filepath.Join(cfg.Gateway.StateDirectory, ".ori-signed-at-messages")
 			before, err := os.ReadFile(mark)
 			if err != nil {
 				t.Fatal(err)
@@ -446,4 +532,171 @@ func TestShutdownJoinsEveryBrokerCallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAStateDirectoryThatRefusesStopsTheStartBeforeTheBroker starts the
+// gateway on state directories gateway-config/v2 refuses: each start fails,
+// and no broker client is ever built (GW-15).
+func TestAStateDirectoryThatRefusesStopsTheStartBeforeTheBroker(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	state := func(t *testing.T, mark string) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "gateway-state")
+		owner, err := gatewaystate.Acquire(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := owner.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if mark != "" {
+			if err := os.WriteFile(filepath.Join(dir, ".ori-signed-at-messages"), []byte(mark), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	cases := map[string]func(t *testing.T) string{
+		"a corrupt mark": func(t *testing.T) string { return state(t, "-1") },
+		"a mark at the ceiling": func(t *testing.T) string {
+			return state(t, strconv.FormatInt(mqttauth.SigningCeiling, 10))
+		},
+		"a mark whose next value reaches the ceiling": func(t *testing.T) string {
+			return state(t, strconv.FormatInt(mqttauth.SigningCeiling-1, 10))
+		},
+		"a group-readable directory": func(t *testing.T) string {
+			dir := state(t, "")
+			if err := os.Chmod(dir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		},
+		"a directory that is not the gateway's": func(t *testing.T) string {
+			dir := filepath.Join(t.TempDir(), "gateway-state")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "other"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		},
+		"a directory another gateway holds": func(t *testing.T) string {
+			dir := state(t, "")
+			owner, err := gatewaystate.Acquire(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.Close() })
+			return dir
+		},
+		"a directory that cannot be written": func(t *testing.T) string {
+			if os.Geteuid() == 0 {
+				t.Skip("root writes through directory permissions")
+			}
+			dir := state(t, "")
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+			return dir
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+			cfg.Gateway.StateDirectory = setup(t)
+			deps := baseDeps(t, cfg, newFakeBroker(), &fakeProvider{healthy: true}, newFakeHeartbeat())
+			deps.logger = slog.New(slog.DiscardHandler)
+			var built atomic.Bool
+			deps.newBroker = func(broker.Options) (brokerClient, error) {
+				built.Store(true)
+				return newFakeBroker(), nil
+			}
+			// A start that is wrongly accepted runs until this bound.
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			err := runGateway(ctx, "gateway.yaml", deps)
+			if err == nil || !strings.Contains(err.Error(), "gateway state directory") && !strings.Contains(err.Error(), "signing clock") {
+				t.Fatalf("runGateway = %v, want the state directory refused", err)
+			}
+			if built.Load() {
+				t.Fatal("a broker client was built after the state directory refused")
+			}
+		})
+	}
+}
+
+// TestShutdownWaitsForTheGatewaysOwnExtension uses more than half of the
+// gateway's own signing reservation, so its clock extends it in the
+// background, and holds that write; then it stops the gateway: runGateway
+// does not return, and the state directory stays held, until the write is
+// done.
+func TestShutdownWaitsForTheGatewaysOwnExtension(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	frozen := time.UnixMilli(1_787_000_000_000)
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
+	deps := baseDeps(t, cfg, newFakeBroker(), &fakeProvider{healthy: true}, newFakeHeartbeat())
+	deps.logger = slog.New(slog.DiscardHandler)
+	deps.now = func() time.Time { return frozen }
+	paused := &pausedDurable{entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan struct{})}
+	deps.signingMark = func(mark mqttauth.DurableMark) mqttauth.DurableMark {
+		paused.inner = mark
+		return paused
+	}
+	signers := make(chan *mqttauth.SigningClock, 1)
+	deps.newHeartbeat = func(_ heartbeat.PublishFunc, _ heartbeat.ProviderStatus, _ heartbeat.SIMStatus, opts heartbeat.Options) (heartbeatRunner, error) {
+		signers <- opts.SigningClock
+		return newFakeHeartbeat(), nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	var signer *mqttauth.SigningClock
+	select {
+	case signer = <-signers:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the heartbeat was not built")
+	}
+	paused.armed.Store(true)
+	// Under a frozen clock the reservation is 1,000 values; more than half
+	// of it starts the extension.
+	for range 502 {
+		if _, err := signer.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-paused.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the clock never extended its reservation")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		close(paused.release)
+		t.Fatalf("runGateway returned (%v) while its clock was still writing the mark", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory); err == nil {
+		_ = owner.Close()
+		close(paused.release)
+		t.Fatal("the state directory was released while its clock was still writing the mark")
+	}
+	close(paused.release)
+	<-paused.wrote
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runGateway did not return once the write was done")
+	}
+	owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory)
+	if err != nil {
+		t.Fatalf("after shutdown the state directory is still held: %v", err)
+	}
+	_ = owner.Close()
 }

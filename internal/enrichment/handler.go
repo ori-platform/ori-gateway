@@ -205,12 +205,16 @@ func (h *Handler) encodeResponse(req contracts.TierCEnrichmentRequest, resp cont
 	}
 	resp.Auth = nil
 	if h.signingSecret != "" {
+		signedAt, err := h.signingClock.Next()
+		if err != nil {
+			return nil, fmt.Errorf("enrichment: sign response: %w", err)
+		}
 		auth, err := mqttauth.Sign(
 			resp,
 			contracts.TierCEnrichmentResponseMessageType,
 			req.DeviceID,
 			req.RequestID,
-			h.signingClock.Next(),
+			signedAt,
 			h.signingSecret,
 		)
 		if err != nil {
@@ -246,5 +250,5 @@ func signingClockOrOwn(clock *mqttauth.SigningClock, now func() time.Time) *mqtt
 	if clock != nil {
 		return clock
 	}
-	return mqttauth.NewSigningClock(now, nil, nil)
+	return mqttauth.NewSigningClock(now, nil)
 }

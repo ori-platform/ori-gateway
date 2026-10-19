@@ -255,7 +255,11 @@ func (d *Dispatcher) encodeResponse(req contracts.ReasoningRequest, resp contrac
 	resp.Confidence = math.Round(resp.Confidence*confidenceDecimals) / confidenceDecimals
 	resp.Auth = nil
 	if d.signingSecret != "" {
-		auth, err := mqttauth.Sign(resp, contracts.ReasoningResponseMessageType, req.DeviceID, req.RequestID, d.signingClock.Next(), d.signingSecret)
+		signedAt, err := d.signingClock.Next()
+		if err != nil {
+			return nil, fmt.Errorf("dispatcher: sign response: %w", err)
+		}
+		auth, err := mqttauth.Sign(resp, contracts.ReasoningResponseMessageType, req.DeviceID, req.RequestID, signedAt, d.signingSecret)
 		if err != nil {
 			return nil, fmt.Errorf("dispatcher: sign response: %w", err)
 		}
@@ -285,5 +289,5 @@ func signingClockOrOwn(clock *mqttauth.SigningClock, now func() time.Time) *mqtt
 	if clock != nil {
 		return clock
 	}
-	return mqttauth.NewSigningClock(now, nil, nil)
+	return mqttauth.NewSigningClock(now, nil)
 }
