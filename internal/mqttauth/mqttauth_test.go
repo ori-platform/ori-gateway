@@ -6,6 +6,7 @@ package mqttauth
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func TestVerifierRejectsStalePayload(t *testing.T) {
 	}
 
 	_, err = verifier.VerifyJSON(payload, contracts.RuntimeHeartbeatMessageType, "dev-01", "")
-	if err == nil || !strings.Contains(err.Error(), "skew") {
+	if !errors.Is(err, ErrStaleTimestamp) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

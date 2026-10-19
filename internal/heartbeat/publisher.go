@@ -17,6 +17,7 @@ import (
 
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 )
 
 // PublishFunc publishes a heartbeat payload to the LAN.
@@ -42,10 +43,10 @@ type Publisher struct {
 	fatal        func(code int)
 	auth         AuthConfig
 	webhook      func() *contracts.WebhookBridgePosture
+	signingClock *mqttauth.SigningClock
 
 	mu            sync.Mutex
 	everPublished bool
-	lastTimestamp int64
 }
 
 // Options configures Publisher.
@@ -58,6 +59,10 @@ type Options struct {
 	Fatal         func(code int)
 	Auth          AuthConfig
 	WebhookBridge func() *contracts.WebhookBridgePosture
+	// SigningClock issues each heartbeat's timestamp_ms, which signs it; nil
+	// gives the publisher its own in-process clock, which never repeats a
+	// value within the process.
+	SigningClock *mqttauth.SigningClock
 }
 
 // NewPublisher constructs a supervised heartbeat publisher.
@@ -100,6 +105,10 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 		fatal = os.Exit
 	}
 
+	signingClock := opts.SigningClock
+	if signingClock == nil {
+		signingClock = mqttauth.NewSigningClock(now, log)
+	}
 	return &Publisher{
 		publish:      publish,
 		provider:     prov,
@@ -112,6 +121,7 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 		fatal:        fatal,
 		auth:         opts.Auth,
 		webhook:      opts.WebhookBridge,
+		signingClock: signingClock,
 	}, nil
 }
 
@@ -211,13 +221,12 @@ func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 	// Run publishes immediately at startup, which is exactly when uptime is smallest.
 	uptimeS := math.Round(now.Sub(p.startedAt).Seconds()*1000) / 1000
 
-	p.mu.Lock()
-	timestampMS := now.UnixMilli()
-	if timestampMS <= p.lastTimestamp {
-		timestampMS = p.lastTimestamp + 1
+	// The heartbeat is signed at its timestamp, so it comes from the signing
+	// clock, which never issues a value twice.
+	timestampMS, err := p.signingClock.Next()
+	if err != nil {
+		return nil, fmt.Errorf("heartbeat: timestamp: %w", err)
 	}
-	p.lastTimestamp = timestampMS
-	p.mu.Unlock()
 
 	beat := contracts.Heartbeat{
 		Status:        status,

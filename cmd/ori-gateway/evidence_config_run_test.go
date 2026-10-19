@@ -115,6 +115,7 @@ func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 				t.Fatalf("the corpus accepts this configuration and the loader refused it: %v", err)
 			}
 			cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+			cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 			cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
 
 			mainBroker := newFakeBroker()

@@ -46,6 +46,68 @@
       }
     },
     {
+      "name": "queue directories with surrounding whitespace are trimmed before the courier's rules",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "  /var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return\t",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "authority_ca_file": ""
+      }
+    },
+    {
+      "name": "queue directories padded with non-ASCII White_Space are trimmed",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "　/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": true,
+      "effective": {
+        "max_items": 10000,
+        "max_bytes": 268435456,
+        "retry_interval_s": 5,
+        "backoff_base_s": 5,
+        "backoff_max_s": 300,
+        "store_probe_interval_s": 900,
+        "device_carriage": {
+          "site-a-edge-01": "gateway-api/v1"
+        },
+        "stopped_max_items": 10000,
+        "stopped_max_bytes": 268435456,
+        "stopped_device_max_items": 10000,
+        "stopped_device_max_bytes": 268435456,
+        "authority_ca_file": ""
+      }
+    },
+    {
       "name": "a back-off base defaults to the delivery interval and the bound to five minutes",
       "device_ids": [
         "site-a-edge-01"
@@ -924,6 +986,38 @@
       },
       "valid": false,
       "rule": "ca_file"
+    },
+    {
+      "name": "queue directories equal once surrounding whitespace is removed are refused",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": " /var/lib/ori-gateway/evidence-outbound",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": false,
+      "rule": "directories"
+    },
+    {
+      "name": "a leading unit separator is not whitespace, so the queue directory is not absolute",
+      "device_ids": [
+        "site-a-edge-01"
+      ],
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "\u001c/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+        "endpoint_env": "ORI_EVIDENCE_ENDPOINT",
+        "client_id_env": "ORI_EVIDENCE_CLIENT_ID",
+        "secret_env": "ORI_EVIDENCE_INGEST_SECRET"
+      },
+      "valid": false,
+      "rule": "directories"
     }
   ]
 }

@@ -24,8 +24,9 @@ publish-failure paths must still preserve the original `request_id` whenever the
 incoming request is valid enough to correlate. Verified by:
 `TestDispatcherTimeoutErrorResponse`, `TestDispatcherProviderErrorResponse`,
 `TestDispatcherProviderPanicResponse`,
-`TestDispatcherProviderInvalidResponsePublishesErrorResponse`, and
-`TestDispatcherPublishFailureIsSurfaced`.
+`TestDispatcherProviderInvalidResponsePublishesErrorResponse`,
+`TestDispatcherPublishFailureIsSurfaced`, and
+`TestAResponseThatCannotBeEncodedIsAnsweredWithAnError`.
 
 3. `GW-3` Providers must satisfy one shared interface.
 Provider-specific settings belong in config, not in the provider interface.
@@ -47,9 +48,14 @@ keeping Tier D evaluation and actuation APIs out of this repository.
 If heartbeat publication cannot continue, the gateway must report failure or
 exit rather than silently appearing available.
 The gateway process must also surface repeated reasoning-response delivery
-failures instead of logging forever while dropping all replies. Verified by
-`TestHeartbeatFailureLimit`, `TestGatewayHeartbeatFailureReturnsError`, and
-`TestMainEscalatesRepeatedRequestHandlerFailures`.
+failures instead of logging forever while dropping all replies. Only a reply
+it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
+a request it refuses, malformed, unauthenticated or not fresh, neither counts
+nor resets the count, so no sender can end the gateway by sending junk.
+Verified by `TestHeartbeatFailureLimit`,
+`TestGatewayHeartbeatFailureReturnsError`,
+`TestMainEscalatesRepeatedRequestHandlerFailures`, and
+`TestMalformedReasoningRequestsNeverStopTheGateway`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
@@ -121,14 +127,25 @@ later stages from starting. Shutdown must cancel background work and disconnect
 the broker. Long-running app tasks must be supervised through the shared
 `errgroup`-backed supervisor rather than open-coded result channels, so adding a
 new runner does not require updating every early-return drain path by hand.
+Every broker callback, on both broker clients, runs through one callback gate,
+and posture fetches started from the runtime heartbeat callback are owned the
+same way: once shutdown begins none starts, and `runGateway` does not return
+while one is still running, since any of them may sign from the durable signing
+clock. The signing clock is closed after them, and a closed clock never writes
+its durable mark and refuses to sign.
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
 `TestGatewayStartupSubscribeFailureCancelsHeartbeatAndDisconnects`,
 `TestMainStartsHeartbeatBeforeSubscribe`, `TestGracefulShutdown`,
 `TestSupervisedRunnersReportsRunnerErrors`,
-`TestSupervisedRunnersWaitsForAllRunners`, and
-`TestSupervisedRunnersUnexpectedNilReturnIsError`.
+`TestSupervisedRunnersWaitsForAllRunners`,
+`TestSupervisedRunnersUnexpectedNilReturnIsError`,
+`TestShutdownWaitsForAPostureFetchesSigningWrite`,
+`TestShutdownJoinsEveryBrokerCallback`,
+`TestAClosedPostureDebouncerStartsNothing`,
+`TestShutdownWaitsForTheGatewaysOwnExtension`, and
+`TestAClosedClockRefusesToSign`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
@@ -497,6 +514,90 @@ of one export is bounded, so no caller waits on an export without a bound
 `TestRepeatedForgeriesNeverExtendTheBound`,
 `TestAResponseOnAnotherDevicesTopicNeverAnswers` and
 `TestAnExportRequestsABoundedNumberOfPages`.
+
+24. `GW-24` Envelope freshness and replay follow gateway-api/v2.
+Every runtime-gateway HMAC envelope the gateway verifies is checked in the
+contract's order, stale, future, below the replay floor, replay, each refused
+under its own name (`mqttauth.ErrStaleTimestamp`, `ErrFutureTimestamp`,
+`ErrBeforeReplayFloor`, `ErrReplayDetected`). A key is kept until its envelope
+is stale; `replay_ttl_ms` is only a lower bound. Every dropped or evicted key
+raises the floor past it in the same step, and a full verifier evicts its key
+with the smallest signing time. The gateway stores neither its floor nor its
+keys, so each verifier starts its floor at its clock: an envelope signed before
+the start is refused, and the contract's stated limits for a receiver that
+stores nothing apply. A family that records only once an envelope answers
+something rechecks the floor and replay in one step with recording, and a
+recorded key is never un-recorded. A refusal below a floor ahead of the stale
+bound is logged with the floor and the clock. Skew is fixed at 5 minutes.
+Every envelope the gateway signs takes `signed_at_ms` from a signing clock: the
+evidence families from their own durable clocks, and every envelope signed
+under the runtime–gateway HMAC outside the evidence path (today the heartbeat,
+reasoning and enrichment responses and export requests) from one shared
+`mqttauth.SigningClock`, the message clock. A signer added later on that path,
+such as a LAN one, uses it too. Within a process no clock repeats a value. A
+gateway that signs keeps the message clock's mark in `gateway.state_directory`
+under gateway-config/v2, which is required when `gateway.auth.enabled` and is
+owned by `internal/gatewaystate` alone: private (0700, the gateway's user,
+never a symlink), marked as the gateway's by a marker written through a staged
+file, apart from evidence storage, and confers no authority. A directory
+without the marker is adopted only when it is empty but for the lock file and
+staged marker files, each a regular file. The marker, the lock and the mark
+are each refused unless they are regular files, the lock is never opened
+through a link, and the marker is read only up to its own length. A mark is at
+most 64 bytes: a longer one is corrupt, decided by reading at most 65. A run holds it exclusively (`gatewaystate.Acquire`, an OS
+lock taken once the marker is in place and before the mark is read, released
+by the OS if the process dies), so a second gateway on the same directory is
+refused and two clocks never share a mark. The mark is read nowhere else: no
+evidence queue directory is consulted. A mark that is not a regular file, not
+the contract's decimal grammar, or at or above the ceiling
+(`mqttauth.SigningCeiling`, 2^63 − 1 − 2,001) refuses the start. Each value is
+the latest of the wall clock, one past the last value issued and one past the
+mark found. Before issuing anything the start persists the later of the mark
+found and the wall clock plus 1,000 ms, and refuses if that write fails; every
+later mark is the later of the wall clock plus 1,000 ms and the value being
+issued, never measured from an earlier mark, so restarts accumulate no lead.
+Marks are extended in the background, so signing never waits on the disk
+within a reservation, and only an extension that would move the mark forward
+starts, so after a step back the coverage already persisted is used up first; a value past it is persisted before it is issued, after
+any extension in flight, and no persisted mark falls. A start whose first
+value would reach the ceiling is refused, and `Next` refuses a value at it
+(`ErrSigningClockExhausted`) or after `Close` (`ErrSigningClockClosed`). A
+write that fails while running is logged with its cause, once each time writes
+start failing, and retried for every value past the reservation until one
+succeeds, and signing goes on meanwhile, the limit gateway-config/v2 accepts.
+Rule 9's upper bound is judged against the wall clock read when a mark is
+chosen; while the value issued is a reservation or more ahead of it, every
+value is persisted before it is issued. A signing time first more than 300,000 ms ahead of
+the wall clock is logged as a warning. Verified by
+`TestReplayVectorCases`, `TestAKeyIsKeptUntilItsEnvelopeIsStale`,
+`TestADroppedKeyRaisesTheFloor`, `TestAStartFloorRefusesWhatWasSignedBefore`,
+`TestFreshnessReasonsAreNamedApart`, `TestSignersNeverRepeatASignedAt`,
+`TestHeartbeatsNeverShareASigningTime`,
+`TestARestartLoopNeverAccumulatesALead`,
+`TestTheStartWritesTheMarkItFound`, `TestAStartThatCannotWriteIsRefused`,
+`TestTheClockNeverReachesTheCeiling`,
+`TestAWriteNeverLandsBelowAValueAlreadyIssued`,
+`TestEveryMarkStaysWithinItsBounds`, `TestAFailedWriteIsRetriedByTheNextValue`,
+`TestEachFailureEpisodeIsWarnedAboutAgain`,
+`TestAnExtensionThatSucceedsEndsAFailureEpisode`,
+`TestTheAheadWarningIsAtThreeHundredThousandMilliseconds`,
+`TestNoMarkReachesTheCeilingNearIt`,
+`TestAJumpPastTheReservationReservesAhead`,
+`TestExtensionsKeepALeadAsTheWallClockMoves`,
+`TestAStateDirectoryThatRefusesStopsTheStartBeforeTheBroker`,
+`TestAMarkIsAtMostSixtyFourBytes`,
+`TestARollbackUsesUpTheCoverageAlreadyPersistedFirst`,
+`TestARestartResumesAboveEveryReservation`,
+`TestTheValueOnePastAReservationIsPersisted`,
+`TestASigningClockAheadOfTheWallIsReported`,
+`TestAClosedClockRefusesToSign`,
+`TestSigningNeverWaitsOnTheDiskWithinAReservation`,
+`TestEverySignerSharesTheGatewaysSigningClock`,
+`TestASignedAtNeverRepeatsAcrossARestart`,
+`TestAMarkInTheEvidenceQueueDirectoryIsNeverRead`, the
+`internal/gatewaystate` tests, and, for the load rules, the
+`gateway-config/vectors/state-directory-v2.json` corpus through
+`TestStateDirectoryVectors`.
 
 ## Layout
 

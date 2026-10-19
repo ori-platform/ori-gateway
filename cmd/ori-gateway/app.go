@@ -30,6 +30,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
 	"github.com/ori-platform/ori-gateway/internal/evidence/courier"
 	"github.com/ori-platform/ori-gateway/internal/fleet"
+	"github.com/ori-platform/ori-gateway/internal/gatewaystate"
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
@@ -88,8 +89,11 @@ type appDependencies struct {
 	// authorityTrustOwner is the one user besides root trusted to own the
 	// authority CA bundle and the directories above it: zero, root, outside tests.
 	authorityTrustOwner int
-	logger              *slog.Logger
-	now                 func() time.Time
+	// signingMark, when set by a test, wraps the state directory's mark
+	// before the signing clock uses it, as a slow disk would.
+	signingMark func(mqttauth.DurableMark) mqttauth.DurableMark
+	logger      *slog.Logger
+	now         func() time.Time
 }
 
 func defaultDependencies() appDependencies {
@@ -269,10 +273,39 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
+	// One signing clock for every envelope the gateway signs outside the
+	// evidence path, so no two are signed at one value (gateway-api/v2
+	// Envelope Freshness and Replay, Senders). A gateway that signs keeps its
+	// mark in its own state directory, independent of evidence forwarding
+	// (gateway-config/v2 gateway.state_directory). A directory that is not
+	// private, not the gateway's, corrupt or not writable refuses the start.
+	// The run holds the state directory exclusively: a second gateway on it is
+	// refused, and the hold is released last, once every signer has stopped.
+	signingClock := mqttauth.NewSigningClock(deps.now, deps.logger)
+	if cfg.Gateway.Auth.Enabled {
+		owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory)
+		if err != nil {
+			return fmt.Errorf("open gateway state directory: %w", err)
+		}
+		defer func() { _ = owner.Close() }()
+		var mark mqttauth.DurableMark = owner.Mark()
+		if deps.signingMark != nil {
+			mark = deps.signingMark(mark)
+		}
+		signingClock, err = mqttauth.NewDurableSigningClock(deps.now, mark, deps.logger)
+		if err != nil {
+			return fmt.Errorf("open gateway signing clock: %w", err)
+		}
+	}
+	// Every broker callback runs through one gate. Shutdown closes it, which
+	// refuses any later callback and waits for those running, before any
+	// state they may sign or write is released (GW-15).
+	callbacks := newCallbackGate()
+
 	// One count of size and volume refusals for every broker client, projected
 	// as the site's mqtt_ingress posture.
 	ingress := broker.NewIngressStats(deps.logger)
-	client, err := deps.newBroker(broker.Options{
+	rawClient, err := deps.newBroker(broker.Options{
 		BrokerURL: cfg.Gateway.BrokerURL,
 		ClientID:  defaultClientID,
 		Logger:    deps.logger,
@@ -282,6 +315,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err != nil {
 		return fmt.Errorf("construct broker: %w", err)
 	}
+	client := callbacks.wrap(rawClient)
 	if err := client.Connect(ctx); err != nil {
 		return fmt.Errorf("connect broker: %w", err)
 	}
@@ -293,7 +327,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	}()
 	var evidenceBroker brokerClient
 	if cfg.Evidence.Enabled {
-		evidenceBroker, err = deps.newBroker(broker.Options{
+		rawEvidenceBroker, err := deps.newBroker(broker.Options{
 			BrokerURL: cfg.Gateway.BrokerURL, ClientID: defaultEvidenceClientID,
 			Logger: deps.logger, PersistentSession: true, Ingress: ingress,
 			Devices: cfg.Gateway.DeviceIDs,
@@ -301,6 +335,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct evidence broker: %w", err)
 		}
+		evidenceBroker = callbacks.wrap(rawEvidenceBroker)
 		if err := evidenceBroker.Connect(ctx); err != nil {
 			return fmt.Errorf("connect evidence broker: %w", err)
 		}
@@ -326,7 +361,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct runtime export client options: %w", err)
 		}
-		runtimeClientOptions = append(runtimeClientOptions, runtimeclient.WithLogger(deps.logger))
+		runtimeClientOptions = append(runtimeClientOptions, runtimeclient.WithLogger(deps.logger),
+			runtimeclient.WithSigningClock(signingClock))
 		runtimeExportClient, err = deps.newRuntimeClient(client, runtimeClientOptions...)
 		if err != nil {
 			return fmt.Errorf("construct runtime export client: %w", err)
@@ -380,9 +416,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Posture fetches run per device off the broker callback, and each signs
+	// an export request from the durable signing clock. They are owned here:
+	// once shutdown begins none starts, and runGateway never returns while
+	// one is still running (GW-15).
+	postureDebounce := newPostureDebouncer()
+	defer func() {
+		cancel()
+		callbacks.close()
+		postureDebounce.close()
+		// The signing clock extends its durable reservation in the
+		// background; no such write outlives runGateway.
+		signingClock.Close()
+	}()
 	runners := newSupervisedRunners(runCtx)
 	shutdownRunners := func() {
 		cancel()
+		postureDebounce.close()
 		_ = runners.wait()
 	}
 
@@ -478,6 +528,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			Logger:        deps.logger,
 			Auth:          heartbeatAuth,
 			WebhookBridge: webhookBridgePostureProbe(cfg.WebhookBridge, webhookBridgeReady.Load),
+			SigningClock:  signingClock,
 		},
 	)
 	if err != nil {
@@ -488,7 +539,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 
 	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
 
-	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now}
+	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now, SigningClock: signingClock}
 	if gatewaySecrets.Enabled {
 		verifier, err := mqttauth.NewVerifier(mqttauth.Config{
 			SharedSecret:         gatewaySecrets.CurrentSecret,
@@ -516,6 +567,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	if err := client.Subscribe(runCtx, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 		if err := reasoningDispatcher.HandleRequest(runCtx, topic, payload); err != nil {
 			deps.logger.Warn("reasoning request handling failed", "topic", topic, "error", err)
+			// Only a reply that could not be delivered counts toward the
+			// escalation (GW-6). A refused request, malformed, unauthenticated
+			// or not fresh, neither counts nor resets the count, so no sender
+			// can end the gateway or mask a delivery failure by sending junk.
+			if !errors.Is(err, dispatcher.ErrPublishResponse) {
+				return
+			}
 			requestFailureMu.Lock()
 			requestFailures++
 			failures := requestFailures
@@ -581,7 +639,6 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
-	postureDebounce := newPostureDebouncer()
 	for _, deviceID := range cfg.Gateway.DeviceIDs {
 		topic, err := contracts.RuntimeNodeHeartbeatTopic(deviceID)
 		if err != nil {
@@ -615,7 +672,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment provider: %w", err)
 		}
-		enrichmentOptions := enrichment.Options{Logger: deps.logger, Now: deps.now}
+		enrichmentOptions := enrichment.Options{Logger: deps.logger, Now: deps.now, SigningClock: signingClock}
 		if gatewaySecrets.Enabled {
 			verifier, err := mqttauth.NewVerifier(mqttauth.Config{
 				SharedSecret:         gatewaySecrets.CurrentSecret,
@@ -689,6 +746,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		return disconnectBroker(client, &disconnect)
 	case err := <-runners.done():
 		cancel()
+		postureDebounce.close()
 		if ctx.Err() != nil {
 			return disconnectBroker(client, &disconnect)
 		}
@@ -1090,6 +1148,8 @@ func (s staticProviderStatus) Healthy(ctx context.Context) bool {
 type postureDebouncer struct {
 	mu       sync.Mutex
 	inflight map[string]bool
+	closed   bool
+	running  sync.WaitGroup
 }
 
 func newPostureDebouncer() *postureDebouncer {
@@ -1097,21 +1157,33 @@ func newPostureDebouncer() *postureDebouncer {
 }
 
 // tryStart marks deviceID as in-flight and returns true if no fetch was already
-// running. Returns false (and does nothing) if a fetch is already in flight.
+// running and the debouncer is not closed. Returns false (and does nothing)
+// otherwise. A true result must be paired with done.
 func (d *postureDebouncer) tryStart(deviceID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.inflight[deviceID] {
+	if d.closed || d.inflight[deviceID] {
 		return false
 	}
 	d.inflight[deviceID] = true
+	d.running.Add(1)
 	return true
 }
 
 func (d *postureDebouncer) done(deviceID string) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	delete(d.inflight, deviceID)
+	d.mu.Unlock()
+	d.running.Done()
+}
+
+// close refuses every later fetch and waits for those running to finish. It
+// may be called more than once.
+func (d *postureDebouncer) close() {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	d.running.Wait()
 }
 
 func fetchAndUpsertPosture(ctx context.Context, rc runtimeclient.Client, registry *site.Registry, deviceID string, logger *slog.Logger) {
@@ -1199,4 +1271,52 @@ func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCo
 		view[family] = site.MQTTIngressCount{PayloadTooLarge: count.PayloadTooLarge, VolumeDropped: count.VolumeDropped}
 	}
 	return view
+}
+
+// callbackGate admits broker callbacks while the gateway runs and joins them
+// at shutdown: once closed it refuses every later callback, and close returns
+// only when every callback it admitted has returned.
+type callbackGate struct {
+	mu      sync.Mutex
+	closed  bool
+	running sync.WaitGroup
+}
+
+func newCallbackGate() *callbackGate { return &callbackGate{} }
+
+func (g *callbackGate) enter() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	g.running.Add(1)
+	return true
+}
+
+func (g *callbackGate) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+	g.running.Wait()
+}
+
+// wrap returns b with every handler it subscribes run through the gate.
+func (g *callbackGate) wrap(b brokerClient) brokerClient {
+	return &gatedBroker{brokerClient: b, gate: g}
+}
+
+type gatedBroker struct {
+	brokerClient
+	gate *callbackGate
+}
+
+func (b *gatedBroker) Subscribe(ctx context.Context, topic string, qos byte, handler broker.MessageHandler) error {
+	return b.brokerClient.Subscribe(ctx, topic, qos, func(topic string, payload []byte) {
+		if !b.gate.enter() {
+			return
+		}
+		defer b.gate.running.Done()
+		handler(topic, payload)
+	})
 }

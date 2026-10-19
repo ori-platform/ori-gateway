@@ -198,15 +198,23 @@ func TestPayloadSizeVectorCases(t *testing.T) {
 	for _, family := range contracts.ReceivedFamilies {
 		received[family] = true
 	}
+	names := map[string]string{}
+	for _, c := range corpus.Cases {
+		names[c.Name] = c.Topic
+	}
+	checkLANPinsExist(t, lanSizeCasePins, names)
 	seen := map[string]int{}
 	for _, c := range corpus.Cases {
+		observed := ""
 		if c.Direction == "runtime_to_gateway" != received[c.Topic] {
-			t.Fatalf("%s: direction %s disagrees with the families the gateway receives", c.Name, c.Direction)
-		}
-		if want, ok := contracts.PayloadMaxima[c.Topic]; !ok {
-			t.Fatalf("%s: topic %s is not in the gateway's table", c.Name, c.Topic)
+			observed = "direction " + c.Direction + " disagrees with the families the gateway receives"
+		} else if want, ok := contracts.PayloadMaxima[c.Topic]; !ok {
+			observed = "topic is not in the gateway's table"
 		} else if c.ConfiguredMaximum == nil && c.Verdict == "admitted" && c.Length > want {
-			t.Fatalf("%s: admitted at %d over the gateway's maximum %d", c.Name, c.Length, want)
+			observed = fmt.Sprintf("admitted at %d over the gateway's maximum %d", c.Length, want)
+		}
+		if checkLANPin(t, lanSizeCasePins, c.Name, observed) {
+			continue
 		}
 		if !received[c.Topic] || c.ConfiguredMaximum != nil {
 			continue

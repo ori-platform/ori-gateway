@@ -98,6 +98,7 @@ func authorityTrustConfig(t *testing.T, bundle string) config.Config {
 	t.Setenv("EVIDENCE_SECRET", "evidence-ingest-secret-with-at-least-32-bytes")
 	cfg := validConfig()
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
 	cfg.Evidence = config.EvidenceConfig{
 		Enabled: true, QueueDirectory: filepath.Join(t.TempDir(), "outbound"),

@@ -43,10 +43,24 @@ func loadMemberCorpus(t *testing.T) memberCorpus {
 // the corpus's list of every topic's defined members.
 func TestDefinedMembersMatchTheCorpus(t *testing.T) {
 	corpus := loadMemberCorpus(t)
-	if len(corpus.Families) != len(contracts.PayloadMaxima) {
-		t.Fatalf("corpus has %d families, the gateway's table %d", len(corpus.Families), len(contracts.PayloadMaxima))
+	families := map[string]string{}
+	for family := range corpus.Families {
+		families[family] = family
+	}
+	checkLANPinsExist(t, lanFamilyPins, families)
+	for family := range contracts.PayloadMaxima {
+		if _, ok := families[family]; !ok {
+			t.Errorf("%s: in the gateway's table, not in the corpus", family)
+		}
 	}
 	for family, want := range corpus.Families {
+		observed := ""
+		if _, ok := contracts.PayloadMaxima[family]; !ok {
+			observed = "not in the gateway's member table"
+		}
+		if checkLANPin(t, lanFamilyPins, family, observed) {
+			continue
+		}
 		got := slices.Clone(contracts.DefinedMembers(family))
 		slices.Sort(got)
 		if !slices.Equal(got, want) {
@@ -71,6 +85,15 @@ func TestPayloadMemberVectorCases(t *testing.T) {
 	for _, family := range contracts.ReceivedFamilies {
 		received[family] = true
 	}
+	names := map[string]string{}
+	for _, c := range corpus.Cases {
+		if c.Family != nil {
+			names[c.Name] = *c.Family
+		} else {
+			names[c.Name] = ""
+		}
+	}
+	checkLANPinsExist(t, lanMemberCasePins, names)
 	throughWrapper := 0
 	for _, c := range corpus.Cases {
 		payload, err := hex.DecodeString(c.PayloadHex)
@@ -101,9 +124,11 @@ func TestPayloadMemberVectorCases(t *testing.T) {
 		} else if err != nil {
 			t.Fatalf("%s: %v", c.Name, err)
 		}
+		observed := ""
 		if got != c.Expected {
-			t.Errorf("%s: %s, want %s", c.Name, got, c.Expected)
+			observed = got + ", want " + c.Expected
 		}
+		checkLANPin(t, lanMemberCasePins, c.Name, observed)
 	}
 	if throughWrapper == 0 {
 		t.Fatal("no corpus case reached the message wrapper")

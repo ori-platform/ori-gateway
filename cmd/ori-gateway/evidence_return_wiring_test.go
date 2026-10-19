@@ -39,6 +39,7 @@ func TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff(t *testing.T) {
 	cfg := validConfig()
 	cfg.Gateway.DeviceIDs = []string{"dev-01", "dev-02"}
 	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
 	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
 	cfg.Evidence = config.EvidenceConfig{
 		Enabled: true, QueueDirectory: filepath.Join(t.TempDir(), "outbound"),

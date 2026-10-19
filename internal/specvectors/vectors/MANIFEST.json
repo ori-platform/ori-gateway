@@ -1,6 +1,6 @@
 {
   "source_repository": "ori-platform/ori-specs",
-  "source_commit": "f4a30dc4555b412bfd386c2714bed7b4bb964552",
+  "source_commit": "404cbcb742f443a706ca6aae986099398edef8c8",
   "note": "Vendored copies of the ori-specs vectors the gateway's tests consume, each at its path in the source repository. Digests detect a local edit; the source commit is the provenance trail. Re-vendor from the source commit rather than editing a copy.",
   "files": {
     "evidence-exchange/vectors/anchor-registration-v2.json": "c8c56f2d8ab1a316724f3f6487359c1e39035ce5207af956ec583086a4b94f62",
@@ -10,9 +10,11 @@
     "evidence-transport/vectors/ingest-auth.json": "88cd580040cecac1e6e23bbad29cd24054d42e1a70360cc22487259db3d65c70",
     "evidence-transport/vectors/refusal-policy-v2.json": "5830cdefced9d9793f9057b9a89c9f730da2901b40a01636a6b01554fd4c2f32",
     "gateway-api/vectors/outbound-evidence.json": "91475546a540ed81637af193b2e78f22c9092e287ebfcf3e6e68b156152a42b8",
-    "gateway-api/vectors/payload-members-v2.json": "ef09a43819d6794ff3b8ee1f6ed06b8d2002b6a0133d95e224d6e0806a7d17eb",
-    "gateway-api/vectors/payload-size-v2.json": "cd18f6a7f41905f9d6b6a32b39cad754a5bf86863eb7efec536d2c7bf2a1f1c1",
-    "gateway-config/vectors/evidence-config-v2.json": "9638dd33f99ee59cf9000c7d5113ca1ffa72d278cb23ad3d72ee086c4fe1b53d",
+    "gateway-api/vectors/payload-members-v2.json": "ea5f327e97deb9a65e3909bd09e7945615745d2ef6f77ccb7df4b9f30c5b9067",
+    "gateway-api/vectors/payload-size-v2.json": "c3359f38734501206b26735a25e117a26bb53bd74b6e9cfb526363ace72246ef",
+    "gateway-api/vectors/replay-v2.json": "1a85b38126e7e680bc5a15a804599372738a4b35f089300886f35306d3962247",
+    "gateway-config/vectors/evidence-config-v2.json": "4da83892370f8530e37502860cf11f773a8ed35b9d9e2f7a419aa51d72d8b95e",
+    "gateway-config/vectors/state-directory-v2.json": "75033541fc66ac063b363e5a6db1495060ad59f67a050a5115e321bf4790506b",
     "gateway-evidence-carriage/vectors/inbound-retirement-v1.json": "4cee709804568e2bdd05f7fee1f983fc458cbccb4d300862e491776bd00c418f",
     "gateway-evidence-carriage/vectors/site-health-evidence-delivery.json": "05cbe0d8a7e50f4a6a1be85e82b51eb34c43ef3d733f81913bab73834f28e326"
   }

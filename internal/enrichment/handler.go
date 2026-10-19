@@ -45,6 +45,9 @@ type Options struct {
 	AuthVerifier  *mqttauth.Verifier
 	SigningSecret string
 	Now           func() time.Time
+	// SigningClock issues every signed_at_ms; nil gives the component its own
+	// in-process clock, which never repeats a value within the process.
+	SigningClock *mqttauth.SigningClock
 }
 
 // Handler validates Tier C enrichment requests and publishes one correlated response.
@@ -56,6 +59,7 @@ type Handler struct {
 	verifier       *mqttauth.Verifier
 	signingSecret  string
 	now            func() time.Time
+	signingClock   *mqttauth.SigningClock
 }
 
 // NewHandler constructs a Tier C enrichment handler.
@@ -93,6 +97,7 @@ func NewHandler(publisher Publisher, provider Provider, opts Options) (*Handler,
 		verifier:       opts.AuthVerifier,
 		signingSecret:  signingSecret,
 		now:            now,
+		signingClock:   signingClockOrOwn(opts.SigningClock, now),
 	}, nil
 }
 
@@ -200,12 +205,16 @@ func (h *Handler) encodeResponse(req contracts.TierCEnrichmentRequest, resp cont
 	}
 	resp.Auth = nil
 	if h.signingSecret != "" {
+		signedAt, err := h.signingClock.Next()
+		if err != nil {
+			return nil, fmt.Errorf("enrichment: sign response: %w", err)
+		}
 		auth, err := mqttauth.Sign(
 			resp,
 			contracts.TierCEnrichmentResponseMessageType,
 			req.DeviceID,
 			req.RequestID,
-			h.now().UnixMilli(),
+			signedAt,
 			h.signingSecret,
 		)
 		if err != nil {
@@ -235,4 +244,11 @@ func providerErrorMessage(err error) string {
 		return "provider panic"
 	}
 	return "provider error"
+}
+
+func signingClockOrOwn(clock *mqttauth.SigningClock, now func() time.Time) *mqttauth.SigningClock {
+	if clock != nil {
+		return clock
+	}
+	return mqttauth.NewSigningClock(now, nil)
 }

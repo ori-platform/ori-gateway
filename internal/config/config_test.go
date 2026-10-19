@@ -388,6 +388,7 @@ func TestGatewayAuthConfigLoads(t *testing.T) {
 gateway:
   broker_url: "tcp://localhost:1883"
   device_ids: ["dev-01"]
+  state_directory: "/var/lib/ori-gateway/state"
   auth:
     enabled: true
     shared_secret_env: "CUSTOM_GATEWAY_SECRET"
@@ -1376,6 +1377,7 @@ func TestGatewayAuthPreviousSecretAndEncryptionLoad(t *testing.T) {
 gateway:
   broker_url: "tcp://localhost:1883"
   device_ids: ["dev-01"]
+  state_directory: "/var/lib/ori-gateway/state"
   auth:
     enabled: true
     shared_secret_env: "GATEWAY_SECRET_CURRENT"
@@ -1516,5 +1518,60 @@ evidence:
 				}
 			})
 		}
+	}
+}
+
+// TestGatewayStateDirectoryRules requires a state directory whenever the
+// gateway signs, holds it to an absolute path, and keeps it apart from the
+// evidence queue directories.
+func TestGatewayStateDirectoryRules(t *testing.T) {
+	base := `
+gateway:
+  broker_url: "tcp://localhost:1883"
+  device_ids: ["dev-01"]
+  STATE
+  auth:
+    enabled: true
+provider:
+  name: echo
+`
+	evidence := `
+evidence:
+  enabled: true
+  queue_directory: "/var/lib/ori-gateway/evidence-outbound"
+  return_queue_directory: "/var/lib/ori-gateway/evidence-returned"
+  max_items: 10
+  max_bytes: 8388608
+  retry_interval_s: 60
+  endpoint_env: "EVIDENCE_ENDPOINT"
+  client_id_env: "EVIDENCE_CLIENT"
+  secret_env: "EVIDENCE_SECRET"
+`
+	for _, c := range []struct {
+		name, state, extra, wantErr string
+	}{
+		{"required when signing", "", "", "gateway.state_directory is required"},
+		{"absolute", `state_directory: "state"`, "", "must be an absolute path"},
+		{"the outbound queue itself", `state_directory: "/var/lib/ori-gateway/evidence-outbound"`, evidence, "separate from the evidence queue"},
+		{"inside the return queue", `state_directory: "/var/lib/ori-gateway/evidence-returned/state"`, evidence, "separate from the evidence queue"},
+		{"containing a queue", `state_directory: "/var/lib/ori-gateway"`, evidence, "separate from the evidence queue"},
+		{"its own directory", `state_directory: "/var/lib/ori-gateway/state"`, evidence, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			content := strings.Replace(base, "STATE", c.state, 1) + c.extra
+			cfg, err := Load(writeConfig(t, content))
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cfg.Gateway.StateDirectory != "/var/lib/ori-gateway/state" {
+					t.Fatalf("state directory = %q", cfg.Gateway.StateDirectory)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("Load = %v, want %q", err, c.wantErr)
+			}
+		})
 	}
 }

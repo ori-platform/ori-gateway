@@ -71,3 +71,33 @@ func sizeReply(t *testing.T, name string) sizeReplyCase {
 	t.Fatalf("the corpus has no %s reply", name)
 	return sizeReplyCase{}
 }
+
+// TestHeartbeatsNeverShareASigningTime builds heartbeats under a frozen
+// clock: each is signed at a time no other heartbeat was, so no two are ever
+// byte-identical (gateway-api/v2 Envelope Freshness and Replay, Senders).
+func TestHeartbeatsNeverShareASigningTime(t *testing.T) {
+	frozen := time.UnixMilli(1_787_000_000_000)
+	publisher, err := NewPublisher(func(context.Context, []byte) error { return nil },
+		stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+			Interval: time.Second, StartedAt: frozen, Now: func() time.Time { return frozen },
+			Auth: AuthConfig{Enabled: true, SharedSecret: "site-local-secret"},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int64]bool{}
+	for range 5 {
+		payload, err := publisher.buildPayload(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var beat contracts.Heartbeat
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			t.Fatal(err)
+		}
+		if beat.Auth == nil || beat.Auth.SignedAtMS != beat.TimestampMS || seen[beat.Auth.SignedAtMS] {
+			t.Fatalf("heartbeat signed at %v, timestamp %d; want a new signing time equal to its timestamp", beat.Auth, beat.TimestampMS)
+		}
+		seen[beat.Auth.SignedAtMS] = true
+	}
+}
