@@ -28,6 +28,9 @@ const (
 	markerBody = "ori-gateway state directory v1\n"
 	lockName   = ".ori-gateway-state.lock"
 	markName   = ".ori-signed-at-messages"
+	// markMaxBytes is the longest mark: a longer file is corrupt, decided by
+	// reading at most one byte more.
+	markMaxBytes = 64
 )
 
 // Open prepares the state directory at the clean form of dir: it is created
@@ -253,11 +256,14 @@ func readMark(dir string) (*Mark, error) {
 	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("gateway signing clock mark is corrupt: not a regular file")
 	}
-	body, err := os.ReadFile(path)
+	body, err := readAtMost(path, markMaxBytes+1)
 	if err != nil {
 		return nil, fmt.Errorf("read gateway signing clock mark: %w", err)
 	}
-	value, ok := parseMark(string(body))
+	if len(body) > markMaxBytes {
+		return nil, fmt.Errorf("gateway signing clock mark is corrupt: longer than %d bytes", markMaxBytes)
+	}
+	value, ok := parseMark(body)
 	if !ok {
 		return nil, fmt.Errorf("gateway signing clock mark is corrupt")
 	}
@@ -267,7 +273,7 @@ func readMark(dir string) (*Mark, error) {
 	return m, nil
 }
 
-// parseMark reads a mark: a non-negative decimal number of milliseconds,
+// parseMark reads a mark of at most markMaxBytes: a non-negative decimal number of milliseconds,
 // possibly with leading zeros, a leading '+' and surrounding Unicode
 // White_Space, below mqttauth.SigningCeiling.
 func parseMark(body string) (int64, bool) {

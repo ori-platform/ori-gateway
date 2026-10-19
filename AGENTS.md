@@ -543,7 +543,8 @@ file, apart from evidence storage, and confers no authority. A directory
 without the marker is adopted only when it is empty but for the lock file and
 staged marker files, each a regular file. The marker, the lock and the mark
 are each refused unless they are regular files, the lock is never opened
-through a link, and the marker is read only up to its own length. A run holds it exclusively (`gatewaystate.Acquire`, an OS
+through a link, and the marker is read only up to its own length. A mark is at
+most 64 bytes: a longer one is corrupt, decided by reading at most 65. A run holds it exclusively (`gatewaystate.Acquire`, an OS
 lock taken once the marker is in place and before the mark is read, released
 by the OS if the process dies), so a second gateway on the same directory is
 refused and two clocks never share a mark. The mark is read nowhere else: no
@@ -583,6 +584,7 @@ the wall clock is logged as a warning. Verified by
 `TestAJumpPastTheReservationReservesAhead`,
 `TestExtensionsKeepALeadAsTheWallClockMoves`,
 `TestAStateDirectoryThatRefusesStopsTheStartBeforeTheBroker`,
+`TestAMarkIsAtMostSixtyFourBytes`,
 `TestARestartResumesAboveEveryReservation`,
 `TestTheValueOnePastAReservationIsPersisted`,
 `TestASigningClockAheadOfTheWallIsReported`,

@@ -549,3 +549,49 @@ func TestRestoringTheMarkerRecoversAUsedDirectory(t *testing.T) {
 		t.Fatalf("after recovery the clock signed at %d (%v), not above %d", at, err, last)
 	}
 }
+
+// TestAMarkIsAtMostSixtyFourBytes reads a valid mark padded to exactly 64
+// bytes, and the same mark one byte longer: the first is read, the second is
+// corrupt, and a mark far longer is refused without being read whole.
+func TestAMarkIsAtMostSixtyFourBytes(t *testing.T) {
+	pad := func(n int) string {
+		return " +" + strings.Repeat("0", n-len(" +42\n")) + "42\n"
+	}
+	for _, tc := range []struct {
+		name, body string
+		valid      bool
+	}{
+		{"64 bytes", pad(64), true},
+		{"65 bytes", pad(65), false},
+		{"64 MiB", pad(64 << 20), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name != "64 MiB" && len(tc.body) != map[string]int{"64 bytes": 64, "65 bytes": 65}[tc.name] {
+				t.Fatalf("built %d bytes", len(tc.body))
+			}
+			dir, err := Open(filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeMark(t, dir, tc.body)
+			owner, err := Acquire(dir)
+			if !tc.valid {
+				if err == nil {
+					_ = owner.Close()
+					t.Fatal("a mark longer than 64 bytes was accepted")
+				}
+				if !strings.Contains(err.Error(), "longer than 64 bytes") {
+					t.Fatalf("Acquire = %v, want refused for its length", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a 64-byte mark was refused: %v", err)
+			}
+			defer owner.Close()
+			if got, ok := owner.Mark().Found(); !ok || got != 42 {
+				t.Fatalf("found %d, %v; want 42", got, ok)
+			}
+		})
+	}
+}
