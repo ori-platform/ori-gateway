@@ -496,3 +496,56 @@ func TestOpenUsesTheCleanPath(t *testing.T) {
 		t.Fatalf("Open opened %q, want %q", got, want)
 	}
 }
+
+// TestRestoringTheMarkerRecoversAUsedDirectory follows docs/OPERATIONS.md's
+// recovery from a corrupt marker on a directory that holds a signing mark:
+// deleting the marker leaves the directory refused, and restoring it exactly
+// recovers it, with the clock resuming above the retained mark.
+func TestRestoringTheMarkerRecoversAUsedDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	owner, err := Acquire(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock, err := mqttauth.NewDurableSigningClock(time.Now, owner.Mark(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := clock.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Close()
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, markerName)
+	if err := os.WriteFile(marker, []byte("damaged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(dir); err == nil || !strings.Contains(err.Error(), "marker is corrupt") {
+		t.Fatalf("a corrupt marker: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(dir); err == nil || !strings.Contains(err.Error(), "not empty") {
+		t.Fatalf("a deleted marker beside a mark: %v, want the directory still refused", err)
+	}
+	if err := os.WriteFile(marker, []byte("ori-gateway state directory v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("after restoring the marker: %v", err)
+	}
+	defer recovered.Close()
+	resumed, err := mqttauth.NewDurableSigningClock(time.Now, recovered.Mark(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Close()
+	if at, err := resumed.Next(); err != nil || at <= last {
+		t.Fatalf("after recovery the clock signed at %d (%v), not above %d", at, err, last)
+	}
+}

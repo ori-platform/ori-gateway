@@ -704,9 +704,21 @@ group or other users, is owned by another user, is not empty and not marked as
 the gateway's (`.ori-gateway-state-v1`), holds a corrupt mark, or cannot be
 written. A directory holding only the lock file and staged
 `.ori-gateway-state-v1.*` files, as an interrupted first start leaves it, is
-adopted. A corrupt marker is not repaired by the gateway: check that the
-directory is the gateway's, then delete the marker. It must not be, contain, or
-sit inside an evidence queue directory, and it
+adopted. A corrupt marker (`gateway state directory marker is corrupt`) is
+not repaired by the gateway, and deleting it does not help: a directory that
+already holds the signing mark is then refused as not empty. To recover, stop
+the gateway, check that the directory is the gateway's (owned by its user,
+holding only `.ori-gateway-state-v1`, `.ori-gateway-state.lock`,
+`.ori-signed-at-messages` and staged copies of them), and restore the marker
+exactly, as the gateway's user, leaving `.ori-signed-at-messages` in place so
+the clock resumes above it:
+
+```sh
+sudo -u "$GATEWAY_USER" sh -c 'umask 077; printf "ori-gateway state directory v1\n" > /var/lib/ori-gateway/state/.ori-gateway-state-v1'
+```
+
+The state directory must not be, contain, or sit inside an evidence queue
+directory, and it
 belongs to one gateway: a running gateway holds an exclusive lock on it
 (`.ori-gateway-state.lock`), so a second gateway started on the same directory
 refuses to start with `gateway state directory is in use by another gateway`.
