@@ -1,0 +1,546 @@
+{
+  "contract": "gateway-config/v2 gateway.state_directory",
+  "note": "Each case is the value of `gateway.auth.enabled`, the `gateway.state_directory` value as written (absent when the key is `null`), and the courier's `enabled` flag and two queue directories, every other courier key holding a valid value. A valid case names `effective`, the state directory after surrounding whitespace is removed, empty when absent; a refused case names the first load rule it breaks: `required_under_auth`, `absolute`, or `separate_from_evidence_queues`. Start rules are not load rules and are not represented.",
+  "cases": [
+    {
+      "name": "auth enabled, a private state directory, courier disabled",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "auth enabled, a state directory beside both queue directories",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "auth disabled and the key absent",
+      "auth_enabled": false,
+      "state_directory": null,
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": ""
+    },
+    {
+      "name": "auth disabled and the key empty",
+      "auth_enabled": false,
+      "state_directory": "",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": ""
+    },
+    {
+      "name": "auth disabled, an absolute state directory is accepted and unused",
+      "auth_enabled": false,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "surrounding whitespace is removed",
+      "auth_enabled": true,
+      "state_directory": "  /var/lib/ori-gateway/state\t",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "a trailing slash is still absolute and beside the queues",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state/",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state/"
+    },
+    {
+      "name": "a name that extends a queue directory's name is not inside it",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-outbound-state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/evidence-outbound-state"
+    },
+    {
+      "name": "the separation rule does not apply while the courier is disabled",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-outbound",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/evidence-outbound"
+    },
+    {
+      "name": "auth enabled and the key absent",
+      "auth_enabled": true,
+      "state_directory": null,
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "required_under_auth"
+    },
+    {
+      "name": "auth enabled and the key empty",
+      "auth_enabled": true,
+      "state_directory": "",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "required_under_auth"
+    },
+    {
+      "name": "auth enabled and the key only whitespace",
+      "auth_enabled": true,
+      "state_directory": " \t ",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "required_under_auth"
+    },
+    {
+      "name": "a relative path, auth disabled",
+      "auth_enabled": false,
+      "state_directory": "var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "absolute"
+    },
+    {
+      "name": "a dot-relative path, auth enabled",
+      "auth_enabled": true,
+      "state_directory": "./state",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "absolute"
+    },
+    {
+      "name": "a parent-relative path, auth enabled",
+      "auth_enabled": true,
+      "state_directory": "../state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "absolute"
+    },
+    {
+      "name": "equal to the outbound queue directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-outbound",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "equal to the return queue directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-return",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "inside the outbound queue directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-outbound/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "inside the return queue directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-return/gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "containing both queue directories",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "the filesystem root contains every queue directory",
+      "auth_enabled": true,
+      "state_directory": "/",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "a queue directory at the root contains every state directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/",
+        "return_queue_directory": "/var/lib/ori-gateway/r"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "equal to a queue directory once repeated slashes and dot components are removed",
+      "auth_enabled": true,
+      "state_directory": "/var/lib//ori-gateway/./evidence-return/.",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "inside a queue directory once a parent component is resolved",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state/../evidence-outbound/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "auth disabled and the key only whitespace",
+      "auth_enabled": false,
+      "state_directory": " \t ",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": ""
+    },
+    {
+      "name": "auth disabled, surrounding whitespace is removed",
+      "auth_enabled": false,
+      "state_directory": "  /var/lib/ori-gateway/state ",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "non-breaking and ideographic spaces are surrounding whitespace",
+      "auth_enabled": true,
+      "state_directory": " /var/lib/ori-gateway/state　",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "a queue directory whose name extends the state directory's name is not inside it",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/evidence"
+    },
+    {
+      "name": "a value written inside a queue directory that resolves outside it",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-outbound/../state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/evidence-outbound/../state"
+    },
+    {
+      "name": "a relative value naming a queue directory is refused as not absolute first",
+      "auth_enabled": true,
+      "state_directory": "var/lib/ori-gateway/evidence-outbound",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "absolute"
+    },
+    {
+      "name": "equal to a queue directory but for a trailing slash",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-outbound/",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "containing both queue directories, written with a trailing slash",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "equal to an outbound queue directory that is written uncleaned",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/./ori-gateway/state",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "equal to a return queue directory that is written uncleaned",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/x/../state"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "equal to a queue directory once surrounding whitespace is removed",
+      "auth_enabled": true,
+      "state_directory": " /var/lib/ori-gateway/evidence-outbound\t",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "the separation rule applies with auth disabled",
+      "auth_enabled": false,
+      "state_directory": "/var/lib/ori-gateway/evidence-return",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "a parent component at the root stays at the root",
+      "auth_enabled": true,
+      "state_directory": "/../var/lib/ori-gateway/evidence-outbound",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "whitespace inside the value is kept and left to the start requirements",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state dir\tx",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state dir\tx"
+    },
+    {
+      "name": "an outbound queue directory with leading whitespace is trimmed and stays beside the state directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "  /var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "a return queue directory with leading whitespace is trimmed and stays beside the state directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "\t/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/state"
+    },
+    {
+      "name": "equal to a return queue directory once its leading whitespace is removed",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/evidence-return",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": " /var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "letter case distinguishes a path from a queue directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/Evidence-Outbound",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": true,
+      "effective": "/var/lib/ori-gateway/Evidence-Outbound"
+    },
+    {
+      "name": "a leading unit separator is not whitespace, so the value is not absolute",
+      "auth_enabled": true,
+      "state_directory": "\u001f/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": false,
+        "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "absolute"
+    },
+    {
+      "name": "equal to a queue directory once the queue's surrounding whitespace is removed",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/state ",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    },
+    {
+      "name": "a queue directory written uncleaned still lies inside the state directory",
+      "auth_enabled": true,
+      "state_directory": "/var/lib/ori-gateway/state",
+      "evidence": {
+        "enabled": true,
+        "queue_directory": "/var/lib/ori-gateway/state//outbound/",
+        "return_queue_directory": "/var/lib/ori-gateway/evidence-return"
+      },
+      "valid": false,
+      "rule": "separate_from_evidence_queues"
+    }
+  ]
+}

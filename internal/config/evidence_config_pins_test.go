@@ -91,6 +91,16 @@ var evidenceConfigPins = map[string]configPin{
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
 		Observed:    "the loader produces no stopped-custody bounds",
 	},
+	"queue directories padded with non-ASCII White_Space are trimmed": {
+		Requirement: "missing_requirement:stopped-custody-bounds",
+		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
+		Observed:    "the loader produces no stopped-custody bounds",
+	},
+	"queue directories with surrounding whitespace are trimmed before the courier's rules": {
+		Requirement: "missing_requirement:stopped-custody-bounds",
+		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
+		Observed:    "the loader produces no stopped-custody bounds",
+	},
 	"stopped-custody bounds set per device and in total": {
 		Requirement: "missing_requirement:stopped-custody-bounds",
 		Issue:       "https://github.com/ori-platform/ori-gateway/issues/105",
