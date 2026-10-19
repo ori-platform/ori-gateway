@@ -620,25 +620,29 @@ func TestAnExtensionThatSucceedsEndsAFailureEpisode(t *testing.T) {
 	mark := newMemMark(t, wall)
 	logs := &bytes.Buffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
-	// Each step moves the wall clock 300 ms, a millisecond per value, so
-	// every step past a reservation's half starts an extension.
-	step := func(fail bool) {
+	// Each step moves the wall clock a millisecond per value, so a step past
+	// a reservation's half starts an extension.
+	step := func(fail bool, values int) {
 		mark.setFail(fail)
-		for range 300 {
+		for range values {
 			wall.add(time.Millisecond)
 			mark.next(t, clock)
 		}
 		settle(clock)
 	}
-	step(false)
-	step(true)
+	// From the start's mark at +1,000: no extension, then a failed one from
+	// +501, then a successful one from +601.
+	step(false, 300)
+	step(true, 300)
 	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
 		t.Fatalf("%d warnings after a failed extension:\n%s", n, logs.String())
 	}
-	// No value passes the reservation, so only an extension can end the
-	// episode, and only a later extension can start the next.
-	step(false)
-	step(true)
+	// The successful extension's mark is one reservation past the wall
+	// clock when it ran, between +1,601 and +1,900, so 600 more values reach
+	// that mark's half and start a failing extension without passing it: no
+	// value passes a reservation, so only extensions end and start episodes.
+	step(false, 300)
+	step(true, 600)
 	if writes := mark.writeCount(); writes != 2 {
 		t.Fatalf("%d writes, want the start's and one extension's", writes)
 	}
