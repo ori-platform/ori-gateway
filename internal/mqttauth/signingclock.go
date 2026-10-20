@@ -134,9 +134,12 @@ type SigningClock struct {
 	// changed is closed and replaced whenever coverage, the episode or the
 	// outstanding write changes, waking every value waiting for coverage.
 	changed chan struct{}
-	// notes are log lines decided under mu and written once it is released,
-	// so a logger that blocks never holds up signing or Degraded.
-	notes []func()
+	// notes are log lines decided under mu, in that order; one drainer at a
+	// time writes them off every lock, so a logger that blocks holds up no
+	// caller and lines never pass one another.
+	notes    []func()
+	draining bool
+	dropped  int
 }
 
 // NewSigningClock returns an in-process clock over now: its values never
@@ -218,7 +221,7 @@ type valueWait struct {
 // and, for a durable clock, one after Close.
 func (c *SigningClock) Next() (int64, error) {
 	c.mu.Lock()
-	defer c.unlock()
+	defer c.mu.Unlock()
 	var wait *valueWait
 	defer func() {
 		if wait != nil {
@@ -249,7 +252,7 @@ func (c *SigningClock) Next() (int64, error) {
 					w := &valueWait{}
 					w.stop = c.after(MarkWriteBound, func() {
 						c.mu.Lock()
-						defer c.unlock()
+						defer c.mu.Unlock()
 						if !w.done {
 							c.openEpisodeLocked(errWriteOutstanding)
 						}
@@ -257,7 +260,7 @@ func (c *SigningClock) Next() (int64, error) {
 					wait = w
 				}
 				changed := c.changed
-				c.unlock()
+				c.mu.Unlock()
 				<-changed
 				c.mu.Lock()
 				continue
@@ -293,7 +296,7 @@ func (c *SigningClock) startWriteLocked(mark int64) {
 	c.writeStarted = time.Now()
 	stop := c.after(MarkWriteBound, func() {
 		c.mu.Lock()
-		defer c.unlock()
+		defer c.mu.Unlock()
 		if c.write == done {
 			c.openEpisodeLocked(errWriteOutstanding)
 		}
@@ -307,7 +310,7 @@ func (c *SigningClock) persist(mark int64, done chan struct{}, stopBound func() 
 	err := c.durable.Persist(mark)
 	stopBound()
 	c.mu.Lock()
-	defer c.unlock()
+	defer c.mu.Unlock()
 	c.write = nil
 	close(done)
 	if err != nil {
@@ -352,7 +355,7 @@ func (c *SigningClock) scheduleRetryLocked() {
 
 func (c *SigningClock) retryWrite() {
 	c.mu.Lock()
-	defer c.unlock()
+	defer c.mu.Unlock()
 	c.retry = nil
 	if c.closed || !c.episode || c.write != nil {
 		return
@@ -360,16 +363,42 @@ func (c *SigningClock) retryWrite() {
 	c.startWriteLocked(reservationFor(c.now().UnixMilli(), c.last))
 }
 
-// noteLocked queues a log line to be written once mu is released.
-func (c *SigningClock) noteLocked(note func()) { c.notes = append(c.notes, note) }
+// maxNotes bounds the log lines queued behind a logger that blocks; later
+// lines are counted and the count is logged once the queue drains.
+const maxNotes = 64
 
-// unlock releases mu, then writes the log lines queued under it.
-func (c *SigningClock) unlock() {
-	notes := c.notes
-	c.notes = nil
-	c.mu.Unlock()
-	for _, note := range notes {
-		note()
+// noteLocked queues a log line, in the order decided under mu, and starts the
+// drainer if none is running.
+func (c *SigningClock) noteLocked(note func()) {
+	if len(c.notes) >= maxNotes {
+		c.dropped++
+		return
+	}
+	c.notes = append(c.notes, note)
+	if !c.draining {
+		c.draining = true
+		go c.drain()
+	}
+}
+
+// drain writes the queued log lines in order until none is left.
+func (c *SigningClock) drain() {
+	for {
+		c.mu.Lock()
+		notes, dropped := c.notes, c.dropped
+		c.notes, c.dropped = nil, 0
+		if len(notes) == 0 && dropped == 0 {
+			c.draining = false
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
+		for _, note := range notes {
+			note()
+		}
+		if dropped > 0 {
+			c.log.Warn("signing clock log lines dropped behind a logger that blocked", "dropped", dropped)
+		}
 	}
 }
 

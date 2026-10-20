@@ -559,7 +559,7 @@ func TestASigningClockAheadOfTheWallIsReported(t *testing.T) {
 		t.Fatalf("resumed at %d, not above the mark found", at)
 	}
 	mark.next(t, clock)
-	if strings.Count(logs.String(), "ahead of the wall clock") != 1 {
+	if waitLogs(t, logs, "ahead of the wall clock", 1) != 1 {
 		t.Fatalf("want one warning for a clock running ahead:\n%s", logs.String())
 	}
 	// The wall clock catches up, then is stepped back again: a second
@@ -568,7 +568,7 @@ func TestASigningClockAheadOfTheWallIsReported(t *testing.T) {
 	mark.next(t, clock)
 	wall.add(-time.Hour)
 	mark.next(t, clock)
-	if strings.Count(logs.String(), "ahead of the wall clock") != 2 {
+	if waitLogs(t, logs, "ahead of the wall clock", 2) != 2 {
 		t.Fatalf("want a second warning for a second episode:\n%s", logs.String())
 	}
 }
@@ -622,7 +622,7 @@ func TestAClosedClockRefusesToSign(t *testing.T) {
 	if mark.mark() != stored {
 		t.Fatal("a closed clock wrote its mark")
 	}
-	if !strings.Contains(logs.String(), "signing clock is stopped") {
+	if waitLogs(t, logs, "signing clock is stopped", 1) != 1 {
 		t.Fatalf("the refusal was not logged:\n%s", logs.String())
 	}
 }
@@ -701,7 +701,11 @@ func TestTheAheadWarningIsAtThreeHundredThousandMilliseconds(t *testing.T) {
 		logs := &syncBuffer{}
 		clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 		at := mark.next(t, clock)
-		if got := strings.Contains(logs.String(), "ahead of the wall clock"); got != tc.warn {
+		want := 0
+		if tc.warn {
+			want = 1
+		}
+		if got := waitLogs(t, logs, "ahead of the wall clock", want) == 1; got != tc.warn {
 			t.Errorf("signed %d ms ahead: warned=%v, want %v", at-wall.now().UnixMilli(), got, tc.warn)
 		}
 	}
@@ -1350,16 +1354,17 @@ func (h *blockingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *blockingHandler) WithGroup(string) slog.Handler      { return h }
 
 // TestALoggerThatBlocksNeverHoldsUpSigning blocks the logger as an episode
-// opens: Degraded reports the episode and values are issued while the
-// warning is still being written, since no line is logged under the clock's
-// lock.
+// opens: Degraded reports the episode, values are issued, and a call whose
+// own line queues behind the blocked one (a closed clock's refusal) returns,
+// since no caller writes a log line itself.
 func TestALoggerThatBlocksNeverHoldsUpSigning(t *testing.T) {
 	useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
 	handler := &blockingHandler{entered: make(chan struct{}), release: make(chan struct{})}
-	t.Cleanup(func() { close(handler.release) })
 	clock := durableClock(t, wall, mark, slog.New(handler))
+	// Registered after the clock's Close, so it runs first.
+	t.Cleanup(func() { close(handler.release) })
 	mark.setFail(true)
 	wall.add(time.Hour)
 	go func() { _, _ = clock.Next() }()
@@ -1372,6 +1377,10 @@ func TestALoggerThatBlocksNeverHoldsUpSigning(t *testing.T) {
 				t.Error(err)
 			}
 		}
+		clock.Stop()
+		if _, err := clock.Next(); !errors.Is(err, ErrSigningClockClosed) {
+			t.Errorf("a stopped clock signed: %v", err)
+		}
 		done <- degraded
 	}()
 	select {
@@ -1380,6 +1389,118 @@ func TestALoggerThatBlocksNeverHoldsUpSigning(t *testing.T) {
 			t.Fatal("the episode being logged was not reported")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("a blocked logger held up Degraded or Next")
+		t.Fatal("a blocked logger held up Degraded, Next or a refusal")
+	}
+}
+
+// TestLogLinesKeepTheOrderTheyWereDecidedIn blocks the logger on the warning
+// of an episode opened by a write past its bound, then lets the write land and
+// close the episode: the warning is still written before the recovery line.
+func TestLogLinesKeepTheOrderTheyWereDecidedIn(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	handler := &orderHandler{release: make(chan struct{}), entered: make(chan struct{})}
+	clock := durableClock(t, wall, mark, slog.New(handler))
+	t.Cleanup(handler.unblock)
+	held, release := holdNext(t, mark)
+	wall.add(time.Hour)
+	got := make(chan int64, 1)
+	go func() { got <- mark.next(t, clock) }()
+	<-held
+	timers.fire(timers.live()[0])
+	<-got
+	<-handler.entered
+	release()
+	settle(clock)
+	// A covering retry is not needed: the late write covers the value issued.
+	recoverEpisode(t, timers, clock)
+	handler.unblock()
+	waitFor(t, "both lines", func() bool { return len(handler.lines()) >= 2 })
+	lines := handler.lines()
+	if !strings.Contains(lines[0], "could not be persisted") || !strings.Contains(lines[1], "persisted again") {
+		t.Fatalf("log lines out of order: %q", lines)
+	}
+}
+
+// orderHandler records messages in the order written, blocking the first
+// it is given until unblocked; the others are not held behind it.
+type orderHandler struct {
+	mu       sync.Mutex
+	messages []string
+	held     bool
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (h *orderHandler) unblock() { h.once.Do(func() { close(h.release) }) }
+
+func (h *orderHandler) lines() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.messages...)
+}
+
+func (h *orderHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *orderHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	first := !h.held
+	h.held = true
+	h.mu.Unlock()
+	if first {
+		close(h.entered)
+		<-h.release
+	}
+	h.mu.Lock()
+	h.messages = append(h.messages, r.Message)
+	h.mu.Unlock()
+	return nil
+}
+func (h *orderHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *orderHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestLogLinesBehindABlockedLoggerAreBounded queues more refusals than the
+// log queue holds while the logger blocks: once it unblocks, the queue's lines
+// are written and the rest are counted in one line, never held.
+func TestLogLinesBehindABlockedLoggerAreBounded(t *testing.T) {
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	handler := &orderHandler{release: make(chan struct{}), entered: make(chan struct{})}
+	clock := durableClock(t, wall, mark, slog.New(handler))
+	t.Cleanup(handler.unblock)
+	clock.Close()
+	// The drainer's first batch and a full queue hold at most two queues'
+	// worth, so a third is always dropped.
+	for range 3 * maxNotes {
+		if _, err := clock.Next(); !errors.Is(err, ErrSigningClockClosed) {
+			t.Fatalf("a closed clock signed: %v", err)
+		}
+	}
+	<-handler.entered
+	clock.mu.Lock()
+	queued := len(clock.notes)
+	clock.mu.Unlock()
+	if queued > maxNotes {
+		t.Fatalf("%d log lines queued behind a blocked logger, want at most %d", queued, maxNotes)
+	}
+	handler.unblock()
+	waitFor(t, "the dropped count", func() bool {
+		for _, line := range handler.lines() {
+			if strings.Contains(line, "dropped") {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "the drainer to finish", func() bool {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return !clock.draining
+	})
+	// The drainer holds one batch, with its count, while it writes, and the
+	// queue refills behind it to its bound.
+	if n := len(handler.lines()); n > 2*(maxNotes+1) {
+		t.Fatalf("%d lines written, want at most two queues, each with a count", n)
 	}
 }
