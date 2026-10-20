@@ -134,6 +134,9 @@ type SigningClock struct {
 	// changed is closed and replaced whenever coverage, the episode or the
 	// outstanding write changes, waking every value waiting for coverage.
 	changed chan struct{}
+	// notes are log lines decided under mu and written once it is released,
+	// so a logger that blocks never holds up signing or Degraded.
+	notes []func()
 }
 
 // NewSigningClock returns an in-process clock over now: its values never
@@ -215,7 +218,7 @@ type valueWait struct {
 // and, for a durable clock, one after Close.
 func (c *SigningClock) Next() (int64, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	var wait *valueWait
 	defer func() {
 		if wait != nil {
@@ -234,7 +237,7 @@ func (c *SigningClock) Next() (int64, error) {
 			case c.closed:
 				// Once the stop is decided no value is issued and no write
 				// starts, so the state directory can reach quiescence.
-				c.log.Info("signing clock is stopped; refusing to sign")
+				c.noteLocked(func() { c.log.Info("signing clock is stopped; refusing to sign") })
 				return 0, ErrSigningClockClosed
 			case at > c.covered && !c.episode:
 				// Past the coverage: wait for a write to cover it, for no
@@ -246,7 +249,7 @@ func (c *SigningClock) Next() (int64, error) {
 					w := &valueWait{}
 					w.stop = c.after(MarkWriteBound, func() {
 						c.mu.Lock()
-						defer c.mu.Unlock()
+						defer c.unlock()
 						if !w.done {
 							c.openEpisodeLocked(errWriteOutstanding)
 						}
@@ -254,7 +257,7 @@ func (c *SigningClock) Next() (int64, error) {
 					wait = w
 				}
 				changed := c.changed
-				c.mu.Unlock()
+				c.unlock()
 				<-changed
 				c.mu.Lock()
 				continue
@@ -267,8 +270,10 @@ func (c *SigningClock) Next() (int64, error) {
 		}
 		switch ahead := at-wall > signingAheadWarning; {
 		case ahead && !c.ahead:
-			c.log.Warn("signing clock is ahead of the wall clock by more than receivers' default skew; they refuse what is signed until the wall clock catches up",
-				"signed_at_ms", at, "wall_ms", wall)
+			c.noteLocked(func() {
+				c.log.Warn("signing clock is ahead of the wall clock by more than receivers' default skew; they refuse what is signed until the wall clock catches up",
+					"signed_at_ms", at, "wall_ms", wall)
+			})
 			c.ahead = true
 		case !ahead:
 			c.ahead = false
@@ -288,7 +293,7 @@ func (c *SigningClock) startWriteLocked(mark int64) {
 	c.writeStarted = time.Now()
 	stop := c.after(MarkWriteBound, func() {
 		c.mu.Lock()
-		defer c.mu.Unlock()
+		defer c.unlock()
 		if c.write == done {
 			c.openEpisodeLocked(errWriteOutstanding)
 		}
@@ -302,7 +307,7 @@ func (c *SigningClock) persist(mark int64, done chan struct{}, stopBound func() 
 	err := c.durable.Persist(mark)
 	stopBound()
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	c.write = nil
 	close(done)
 	if err != nil {
@@ -313,7 +318,7 @@ func (c *SigningClock) persist(mark int64, done chan struct{}, stopBound func() 
 		// between the comparison and the episode's end.
 		if c.episode && c.covered >= c.last {
 			c.episode = false
-			c.log.Info("signing clock mark persisted again; every value issued is covered")
+			c.noteLocked(func() { c.log.Info("signing clock mark persisted again; every value issued is covered") })
 		}
 	}
 	if c.episode {
@@ -328,7 +333,9 @@ func (c *SigningClock) openEpisodeLocked(cause error) {
 		return
 	}
 	c.episode = true
-	c.log.Warn("signing clock mark could not be persisted; signing goes on uncovered until a write completes", "error", cause)
+	c.noteLocked(func() {
+		c.log.Warn("signing clock mark could not be persisted; signing goes on uncovered until a write completes", "error", cause)
+	})
 	c.scheduleRetryLocked()
 	c.broadcastLocked()
 }
@@ -345,12 +352,25 @@ func (c *SigningClock) scheduleRetryLocked() {
 
 func (c *SigningClock) retryWrite() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	c.retry = nil
 	if c.closed || !c.episode || c.write != nil {
 		return
 	}
 	c.startWriteLocked(reservationFor(c.now().UnixMilli(), c.last))
+}
+
+// noteLocked queues a log line to be written once mu is released.
+func (c *SigningClock) noteLocked(note func()) { c.notes = append(c.notes, note) }
+
+// unlock releases mu, then writes the log lines queued under it.
+func (c *SigningClock) unlock() {
+	notes := c.notes
+	c.notes = nil
+	c.mu.Unlock()
+	for _, note := range notes {
+		note()
+	}
 }
 
 func (c *SigningClock) broadcastLocked() {

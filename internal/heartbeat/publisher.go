@@ -213,7 +213,6 @@ func (p *Publisher) recordFailure(failures *int, err error) bool {
 
 func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 	now := p.now()
-	status := p.status(ctx)
 	// Rounded to milliseconds so the emitted value is either exactly 0 or at least
 	// 0.001. Go and CPython choose different notation for a non-zero magnitude below
 	// 1e-4 -- Go writes 0.000035 where CPython writes 3.5e-05 -- and the runtime
@@ -227,6 +226,9 @@ func (p *Publisher) buildPayload(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("heartbeat: timestamp: %w", err)
 	}
+	// Read after the timestamp is issued: an episode that issuing it opened
+	// is reported by this heartbeat, not the next.
+	status := p.status(ctx)
 
 	beat := contracts.Heartbeat{
 		Status:        status,

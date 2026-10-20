@@ -782,3 +782,59 @@ func TestAStalledMarkWriteDegradesTheHeartbeatWithoutStoppingIt(t *testing.T) {
 		t.Fatalf("the heartbeat reports %q during an episode, want degraded", last.Status)
 	}
 }
+
+// TestTheHeartbeatThatOpensAnEpisodeReportsIt jumps the wall clock past the
+// signing reservation while every write after the start's hangs: the first
+// heartbeat signed after the jump waits for the write bound, opens the
+// episode, and already reports degraded, as does every heartbeat after it.
+func TestTheHeartbeatThatOpensAnEpisodeReportsIt(t *testing.T) {
+	mark := &stalledMark{hung: make(chan struct{})}
+	t.Cleanup(func() { close(mark.hung) })
+	var offset atomic.Int64
+	now := func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	clock, err := mqttauth.NewDurableSigningClock(now, mark, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beats := make(chan contracts.Heartbeat, 64)
+	publish := func(_ context.Context, payload []byte) error {
+		var beat contracts.Heartbeat
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			return err
+		}
+		beats <- beat
+		return nil
+	}
+	publisher, err := NewPublisher(publish, stubProvider{name: "llama_cpp", healthy: true}, SIMStatus{}, Options{
+		Interval: 200 * time.Millisecond, Now: now,
+		Logger: slog.New(slog.DiscardHandler), Fatal: func(int) {}, SigningClock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(t.Context()) }()
+	next := func() contracts.Heartbeat {
+		t.Helper()
+		select {
+		case beat := <-beats:
+			return beat
+		case <-time.After(5 * time.Second):
+			t.Fatal("no heartbeat")
+			return contracts.Heartbeat{}
+		}
+	}
+	next()
+	offset.Store(int64(time.Minute))
+	jumped := now().UnixMilli()
+	// Drop any heartbeat already signed before the jump.
+	beat := next()
+	for beat.TimestampMS < jumped {
+		beat = next()
+	}
+	for i := range 3 {
+		if beat.Status != StatusDegraded {
+			t.Fatalf("heartbeat %d after the jump, signed at %d during an episode, reports %q", i, beat.TimestampMS, beat.Status)
+		}
+		beat = next()
+	}
+}

@@ -5,6 +5,7 @@ package mqttauth
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
@@ -253,6 +254,14 @@ func (ft *fakeTimers) live() []*fakeTimer {
 	return append([]*fakeTimer(nil), live...)
 }
 
+// everyTimer is every timer armed, fired, stopped or not, since the last
+// call to live.
+func (ft *fakeTimers) everyTimer() []*fakeTimer {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return append([]*fakeTimer(nil), ft.pending...)
+}
+
 // fire expires timer, unless it was stopped.
 func (ft *fakeTimers) fire(timer *fakeTimer) {
 	ft.mu.Lock()
@@ -292,7 +301,7 @@ func TestSignersNeverRepeatASignedAt(t *testing.T) {
 	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
-	logs := &bytes.Buffer{}
+	logs := &syncBuffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 	for range 5 {
 		mark.next(t, clock)
@@ -303,7 +312,7 @@ func TestSignersNeverRepeatASignedAt(t *testing.T) {
 		wall.add(2 * time.Second)
 		during = mark.next(t, clock)
 	}
-	if strings.Count(logs.String(), "could not be persisted") != 1 {
+	if n := waitLogs(t, logs, "could not be persisted", 1); n != 1 {
 		t.Fatalf("want one warning while persistence fails:\n%s", logs.String())
 	}
 	mark.setFail(false)
@@ -544,7 +553,7 @@ func TestASigningClockAheadOfTheWallIsReported(t *testing.T) {
 	mark := newMemMark(t, wall)
 	ahead := wall.now().Add(time.Hour).UnixMilli()
 	mark.found, mark.has = ahead, true
-	logs := &bytes.Buffer{}
+	logs := &syncBuffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 	if at := mark.next(t, clock); at <= ahead {
 		t.Fatalf("resumed at %d, not above the mark found", at)
@@ -602,7 +611,7 @@ func TestTheValueOnePastAReservationIsPersisted(t *testing.T) {
 func TestAClosedClockRefusesToSign(t *testing.T) {
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
-	logs := &bytes.Buffer{}
+	logs := &syncBuffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 	clock.Close()
 	stored := mark.mark()
@@ -652,7 +661,7 @@ func TestEachFailureEpisodeIsWarnedAboutAgain(t *testing.T) {
 	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
-	logs := &bytes.Buffer{}
+	logs := &syncBuffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 	episode := func() {
 		mark.setFail(true)
@@ -666,14 +675,14 @@ func TestEachFailureEpisodeIsWarnedAboutAgain(t *testing.T) {
 		recoverEpisode(t, timers, clock)
 	}
 	episode()
-	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
+	if n := waitLogs(t, logs, "could not be persisted", 1); n != 1 {
 		t.Fatalf("%d warnings for one episode:\n%s", n, logs.String())
 	}
 	if !strings.Contains(logs.String(), "disk full") {
 		t.Fatalf("the warning does not carry its cause:\n%s", logs.String())
 	}
 	episode()
-	if n := strings.Count(logs.String(), "could not be persisted"); n != 2 {
+	if n := waitLogs(t, logs, "could not be persisted", 2); n != 2 {
 		t.Fatalf("%d warnings for two episodes:\n%s", n, logs.String())
 	}
 }
@@ -689,7 +698,7 @@ func TestTheAheadWarningIsAtThreeHundredThousandMilliseconds(t *testing.T) {
 		wall := newTestWall()
 		mark := newMemMark(t, wall)
 		mark.found, mark.has = wall.now().UnixMilli()+tc.lead, true
-		logs := &bytes.Buffer{}
+		logs := &syncBuffer{}
 		clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 		at := mark.next(t, clock)
 		if got := strings.Contains(logs.String(), "ahead of the wall clock"); got != tc.warn {
@@ -760,7 +769,7 @@ func TestAnExtensionThatFailsOpensAnEpisode(t *testing.T) {
 	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
-	logs := &bytes.Buffer{}
+	logs := &syncBuffer{}
 	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
 	// Each step moves the wall clock a millisecond per value, so a step past
 	// a reservation's half starts an extension.
@@ -777,13 +786,13 @@ func TestAnExtensionThatFailsOpensAnEpisode(t *testing.T) {
 	if !clock.Degraded() {
 		t.Fatal("a failed extension opened no episode")
 	}
-	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
+	if n := waitLogs(t, logs, "could not be persisted", 1); n != 1 {
 		t.Fatalf("%d warnings after a failed extension:\n%s", n, logs.String())
 	}
 	mark.setFail(false)
 	recoverEpisode(t, timers, clock)
 	step(true, 600)
-	if n := strings.Count(logs.String(), "could not be persisted"); n != 2 {
+	if n := waitLogs(t, logs, "could not be persisted", 2); n != 2 {
 		t.Fatalf("%d warnings, want a second after the first episode closed:\n%s", n, logs.String())
 	}
 }
@@ -859,7 +868,7 @@ func TestAStalledWriteOpensAnEpisodeAtTheWriteBound(t *testing.T) {
 	if waited < MarkWriteBound-50*time.Millisecond || waited > MarkWriteBound+2*time.Second {
 		t.Fatalf("a value past the coverage waited %v for a stalled write, want the write bound %v", waited, MarkWriteBound)
 	}
-	if !clock.Degraded() || !strings.Contains(logs.String(), "could not be persisted") {
+	if !clock.Degraded() || waitLogs(t, logs, "could not be persisted", 1) != 1 {
 		t.Fatalf("no episode opened at the write bound (degraded=%v):\n%s", clock.Degraded(), logs.String())
 	}
 	began = time.Now()
@@ -886,9 +895,22 @@ func TestAStalledWriteOpensAnEpisodeAtTheWriteBound(t *testing.T) {
 	if n := mark.attemptCount(); n < 3 {
 		t.Fatalf("the episode closed after %d writes, want the start's, the late one and a retry", n)
 	}
-	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
+	if n := waitLogs(t, logs, "could not be persisted", 1); n != 1 {
 		t.Fatalf("%d warnings for one episode:\n%s", n, logs.String())
 	}
+}
+
+// waitLogs waits until logs holds want lines containing substr, which the
+// clock writes once its lock is released, possibly from its writer, then
+// returns how many it holds after a short settle.
+func waitLogs(t *testing.T, logs *syncBuffer, substr string, want int) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for strings.Count(logs.String(), substr) < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	return strings.Count(logs.String(), substr)
 }
 
 // syncBuffer is a log buffer safe to write from timers.
@@ -1076,7 +1098,7 @@ func TestALateFailureThenRecovery(t *testing.T) {
 	}
 	mark.setFail(false)
 	recoverEpisode(t, timers, clock)
-	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
+	if n := waitLogs(t, logs, "could not be persisted", 1); n != 1 {
 		t.Fatalf("%d warnings for one episode:\n%s", n, logs.String())
 	}
 }
@@ -1237,4 +1259,127 @@ func TestAnEpisodeOpenedBetweenWritesArmsARetry(t *testing.T) {
 		t.Fatal("an episode opened between writes armed no retry")
 	}
 	recoverEpisode(t, timers, clock)
+}
+
+// TestAStopDuringAnEpisodeStartsNoWrite fails writes until an episode opens
+// with its retry armed, then stops the clock: Stop reports no write
+// outstanding, and no expiring timer starts a write after it.
+func TestAStopDuringAnEpisodeStartsNoWrite(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	mark.setFail(true)
+	wall.add(time.Hour)
+	mark.next(t, clock)
+	settle(clock)
+	clock.mu.Lock()
+	armed := clock.retry != nil
+	clock.mu.Unlock()
+	if !clock.Degraded() || !armed {
+		t.Fatalf("degraded=%v, retry armed=%v; want an episode with its retry armed", clock.Degraded(), armed)
+	}
+	select {
+	case <-clock.Stop():
+	default:
+		t.Fatal("Stop reported a write outstanding with none")
+	}
+	attempts := mark.attemptCount()
+	for _, timer := range timers.everyTimer() {
+		// Expire every timer, stopped or not, as a timer whose stop lost the
+		// race with its expiry would.
+		timer.f()
+	}
+	settle(clock)
+	if mark.attemptCount() != attempts {
+		t.Fatal("a write started after Stop reported none outstanding")
+	}
+}
+
+// TestAWriteFailingAfterStopArmsNoRetry stops the clock while a write is
+// held, then fails that write: no retry is armed, and no write follows.
+func TestAWriteFailingAfterStopArmsNoRetry(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	held, release := holdNext(t, mark)
+	wall.add(time.Hour)
+	got := make(chan int64, 1)
+	go func() { got <- mark.next(t, clock) }()
+	<-held
+	timers.fireAll()
+	<-got
+	idle := clock.Stop()
+	mark.mu.Lock()
+	mark.failHeld = true
+	mark.mu.Unlock()
+	release()
+	<-idle
+	attempts := mark.attemptCount()
+	clock.mu.Lock()
+	armed := clock.retry != nil
+	clock.mu.Unlock()
+	if armed {
+		t.Fatal("a write failing after Stop armed a retry")
+	}
+	for _, timer := range timers.everyTimer() {
+		timer.f()
+	}
+	settle(clock)
+	if mark.attemptCount() != attempts {
+		t.Fatal("a write started after Stop")
+	}
+}
+
+// blockingHandler holds every log record until released, as a full pipe or a
+// stalled journal would.
+type blockingHandler struct {
+	entered chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (h *blockingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *blockingHandler) Handle(context.Context, slog.Record) error {
+	h.once.Do(func() { close(h.entered) })
+	<-h.release
+	return nil
+}
+func (h *blockingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *blockingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestALoggerThatBlocksNeverHoldsUpSigning blocks the logger as an episode
+// opens: Degraded reports the episode and values are issued while the
+// warning is still being written, since no line is logged under the clock's
+// lock.
+func TestALoggerThatBlocksNeverHoldsUpSigning(t *testing.T) {
+	useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	handler := &blockingHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(handler.release) })
+	clock := durableClock(t, wall, mark, slog.New(handler))
+	mark.setFail(true)
+	wall.add(time.Hour)
+	go func() { _, _ = clock.Next() }()
+	<-handler.entered
+	done := make(chan bool, 1)
+	go func() {
+		degraded := clock.Degraded()
+		for range 10 {
+			if _, err := clock.Next(); err != nil {
+				t.Error(err)
+			}
+		}
+		done <- degraded
+	}()
+	select {
+	case degraded := <-done:
+		if !degraded {
+			t.Fatal("the episode being logged was not reported")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a blocked logger held up Degraded or Next")
+	}
 }

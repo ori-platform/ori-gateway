@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -144,7 +145,12 @@ func TestAStoppingGatewayWithAStalledWriteEndsTheProcessHoldingTheLock(t *testin
 		t.Fatal("a second owner acquired the state directory while a write was outstanding")
 	}
 	close(g.mark.release)
-	time.Sleep(50 * time.Millisecond)
+	// Nothing left references the hold but the gateway's own registry: a
+	// collection must not finalise its file and so release the lock.
+	for range 3 {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
 	if owner, err := gatewaystate.Acquire(dir); err == nil {
 		_ = owner.Close()
 		t.Fatal("the state directory was released in the process that ended without quiescence")
