@@ -36,20 +36,30 @@ func (w *testWall) add(d time.Duration) {
 
 // memMark is a durable mark in memory. Every mark it writes is held to
 // gateway-config/v2 gateway.state_directory rule 9 against the values the
-// test has seen issued: at least each of them, and at most the latest of the
-// wall clock plus 1,000 ms, the mark found, and the value being issued, which
-// rule 8 puts at most one past the last value issued or the mark found.
+// test has seen issued: at most the latest of the wall clock plus 1,000 ms,
+// the mark found, the value being issued, which rule 8 puts at most one past
+// the last value issued or the mark found, and the highest mark written
+// before; never below a mark written before; and, unless its clock is in an
+// episode, at least every value issued.
 type memMark struct {
 	t    *testing.T
 	wall *testWall
+	// clock, once set, is asked whether an episode is open when a write lands.
+	clock *SigningClock
 
 	mu        sync.Mutex
 	found     int64
 	has       bool
 	persisted int64
+	attempted int64
 	writes    int
+	attempts  int
 	fail      bool
-	block     chan struct{}
+	// failHeld fails the write held once, which fail exempts.
+	failHeld bool
+	// delay slows every write.
+	delay time.Duration
+	block chan struct{}
 	// blockOnce holds the next write only; held is closed once it is held.
 	blockOnce chan struct{}
 	held      chan struct{}
@@ -57,7 +67,7 @@ type memMark struct {
 }
 
 func newMemMark(t *testing.T, wall *testWall) *memMark {
-	return &memMark{t: t, wall: wall, persisted: -1}
+	return &memMark{t: t, wall: wall, persisted: -1, attempted: -1}
 }
 
 // restarted is the mark a restart finds: the last one written.
@@ -79,7 +89,9 @@ func (m *memMark) Persist(mark int64) error {
 	block := m.block
 	once, held := m.blockOnce, m.held
 	m.blockOnce, m.held = nil, nil
+	delay := m.delay
 	m.mu.Unlock()
+	time.Sleep(delay)
 	if held != nil {
 		close(held)
 	}
@@ -95,22 +107,33 @@ func (m *memMark) Persist(mark int64) error {
 	if mark >= SigningCeiling {
 		m.t.Errorf("persisted %d at or above the ceiling", mark)
 	}
-	if m.fail && once == nil {
-		return errors.New("disk full")
-	}
-	if mark <= m.persisted {
-		return nil
+	if mark < m.attempted {
+		m.t.Errorf("wrote %d below %d, a mark written before", mark, m.attempted)
 	}
 	wall := m.wall.now().UnixMilli()
-	upper := max(wall+signingReservation, m.issued+1)
+	upper := max(wall+signingReservation, m.issued+1, m.attempted)
 	if m.has {
 		upper = max(upper, m.found+1)
 	}
 	if mark > upper {
 		m.t.Errorf("persisted %d above rule 9's bound %d (wall %d, last issued %d)", mark, upper, wall, m.issued)
 	}
-	if mark < m.issued {
-		m.t.Errorf("persisted %d below the issued value %d", mark, m.issued)
+	m.attempted = max(m.attempted, mark)
+	m.attempts++
+	if once != nil && m.failHeld {
+		m.failHeld = false
+		return errors.New("disk full")
+	}
+	if m.fail && once == nil {
+		return errors.New("disk full")
+	}
+	if mark <= m.persisted {
+		return nil
+	}
+	// The issued value is read before the episode: no episode closes while
+	// this write is outstanding, so one closed now was closed throughout.
+	if issued := m.issued; mark < issued && (m.clock == nil || !m.clock.Degraded()) {
+		m.t.Errorf("persisted %d below the issued value %d outside an episode", mark, issued)
 	}
 	m.persisted = mark
 	m.writes++
@@ -127,6 +150,18 @@ func (m *memMark) mark() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.persisted
+}
+
+func (m *memMark) attemptCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attempts
+}
+
+func (m *memMark) highestAttempt() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attempted
 }
 
 func (m *memMark) writeCount() int {
@@ -160,15 +195,101 @@ func durableClock(t *testing.T, wall *testWall, mark *memMark, log *slog.Logger)
 	if err != nil {
 		t.Fatalf("NewDurableSigningClock: %v", err)
 	}
+	mark.mu.Lock()
+	mark.clock = clock
+	mark.mu.Unlock()
 	t.Cleanup(clock.Close)
 	return clock
 }
 
+// fakeTimers stands in for the clock's timers: none expires until the test
+// fires it.
+type fakeTimers struct {
+	mu      sync.Mutex
+	pending []*fakeTimer
+}
+
+type fakeTimer struct {
+	d       time.Duration
+	f       func()
+	stopped bool
+}
+
+// useFakeTimers gives every clock built from now on timers the test fires.
+func useFakeTimers(t *testing.T) *fakeTimers {
+	t.Helper()
+	timers := &fakeTimers{}
+	prev := afterFunc
+	afterFunc = timers.after
+	t.Cleanup(func() { afterFunc = prev })
+	return timers
+}
+
+func (ft *fakeTimers) after(d time.Duration, f func()) func() bool {
+	timer := &fakeTimer{d: d, f: f}
+	ft.mu.Lock()
+	ft.pending = append(ft.pending, timer)
+	ft.mu.Unlock()
+	return func() bool {
+		ft.mu.Lock()
+		defer ft.mu.Unlock()
+		was := !timer.stopped
+		timer.stopped = true
+		return was
+	}
+}
+
+// live is every timer neither fired nor stopped, oldest first.
+func (ft *fakeTimers) live() []*fakeTimer {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	var live []*fakeTimer
+	for _, timer := range ft.pending {
+		if !timer.stopped {
+			live = append(live, timer)
+		}
+	}
+	ft.pending = live
+	return append([]*fakeTimer(nil), live...)
+}
+
+// fire expires timer, unless it was stopped.
+func (ft *fakeTimers) fire(timer *fakeTimer) {
+	ft.mu.Lock()
+	if timer.stopped {
+		ft.mu.Unlock()
+		return
+	}
+	timer.stopped = true
+	ft.mu.Unlock()
+	timer.f()
+}
+
+// fireAll expires every live timer.
+func (ft *fakeTimers) fireAll() {
+	for _, timer := range ft.live() {
+		ft.fire(timer)
+	}
+}
+
+// recoverEpisode fires timers and settles writes until the clock's episode closes.
+func recoverEpisode(t *testing.T, timers *fakeTimers, clock *SigningClock) {
+	t.Helper()
+	for range 10 {
+		settle(clock)
+		if !clock.Degraded() {
+			return
+		}
+		timers.fireAll()
+	}
+	t.Fatal("the episode never closed")
+}
+
 // TestSignersNeverRepeatASignedAt issues signing times while the mark cannot
-// be written: signing goes on without repeating, one warning is logged, the
-// write is retried for every value past the reservation, and the first that
-// succeeds covers every value issued.
+// be written: signing goes on without repeating, one warning is logged, and
+// once the disk recovers the paced retry covers every value issued.
 func TestSignersNeverRepeatASignedAt(t *testing.T) {
+	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
 	logs := &bytes.Buffer{}
@@ -188,6 +309,7 @@ func TestSignersNeverRepeatASignedAt(t *testing.T) {
 	mark.setFail(false)
 	wall.add(2 * time.Second)
 	after := mark.next(t, clock)
+	recoverEpisode(t, timers, clock)
 	if mark.mark() < after || after <= during {
 		t.Fatalf("mark %d after issuing %d, then %d; the mark fell behind", mark.mark(), during, after)
 	}
@@ -338,7 +460,7 @@ func TestAWriteNeverLandsBelowAValueAlreadyIssued(t *testing.T) {
 		mark.next(t, clock)
 	}
 	clock.mu.Lock()
-	extending := clock.extension != nil
+	extending := clock.write != nil
 	clock.mu.Unlock()
 	if !extending {
 		t.Fatal("no extension started")
@@ -364,6 +486,7 @@ func TestAWriteNeverLandsBelowAValueAlreadyIssued(t *testing.T) {
 // jumps and steps back of the wall clock, write failures and restarts: every
 // mark written is held to rule 9 by memMark, and no value repeats.
 func TestEveryMarkStaysWithinItsBounds(t *testing.T) {
+	timers := useFakeTimers(t)
 	rng := rand.New(rand.NewPCG(1, 2))
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
@@ -381,8 +504,12 @@ func TestEveryMarkStaysWithinItsBounds(t *testing.T) {
 			// let an extension in flight land before the wall steps back.
 			settle(clock)
 			wall.add(-time.Duration(rng.IntN(600)) * time.Second)
-		case r < 97:
+		case r < 95:
 			mark.setFail(rng.IntN(2) == 0)
+		case r < 97:
+			// A paced retry, or a timer that opens an episode, expires.
+			settle(clock)
+			timers.fireAll()
 		default:
 			// End any failure episode with a write that covers every value
 			// issued, then restart. A restart inside an episode may repeat
@@ -390,6 +517,7 @@ func TestEveryMarkStaysWithinItsBounds(t *testing.T) {
 			mark.setFail(false)
 			wall.add(2 * time.Second)
 			mark.next(t, clock)
+			recoverEpisode(t, timers, clock)
 			clock.Close()
 			mark = mark.restarted()
 			clock = durableClock(t, wall, mark, nil)
@@ -398,10 +526,10 @@ func TestEveryMarkStaysWithinItsBounds(t *testing.T) {
 	}
 }
 
-// settle waits for an extension in flight, if any.
+// settle waits for the outstanding write, if any.
 func settle(clock *SigningClock) {
 	clock.mu.Lock()
-	done := clock.extension
+	done := clock.write
 	clock.mu.Unlock()
 	if done != nil {
 		<-done
@@ -470,7 +598,7 @@ func TestTheValueOnePastAReservationIsPersisted(t *testing.T) {
 
 // TestAClosedClockRefusesToSign closes the clock and then asks for a value
 // past its reservation: it is refused, nothing reaches the mark, and the
-// misuse is logged.
+// refusal is logged.
 func TestAClosedClockRefusesToSign(t *testing.T) {
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
@@ -485,24 +613,34 @@ func TestAClosedClockRefusesToSign(t *testing.T) {
 	if mark.mark() != stored {
 		t.Fatal("a closed clock wrote its mark")
 	}
-	if !strings.Contains(logs.String(), "used after it was closed") {
-		t.Fatalf("the misuse was not logged:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "signing clock is stopped") {
+		t.Fatalf("the refusal was not logged:\n%s", logs.String())
 	}
 }
 
-// TestAFailedWriteIsRetriedByTheNextValue fails one write past the
-// reservation and then lets writes succeed: the very next value, within what
-// the failed write would have reserved, retries the write, so no value goes
-// uncovered once the disk recovers.
-func TestAFailedWriteIsRetriedByTheNextValue(t *testing.T) {
+// TestAFailedWriteIsRetriedOnItsPace fails one write past the reservation:
+// the value is issued at once, no later value retries the write, and the
+// write is retried once its paced timer expires, which covers every value.
+func TestAFailedWriteIsRetriedOnItsPace(t *testing.T) {
+	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
 	clock := durableClock(t, wall, mark, nil)
 	wall.add(2 * time.Second)
 	mark.setFail(true)
 	uncovered := mark.next(t, clock)
+	settle(clock)
 	mark.setFail(false)
-	next := mark.next(t, clock)
+	writes := mark.writeCount()
+	var next int64
+	for range 100 {
+		next = mark.next(t, clock)
+	}
+	settle(clock)
+	if mark.writeCount() != writes {
+		t.Fatalf("%d writes while an episode was open with its retry pending, want none per message", mark.writeCount()-writes)
+	}
+	recoverEpisode(t, timers, clock)
 	if got := mark.mark(); got < next || got < uncovered {
 		t.Fatalf("mark %d after issuing %d then %d; the failed write was not retried", got, uncovered, next)
 	}
@@ -511,6 +649,7 @@ func TestAFailedWriteIsRetriedByTheNextValue(t *testing.T) {
 // TestEachFailureEpisodeIsWarnedAboutAgain fails writes, lets one succeed,
 // then fails them again: each episode is warned about once, with its cause.
 func TestEachFailureEpisodeIsWarnedAboutAgain(t *testing.T) {
+	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
 	logs := &bytes.Buffer{}
@@ -524,6 +663,7 @@ func TestEachFailureEpisodeIsWarnedAboutAgain(t *testing.T) {
 		mark.setFail(false)
 		wall.add(2 * time.Second)
 		mark.next(t, clock)
+		recoverEpisode(t, timers, clock)
 	}
 	episode()
 	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
@@ -612,10 +752,12 @@ func TestAJumpPastTheReservationReservesAhead(t *testing.T) {
 	}
 }
 
-// TestAnExtensionThatSucceedsEndsAFailureEpisode fails an extension, lets the
-// next one succeed, then fails another: each failing episode is warned about,
-// so a success off the signing path ends an episode as one on it does.
-func TestAnExtensionThatSucceedsEndsAFailureEpisode(t *testing.T) {
+// TestAnExtensionThatFailsOpensAnEpisode fails an extension off the signing
+// path: an episode opens and is warned about, though every value issued is
+// still covered; the retry that succeeds ends it, and a second failing
+// extension is warned about again.
+func TestAnExtensionThatFailsOpensAnEpisode(t *testing.T) {
+	timers := useFakeTimers(t)
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
 	logs := &bytes.Buffer{}
@@ -630,24 +772,19 @@ func TestAnExtensionThatSucceedsEndsAFailureEpisode(t *testing.T) {
 		}
 		settle(clock)
 	}
-	// From the start's mark at +1,000: no extension, then a failed one from
-	// +501, then a successful one from +601.
 	step(false, 300)
 	step(true, 300)
+	if !clock.Degraded() {
+		t.Fatal("a failed extension opened no episode")
+	}
 	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
 		t.Fatalf("%d warnings after a failed extension:\n%s", n, logs.String())
 	}
-	// The successful extension's mark is one reservation past the wall
-	// clock when it ran, between +1,601 and +1,900, so 600 more values reach
-	// that mark's half and start a failing extension without passing it: no
-	// value passes a reservation, so only extensions end and start episodes.
-	step(false, 300)
+	mark.setFail(false)
+	recoverEpisode(t, timers, clock)
 	step(true, 600)
-	if writes := mark.writeCount(); writes != 2 {
-		t.Fatalf("%d writes, want the start's and one extension's", writes)
-	}
 	if n := strings.Count(logs.String(), "could not be persisted"); n != 2 {
-		t.Fatalf("%d warnings, want a second after an extension succeeded:\n%s", n, logs.String())
+		t.Fatalf("%d warnings, want a second after the first episode closed:\n%s", n, logs.String())
 	}
 }
 
@@ -672,7 +809,7 @@ func TestARollbackUsesUpTheCoverageAlreadyPersistedFirst(t *testing.T) {
 			t.Fatalf("issued %d, want %d", at, want)
 		}
 		clock.mu.Lock()
-		extending := clock.extension != nil
+		extending := clock.write != nil
 		clock.mu.Unlock()
 		if extending {
 			t.Fatalf("an extension started at %d while the persisted mark still covered it", want)
@@ -687,4 +824,417 @@ func TestARollbackUsesUpTheCoverageAlreadyPersistedFirst(t *testing.T) {
 			t.Fatalf("issued %d under mark %d after %d writes; want each value persisted before it is issued", at, mark.mark(), mark.writeCount())
 		}
 	}
+}
+
+// holdNext holds the mark's next write until the returned release is called,
+// and returns a channel closed once that write is held.
+func holdNext(t *testing.T, mark *memMark) (held <-chan struct{}, release func()) {
+	t.Helper()
+	gate, entered := make(chan struct{}), make(chan struct{})
+	mark.mu.Lock()
+	mark.blockOnce, mark.held = gate, entered
+	mark.mu.Unlock()
+	release = sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return entered, release
+}
+
+// TestAStalledWriteOpensAnEpisodeAtTheWriteBound holds a write past the
+// reservation on the real monotonic clock: the value waiting for it is issued
+// once the write bound has passed, not before, an episode is open and warned
+// about, and the next values wait on nothing although the write is still
+// held. The write that lands late covers only its own mark, so the episode
+// stays open until the paced retry covers every value issued.
+func TestAStalledWriteOpensAnEpisodeAtTheWriteBound(t *testing.T) {
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	logs := &syncBuffer{}
+	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
+	held, release := holdNext(t, mark)
+	wall.add(time.Hour)
+	began := time.Now()
+	first := mark.next(t, clock)
+	waited := time.Since(began)
+	<-held
+	if waited < MarkWriteBound-50*time.Millisecond || waited > MarkWriteBound+2*time.Second {
+		t.Fatalf("a value past the coverage waited %v for a stalled write, want the write bound %v", waited, MarkWriteBound)
+	}
+	if !clock.Degraded() || !strings.Contains(logs.String(), "could not be persisted") {
+		t.Fatalf("no episode opened at the write bound (degraded=%v):\n%s", clock.Degraded(), logs.String())
+	}
+	began = time.Now()
+	// Past the held write's mark, one reservation past the wall clock.
+	var last int64
+	for range 1500 {
+		wall.add(time.Millisecond)
+		last = mark.next(t, clock)
+	}
+	if waited := time.Since(began); waited > 500*time.Millisecond {
+		t.Fatalf("values waited %v during an episode", waited)
+	}
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for clock.Degraded() {
+		if time.Now().After(deadline) {
+			t.Fatal("the paced retry never closed the episode")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mark.mark(); got < last || got < first {
+		t.Fatalf("the episode closed under mark %d, below the last value %d", got, last)
+	}
+	if n := mark.attemptCount(); n < 3 {
+		t.Fatalf("the episode closed after %d writes, want the start's, the late one and a retry", n)
+	}
+	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
+		t.Fatalf("%d warnings for one episode:\n%s", n, logs.String())
+	}
+}
+
+// syncBuffer is a log buffer safe to write from timers.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestAValueWaitsOnlyTheRemainingDeadlineOfTheOutstandingWrite holds an
+// extension, then asks for a value past the coverage: the extension's own
+// write bound expiring, before the value's, opens the episode and releases
+// the value, so no value waits past the moment an episode opens, and a value
+// waiting alone is released by its own bound.
+func TestAValueWaitsOnlyTheRemainingDeadlineOfTheOutstandingWrite(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	held, _ := holdNext(t, mark)
+	for range signingReservation/2 + 2 {
+		wall.add(time.Millisecond)
+		mark.next(t, clock)
+	}
+	<-held
+	writeBound := timers.live()
+	if len(writeBound) != 1 || writeBound[0].d != MarkWriteBound {
+		t.Fatalf("the outstanding write has %d timers, want one of the write bound", len(writeBound))
+	}
+	wall.add(time.Hour)
+	got := make(chan int64, 1)
+	go func() { got <- mark.next(t, clock) }()
+	waitFor(t, "the value's own bound", func() bool { return len(timers.live()) == 2 })
+	select {
+	case <-got:
+		t.Fatal("a value past the coverage was issued before any bound expired")
+	case <-time.After(50 * time.Millisecond):
+	}
+	timers.fire(writeBound[0])
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the value still waited after the outstanding write passed its bound")
+	}
+	if !clock.Degraded() {
+		t.Fatal("no episode opened when the outstanding write passed its bound")
+	}
+}
+
+// TestAValueThatWaitedTheWriteBoundOpensAnEpisode holds the write a value
+// waits for, and expires the value's own bound: the value is issued, an
+// episode is open, and the held write stays outstanding. The held write then
+// lands below later values, which leaves the episode open.
+func TestAValueThatWaitedTheWriteBoundOpensAnEpisode(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	held, release := holdNext(t, mark)
+	wall.add(time.Hour)
+	got := make(chan int64, 1)
+	go func() { got <- mark.next(t, clock) }()
+	<-held
+	waitFor(t, "both bounds", func() bool { return len(timers.live()) == 2 })
+	// The value's bound was armed after the write's.
+	timers.fire(timers.live()[1])
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a value waited past its own write bound")
+	}
+	clock.mu.Lock()
+	outstanding := clock.write != nil
+	clock.mu.Unlock()
+	if !clock.Degraded() || !outstanding {
+		t.Fatalf("degraded=%v, write outstanding=%v; want an episode with the write still outstanding", clock.Degraded(), outstanding)
+	}
+	// Values past the held write's mark, then the write lands late: it covers
+	// only its own mark, so the episode stays open until a retry covers them.
+	var last int64
+	for range 1500 {
+		wall.add(time.Millisecond)
+		last = mark.next(t, clock)
+	}
+	release()
+	settle(clock)
+	if !clock.Degraded() {
+		t.Fatalf("a write landing below the last value %d issued closed the episode", last)
+	}
+	recoverEpisode(t, timers, clock)
+	if got := mark.mark(); got < last {
+		t.Fatalf("the episode closed under mark %d, below the last value %d", got, last)
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestRetriesArePacedFromThePreviousWritesStart fails every write: each
+// failure arms one retry, no sooner than 1,000 ms after the write before it
+// started, at most one write is ever outstanding, and only an expired retry
+// writes again.
+func TestRetriesArePacedFromThePreviousWritesStart(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	mark.setFail(true)
+	wall.add(time.Hour)
+	for range 50 {
+		wall.add(time.Millisecond)
+		mark.next(t, clock)
+	}
+	for round := range 5 {
+		settle(clock)
+		live := timers.live()
+		if len(live) != 1 {
+			t.Fatalf("round %d: %d timers armed, want one retry", round, len(live))
+		}
+		if d := live[0].d; d <= 0 || d > markRetryPacing {
+			t.Fatalf("round %d: retry armed after %v, want within the pacing %v of the previous start", round, d, markRetryPacing)
+		}
+		writes := mark.attemptCount()
+		for range 50 {
+			mark.next(t, clock)
+		}
+		settle(clock)
+		if mark.attemptCount() != writes {
+			t.Fatalf("round %d: values started a write while a retry was pending", round)
+		}
+		timers.fire(live[0])
+		settle(clock)
+		if mark.attemptCount() != writes+1 {
+			t.Fatalf("round %d: an expired retry wrote %d times, want once", round, mark.attemptCount()-writes)
+		}
+	}
+}
+
+// TestALateFailureThenRecovery fails a write that lands after its bound has
+// opened the episode: the episode stays open, one warning stands for it, and
+// a later write that covers every value closes it.
+func TestALateFailureThenRecovery(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	logs := &syncBuffer{}
+	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, nil)))
+	held, release := holdNext(t, mark)
+	wall.add(time.Hour)
+	got := make(chan int64, 1)
+	go func() { got <- mark.next(t, clock) }()
+	<-held
+	timers.fireAll()
+	<-got
+	mark.mu.Lock()
+	mark.fail = true
+	mark.mu.Unlock()
+	// The held write is exempt from fail; fail it explicitly on landing.
+	mark.mu.Lock()
+	mark.failHeld = true
+	mark.mu.Unlock()
+	release()
+	settle(clock)
+	if !clock.Degraded() {
+		t.Fatal("a late failure closed the episode")
+	}
+	mark.setFail(false)
+	recoverEpisode(t, timers, clock)
+	if n := strings.Count(logs.String(), "could not be persisted"); n != 1 {
+		t.Fatalf("%d warnings for one episode:\n%s", n, logs.String())
+	}
+}
+
+// TestAMarkNeverLowersOneAlreadyWritten fails a write after the wall clock
+// moved ahead, then steps the wall clock back: the retry writes no lower than
+// the failed mark, which may have landed (rule 9), and memMark holds it to
+// the upper bound that allows rewriting it.
+func TestAMarkNeverLowersOneAlreadyWritten(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	mark.setFail(true)
+	wall.add(time.Hour)
+	mark.next(t, clock)
+	settle(clock)
+	failed := mark.highestAttempt()
+	wall.add(-2 * time.Hour)
+	mark.setFail(false)
+	recoverEpisode(t, timers, clock)
+	if got := mark.mark(); got < failed {
+		t.Fatalf("the retry wrote %d, below the failed mark %d", got, failed)
+	}
+}
+
+// TestAStartWhoseFirstWriteStallsIsRefused holds the start's write past the
+// write bound: the start is refused with a StartWriteError, which reports the
+// write outstanding until it ends.
+func TestAStartWhoseFirstWriteStallsIsRefused(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	held, release := holdNext(t, mark)
+	refused := make(chan error, 1)
+	go func() {
+		_, err := NewDurableSigningClock(wall.now, mark, nil)
+		refused <- err
+	}()
+	<-held
+	waitFor(t, "the start's bound", func() bool { return len(timers.live()) == 1 })
+	timers.fireAll()
+	var startErr *StartWriteError
+	select {
+	case err := <-refused:
+		if !errors.As(err, &startErr) {
+			t.Fatalf("a start whose first write stalled: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a start waited on its stalled write past the write bound")
+	}
+	if startErr.Quiesce(20 * time.Millisecond) {
+		t.Fatal("the start's write reported ended while still held")
+	}
+	release()
+	if !startErr.Quiesce(5 * time.Second) {
+		t.Fatal("the start's write never reported ended")
+	}
+}
+
+// TestCloseWithinReportsAWriteStillOutstanding holds a write and closes the
+// clock within a bound: it reports the write outstanding, refuses to sign,
+// cancels the paced retry and starts no write, and Close returns once the
+// write ends.
+func TestCloseWithinReportsAWriteStillOutstanding(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	held, release := holdNext(t, mark)
+	wall.add(time.Hour)
+	got := make(chan int64, 1)
+	go func() { got <- mark.next(t, clock) }()
+	<-held
+	timers.fireAll()
+	<-got
+	if clock.CloseWithin(20 * time.Millisecond) {
+		t.Fatal("CloseWithin reported quiescence with a write held")
+	}
+	if _, err := clock.Next(); !errors.Is(err, ErrSigningClockClosed) {
+		t.Fatalf("a closing clock signed: %v", err)
+	}
+	release()
+	clock.Close()
+	attempts := mark.attemptCount()
+	timers.fireAll()
+	settle(clock)
+	if mark.attemptCount() != attempts {
+		t.Fatal("a closed clock started a write")
+	}
+}
+
+// TestParallelSignersAcrossAStalledReservation signs from many goroutines
+// while every write is slow, on real timers: no value repeats, no signer
+// waits past the write bound plus scheduling slack, and the clock recovers
+// once writes are fast again.
+func TestParallelSignersAcrossAStalledReservation(t *testing.T) {
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	mark.mu.Lock()
+	mark.delay = 1500 * time.Millisecond
+	mark.mu.Unlock()
+	var mu sync.Mutex
+	seen := map[int64]bool{}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 200 {
+				wall.add(time.Millisecond)
+				began := time.Now()
+				at, err := clock.Next()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if waited := time.Since(began); waited > MarkWriteBound+time.Second {
+					t.Errorf("a signer waited %v", waited)
+				}
+				mu.Lock()
+				if seen[at] {
+					t.Errorf("value %d issued twice", at)
+				}
+				seen[at] = true
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	mark.mu.Lock()
+	mark.delay = 0
+	mark.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for clock.Degraded() {
+		if time.Now().After(deadline) {
+			t.Fatal("the clock never recovered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAnEpisodeOpenedBetweenWritesArmsARetry opens an episode while no write
+// is outstanding, as a value's bound expiring just after a write landed short
+// of it does: a retry is armed, so the episode never stays open with nothing
+// left to close it.
+func TestAnEpisodeOpenedBetweenWritesArmsARetry(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	clock := durableClock(t, wall, mark, nil)
+	wall.add(time.Hour)
+	clock.mu.Lock()
+	clock.last = wall.now().UnixMilli()
+	clock.openEpisodeLocked(errWriteOutstanding)
+	armed := clock.retry != nil
+	clock.mu.Unlock()
+	if !armed {
+		t.Fatal("an episode opened between writes armed no retry")
+	}
+	recoverEpisode(t, timers, clock)
 }

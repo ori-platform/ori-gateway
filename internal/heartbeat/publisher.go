@@ -251,6 +251,12 @@ func (p *Publisher) status(ctx context.Context) string {
 	everPublished := p.everPublished
 	p.mu.Unlock()
 
+	// An episode of the signing clock's mark writes is reported, never waited
+	// on, and does not stop the heartbeat (gateway-config/v2
+	// gateway.state_directory rule 11).
+	if p.signingClock.Degraded() {
+		return StatusDegraded
+	}
 	if !everPublished {
 		return StatusStarting
 	}

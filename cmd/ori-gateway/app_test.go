@@ -401,7 +401,9 @@ func baseDeps(t *testing.T, cfg config.Config, fb *fakeBroker, fp *fakeProvider,
 		) (heartbeatRunner, error) {
 			return hb, nil
 		},
-		logger: slog.Default(),
+		// No test process ends: a test that expects the exit replaces this.
+		exitProcess: func(code int) { t.Errorf("the gateway ended the process with status %d", code) },
+		logger:      slog.Default(),
 		now: func() time.Time {
 			return time.Unix(1_700_000_000, 0)
 		},

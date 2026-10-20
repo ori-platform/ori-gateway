@@ -92,6 +92,12 @@ type appDependencies struct {
 	// signingMark, when set by a test, wraps the state directory's mark
 	// before the signing clock uses it, as a slow disk would.
 	signingMark func(mqttauth.DurableMark) mqttauth.DurableMark
+	// stateQuiescenceBound is how long stopping waits for an outstanding
+	// write of the signing clock's mark before the process ends without
+	// releasing the state directory (gateway-config/v2 rule 13).
+	stateQuiescenceBound time.Duration
+	// exitProcess ends the process; a test records the call instead.
+	exitProcess func(code int)
 	logger      *slog.Logger
 	now         func() time.Time
 }
@@ -129,9 +135,41 @@ func defaultDependencies() appDependencies {
 		) (heartbeatRunner, error) {
 			return heartbeat.NewPublisher(publish, prov, simStatus, opts)
 		},
-		logger: slog.Default(),
-		now:    time.Now,
+		stateQuiescenceBound: defaultStateQuiescenceBound,
+		exitProcess:          os.Exit,
+		logger:               slog.Default(),
+		now:                  time.Now,
 	}
+}
+
+// defaultStateQuiescenceBound is this release's quiescence bound under
+// gateway-config/v2 gateway.state_directory rule 13.
+const defaultStateQuiescenceBound = 5 * time.Second
+
+// errStateWriteOutstanding is why a stopping gateway ends its process: a
+// write of the signing clock's mark is still outstanding.
+var errStateWriteOutstanding = errors.New("a write of the signing clock mark is still outstanding")
+
+// abandonedOwners holds every state directory hold a run could not release,
+// so nothing closes its lock before the process ends.
+var (
+	abandonedMu     sync.Mutex
+	abandonedOwners []*gatewaystate.Owner
+)
+
+// abandonStateDirectory ends the process with a non-zero status while a write
+// of the mark is still outstanding, without releasing the state directory:
+// the lock ends with the process, so no second owner can take it while that
+// write may still land (gateway-config/v2 gateway.state_directory rules 3
+// and 13). No further run begins in this process.
+func abandonStateDirectory(deps appDependencies, owner *gatewaystate.Owner, cause error) error {
+	abandonedMu.Lock()
+	abandonedOwners = append(abandonedOwners, owner)
+	abandonedMu.Unlock()
+	deps.logger.Error("gateway state directory is not quiescent; ending the process without releasing it",
+		"error", cause, "bound", deps.stateQuiescenceBound)
+	deps.exitProcess(1)
+	return fmt.Errorf("gateway state directory not quiescent: %w", cause)
 }
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -159,7 +197,7 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	return 0
 }
 
-func runGateway(ctx context.Context, configPath string, deps appDependencies) error {
+func runGateway(ctx context.Context, configPath string, deps appDependencies) (runErr error) {
 	deps = normalizeDependencies(deps)
 	startedAt := deps.now()
 
@@ -188,6 +226,73 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		if err != nil {
 			return fmt.Errorf("construct custody signer: %w", err)
 		}
+	}
+
+	// One signing clock for every envelope the gateway signs outside the
+	// evidence path, so no two are signed at one value (gateway-api/v2
+	// Envelope Freshness and Replay, Senders). A gateway that signs keeps its
+	// mark in its own state directory, independent of evidence forwarding
+	// (gateway-config/v2 gateway.state_directory). A directory that is not
+	// private, not the gateway's, corrupt or not writable refuses the start,
+	// before any optional module writes to disk. The run holds the state
+	// directory exclusively: a second gateway on it is refused, and the hold
+	// is released last, once every signer has stopped and no write of the
+	// mark is outstanding. When that cannot be reached within the quiescence
+	// bound, the process ends without releasing it (rule 13).
+	signingClock := mqttauth.NewSigningClock(deps.now, deps.logger)
+	stopSigning := func() {}
+	if cfg.Gateway.Auth.Enabled {
+		owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory)
+		if err != nil {
+			return fmt.Errorf("open gateway state directory: %w", err)
+		}
+		var mark mqttauth.DurableMark = owner.Mark()
+		if deps.signingMark != nil {
+			mark = deps.signingMark(mark)
+		}
+		signingClock, err = mqttauth.NewDurableSigningClock(deps.now, mark, deps.logger)
+		var stalled *mqttauth.StartWriteError
+		switch {
+		case errors.As(err, &stalled):
+			if !stalled.Quiesce(deps.stateQuiescenceBound) {
+				return abandonStateDirectory(deps, owner, err)
+			}
+			_ = owner.Close()
+			return fmt.Errorf("open gateway signing clock: %w", err)
+		case err != nil:
+			_ = owner.Close()
+			return fmt.Errorf("open gateway signing clock: %w", err)
+		}
+		// Deciding to stop stops the clock at once, and the quiescence bound
+		// runs from that decision, once for the whole stop: past it with a
+		// write outstanding, the process ends even while callbacks are still
+		// being joined.
+		quiescent := make(chan error, 1)
+		var stopOnce sync.Once
+		stopSigning = func() {
+			stopOnce.Do(func() {
+				idle := signingClock.Stop()
+				go func() {
+					timer := time.NewTimer(deps.stateQuiescenceBound)
+					defer timer.Stop()
+					select {
+					case <-idle:
+						quiescent <- nil
+					case <-timer.C:
+						quiescent <- abandonStateDirectory(deps, owner, errStateWriteOutstanding)
+					}
+				}()
+			})
+		}
+		// Registered first, so it runs last: after every signer has stopped.
+		defer func() {
+			stopSigning()
+			if err := <-quiescent; err != nil {
+				runErr = errors.Join(runErr, err)
+				return
+			}
+			_ = owner.Close()
+		}()
 	}
 
 	var evidenceQueue *courier.DurableQueue
@@ -273,30 +378,6 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		}
 	}
 
-	// One signing clock for every envelope the gateway signs outside the
-	// evidence path, so no two are signed at one value (gateway-api/v2
-	// Envelope Freshness and Replay, Senders). A gateway that signs keeps its
-	// mark in its own state directory, independent of evidence forwarding
-	// (gateway-config/v2 gateway.state_directory). A directory that is not
-	// private, not the gateway's, corrupt or not writable refuses the start.
-	// The run holds the state directory exclusively: a second gateway on it is
-	// refused, and the hold is released last, once every signer has stopped.
-	signingClock := mqttauth.NewSigningClock(deps.now, deps.logger)
-	if cfg.Gateway.Auth.Enabled {
-		owner, err := gatewaystate.Acquire(cfg.Gateway.StateDirectory)
-		if err != nil {
-			return fmt.Errorf("open gateway state directory: %w", err)
-		}
-		defer func() { _ = owner.Close() }()
-		var mark mqttauth.DurableMark = owner.Mark()
-		if deps.signingMark != nil {
-			mark = deps.signingMark(mark)
-		}
-		signingClock, err = mqttauth.NewDurableSigningClock(deps.now, mark, deps.logger)
-		if err != nil {
-			return fmt.Errorf("open gateway signing clock: %w", err)
-		}
-	}
 	// Every broker callback runs through one gate. Shutdown closes it, which
 	// refuses any later callback and waits for those running, before any
 	// state they may sign or write is released (GW-15).
@@ -422,15 +503,14 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 	// one is still running (GW-15).
 	postureDebounce := newPostureDebouncer()
 	defer func() {
+		stopSigning()
 		cancel()
 		callbacks.close()
 		postureDebounce.close()
-		// The signing clock extends its durable reservation in the
-		// background; no such write outlives runGateway.
-		signingClock.Close()
 	}()
 	runners := newSupervisedRunners(runCtx)
 	shutdownRunners := func() {
+		stopSigning()
 		cancel()
 		postureDebounce.close()
 		_ = runners.wait()
@@ -718,7 +798,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		gatewayViewFn := func() site.GatewayView {
 			status := site.SiteStatusHealthy
 			evidenceDelivery := evidenceDeliveryView(evidenceWorker)
-			if !providerStatus.Healthy(runCtx) ||
+			if !providerStatus.Healthy(runCtx) || signingClock.Degraded() ||
 				(evidenceDelivery != nil && (evidenceDelivery.Degraded || evidenceDelivery.Blocked)) {
 				status = site.SiteStatusDegraded
 			}
@@ -745,6 +825,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) er
 		shutdownRunners()
 		return disconnectBroker(client, &disconnect)
 	case err := <-runners.done():
+		stopSigning()
 		cancel()
 		postureDebounce.close()
 		if ctx.Err() != nil {
@@ -1107,6 +1188,12 @@ func normalizeDependencies(deps appDependencies) appDependencies {
 	}
 	if deps.newRuntimeClient == nil {
 		deps.newRuntimeClient = defaults.newRuntimeClient
+	}
+	if deps.stateQuiescenceBound <= 0 {
+		deps.stateQuiescenceBound = defaults.stateQuiescenceBound
+	}
+	if deps.exitProcess == nil {
+		deps.exitProcess = defaults.exitProcess
 	}
 	if deps.newWeeklyReportRunner == nil {
 		deps.newWeeklyReportRunner = defaults.newWeeklyReportRunner
