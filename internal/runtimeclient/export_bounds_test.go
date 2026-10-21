@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -922,5 +923,70 @@ func TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback(t *testing.T) {
 	case <-h.entered:
 	case <-time.After(time.Second):
 		t.Fatal("the refusal below the floor was never logged")
+	}
+}
+
+// serialHandler is a valid handler that holds one lock for its level check and
+// for writing, and blocks writing its first record until released.
+type serialHandler struct {
+	mu               sync.Mutex
+	entered, release chan struct{}
+	once             sync.Once
+	levels           atomic.Int32
+}
+
+func (h *serialHandler) Enabled(context.Context, slog.Level) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.levels.Add(1)
+	return true
+}
+
+func (h *serialHandler) Handle(context.Context, slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.once.Do(func() { close(h.entered) })
+	<-h.release
+	return nil
+}
+
+func (h *serialHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *serialHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestALoggerThatLocksItsLevelCheckNeverHoldsAnExport blocks a logger that
+// holds one lock for its level check and its writing, then ends an export at
+// its bound: the export returns at its bound, since the level is asked off
+// the caller's path, by the drainer.
+func TestALoggerThatLocksItsLevelCheckNeverHoldsAnExport(t *testing.T) {
+	h := &serialHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	c, err := NewMQTTClient(newFakeBroker(), WithLogger(slog.New(h)), WithExportWait(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); !errors.Is(err, ErrExportTimeout) {
+		t.Fatalf("Health = %v, want ErrExportTimeout", err)
+	}
+	<-h.entered
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrExportTimeout) {
+			t.Fatalf("Health = %v, want ErrExportTimeout", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(h.release)
+		t.Fatal("an export was held past its bound by the logger's level check")
+	}
+	close(h.release)
+	waitFor := time.Now().Add(time.Second)
+	for h.levels.Load() < 2 && time.Now().Before(waitFor) {
+		time.Sleep(time.Millisecond)
+	}
+	if h.levels.Load() < 2 {
+		t.Fatal("the drainer never asked the logger's level before writing")
 	}
 }

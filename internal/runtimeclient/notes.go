@@ -63,7 +63,9 @@ func (n *noteLog) drain() {
 			next := n.notes[0]
 			n.notes = n.notes[1:]
 			n.mu.Unlock()
-			_ = next.handler.Handle(ctx, next.record)
+			if next.handler.Enabled(ctx, next.record.Level) {
+				_ = next.handler.Handle(ctx, next.record)
+			}
 			continue
 		}
 		dropped := n.dropped
@@ -84,15 +86,15 @@ func (n *noteLog) drain() {
 }
 
 // queuedHandler is an slog.Handler that queues every record it is given for
-// inner on notes, so logging through it never waits on inner.
+// inner on notes, so logging through it never waits on inner: not even for
+// inner's level, which the drainer asks before it writes each record, since
+// a handler may hold one lock for both.
 type queuedHandler struct {
 	inner slog.Handler
 	notes *noteLog
 }
 
-func (h *queuedHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.inner.Enabled(ctx, level)
-}
+func (h *queuedHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *queuedHandler) Handle(_ context.Context, record slog.Record) error {
 	h.notes.queue(h.inner, record.Clone())

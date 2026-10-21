@@ -542,8 +542,8 @@ broker `Connect`, `Subscribe` or `Publish` waits for its acknowledgement only
 while its caller's context lasts, and 30 seconds at most without a deadline,
 so ending the run ends a shared subscribe at the transport. The export
 client's log records, its verifier's included, are written off every caller's
-path, in order, by one drainer, at most 64 waiting behind a logger that blocks
-and later ones counted, so none of them holds an export past its bound, delays
+path, in order, by one drainer, which also asks the logger's level, at most 64
+waiting behind a logger that blocks and later ones counted, so none of them holds an export past its bound, delays
 the release of its pending state, or holds the broker callback that delivers
 responses. An export page missing any
 envelope member (`request_id`, `export_type`, `device_id`, `items`,
@@ -576,6 +576,7 @@ Export Auth Envelope). Verified by
 `TestATimeoutNeverWaitsOnTheLogger`,
 `TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback`,
 `TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger`,
+`TestALoggerThatLocksItsLevelCheckNeverHoldsAnExport`,
 `TestASubscribeEndsWhenItsContextIsCancelled`,
 `TestWaitTokenEndsWhenItsContextIsCancelled`,
 `TestWaitTokenTakesATokenThatCompletedAsItsContextEnded`,
