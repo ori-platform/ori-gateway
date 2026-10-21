@@ -33,9 +33,9 @@ var (
 	// A request it refuses, malformed, unauthenticated or not fresh, is not.
 	ErrPublishResponse = errors.New("dispatcher: publish response")
 	// ErrRequestInFlight refuses a request whose request_id is already being
-	// handled: it is not answered on its own, since the request in flight
-	// answers that request_id, and it delivers nothing, so it is neither a
-	// delivery failure nor a delivered reply.
+	// handled for the same device: it is not answered on its own, since the
+	// request in flight answers that request_id, and it delivers nothing, so
+	// it is neither a delivery failure nor a delivered reply.
 	ErrRequestInFlight = errors.New("dispatcher: request_id already in flight")
 )
 
@@ -62,7 +62,7 @@ type Dispatcher struct {
 	signingClock    *mqttauth.SigningClock
 
 	mu       sync.Mutex
-	inFlight map[string]struct{}
+	inFlight map[inFlightKey]struct{}
 }
 
 // Options configures Dispatcher.
@@ -118,7 +118,7 @@ func New(publisher Publisher, reasoningProvider provider.Provider, opts Options)
 		signingSecret:   signingSecret,
 		now:             now,
 		signingClock:    signingClockOrOwn(opts.SigningClock, now),
-		inFlight:        map[string]struct{}{},
+		inFlight:        map[inFlightKey]struct{}{},
 	}, nil
 }
 
@@ -151,10 +151,11 @@ func (d *Dispatcher) HandleRequest(ctx context.Context, topic string, payload []
 		}
 	}
 	req.Auth = nil
-	if !d.begin(req.RequestID) {
+	key := inFlightKey{deviceID: req.DeviceID, requestID: req.RequestID}
+	if !d.begin(key) {
 		return ErrRequestInFlight
 	}
-	defer d.finish(req.RequestID)
+	defer d.finish(key)
 
 	resp, err := d.callProvider(ctx, req)
 	if err != nil {
@@ -169,20 +170,27 @@ func (d *Dispatcher) HandleRequest(ctx context.Context, topic string, payload []
 	return d.publishResponse(req, resp)
 }
 
-func (d *Dispatcher) begin(requestID string) bool {
+// inFlightKey is a request's whole identity: request_id is unique only
+// within its device, so two devices may use the same one at once.
+type inFlightKey struct {
+	deviceID  string
+	requestID string
+}
+
+func (d *Dispatcher) begin(key inFlightKey) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, exists := d.inFlight[requestID]; exists {
+	if _, exists := d.inFlight[key]; exists {
 		return false
 	}
-	d.inFlight[requestID] = struct{}{}
+	d.inFlight[key] = struct{}{}
 	return true
 }
 
-func (d *Dispatcher) finish(requestID string) {
+func (d *Dispatcher) finish(key inFlightKey) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	delete(d.inFlight, requestID)
+	delete(d.inFlight, key)
 }
 
 func validateRequestTopic(req contracts.ReasoningRequest, topic string) error {

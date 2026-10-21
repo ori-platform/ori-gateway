@@ -51,7 +51,8 @@ The gateway process must also surface repeated reasoning-response delivery
 failures instead of logging forever while dropping all replies. Only a reply
 it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
 a request it refuses, malformed, unauthenticated, not fresh or with a
-`request_id` already in flight (`dispatcher.ErrRequestInFlight`), neither
+`request_id` already in flight for the same device
+(`dispatcher.ErrRequestInFlight`), neither
 counts nor resets the count, so no sender can end the gateway by sending junk
 or mask a delivery failure by repeating a request. A
 heartbeat that the run's own stop interrupts, or that the signing clock the
@@ -64,6 +65,8 @@ Verified by `TestHeartbeatFailureLimit`,
 `TestMalformedReasoningRequestsNeverStopTheGateway`,
 `TestADuplicateInFlightRequestNeitherCountsNorResetsTheFailureCount`,
 `TestARequestAlreadyInFlightIsRefusedAndDeliversNothing`,
+`TestTheSameRequestIDFromTwoDevicesIsAnsweredForEach`,
+`TestTheSameRequestIDFromTwoDevicesIsAnsweredThroughTheGateway`,
 `TestAPublishTheStopInterruptsIsNotAFailure`,
 `TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`,
 `TestAReplyTheStopRefusesIsNotADeliveryFailure`,

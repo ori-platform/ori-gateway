@@ -24,20 +24,24 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/enrichment"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
 	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
 )
 
 // startGatewayOnABroker runs the gateway on a real MQTT broker with site
-// health, and returns the broker URL, the site health address and the
-// gateway's clock.
-func startGatewayOnABroker(t *testing.T, prov provider.Provider) (string, string, func() time.Time) {
+// health, after configure if it is set, and returns the broker URL, the site
+// health address and the gateway's clock.
+func startGatewayOnABroker(t *testing.T, prov provider.Provider, configure func(*config.Config)) (string, string, func() time.Time) {
 	t.Helper()
 	brokerURL := startEmbeddedBroker(t)
 	siteAddr := loopbackAddr(t)
 	cfg := validConfig()
 	cfg.Gateway.BrokerURL = brokerURL
 	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: siteAddr}
+	if configure != nil {
+		configure(&cfg)
+	}
 	logs := &syncBuffer{}
 	deps := baseDeps(t, cfg, newFakeBroker(), &fakeProvider{healthy: true}, newFakeHeartbeat())
 	deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return prov, nil }
@@ -67,7 +71,7 @@ func startGatewayOnABroker(t *testing.T, prov provider.Provider) (string, string
 // out the publish timeout. Every request is answered well within it.
 func TestABurstOfReasoningRequestsIsAnsweredWithoutStalling(t *testing.T) {
 	prov := &fakeProvider{healthy: true}
-	brokerURL, _, _ := startGatewayOnABroker(t, prov)
+	brokerURL, _, _ := startGatewayOnABroker(t, prov, nil)
 	peer := newRuntimePeer(t, brokerURL, "ori/dev-01/reasoning/response")
 
 	const burst = 10
@@ -104,7 +108,7 @@ func TestABurstOfReasoningRequestsIsAnsweredWithoutStalling(t *testing.T) {
 // health while the call is still held.
 func TestAHeartbeatIsNotDelayedByAReasoningCall(t *testing.T) {
 	prov := &heldProvider{fakeProvider: fakeProvider{healthy: true}, entered: make(chan struct{}), release: make(chan struct{})}
-	brokerURL, siteAddr, now := startGatewayOnABroker(t, prov)
+	brokerURL, siteAddr, now := startGatewayOnABroker(t, prov, nil)
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(prov.release) }) }
 	t.Cleanup(release)
@@ -786,6 +790,78 @@ func TestTheRunningGatewayKeepsEachDevicesEvidenceOrder(t *testing.T) {
 	for i, ok := range seen {
 		if !ok {
 			t.Fatalf("round %d: an inbound acknowledgement was handled before the carriage that arrived ahead of it", i)
+		}
+	}
+}
+
+// deviceHeldProvider holds every reasoning call from one device until
+// release is closed.
+type deviceHeldProvider struct {
+	fakeProvider
+	device           string
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (p *deviceHeldProvider) Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
+	if req.DeviceID == p.device {
+		p.once.Do(func() { close(p.entered) })
+		<-p.release
+	}
+	return p.fakeProvider.Reason(ctx, req)
+}
+
+// TestTheSameRequestIDFromTwoDevicesIsAnsweredThroughTheGateway sends the
+// same request_id, signed, from two devices through a real broker while the
+// first is held in the provider: the second device is answered while the
+// first is still in flight, and then the first is answered too.
+func TestTheSameRequestIDFromTwoDevicesIsAnsweredThroughTheGateway(t *testing.T) {
+	const secret = "runtime-gateway-envelope-secret"
+	t.Setenv("GATEWAY_ENVELOPE", secret)
+	prov := &deviceHeldProvider{fakeProvider: fakeProvider{healthy: true}, device: "dev-01", entered: make(chan struct{}), release: make(chan struct{})}
+	brokerURL, _, now := startGatewayOnABroker(t, prov, func(cfg *config.Config) {
+		cfg.Gateway.DeviceIDs = []string{"dev-01", "dev-02"}
+		cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+		cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
+	})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(prov.release) }) }
+	t.Cleanup(release)
+	signed := func(device string) []byte {
+		var payload map[string]any
+		if err := json.Unmarshal(reasoningRequestFrom(t, device, "same-id", 300), &payload); err != nil {
+			t.Fatal(err)
+		}
+		auth, err := mqttauth.Sign(payload, contracts.ReasoningRequestMessageType, device, "same-id", now().UnixMilli(), secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload["auth"] = auth
+		return mustJSON(t, payload)
+	}
+	peer := newRuntimePeer(t, brokerURL, "ori/dev-01/reasoning/response", "ori/dev-02/reasoning/response")
+
+	peer.publish(t, "ori/dev-01/reasoning/request", signed("dev-01"))
+	select {
+	case <-prov.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dev-01's request never reached the provider")
+	}
+	peer.publish(t, "ori/dev-02/reasoning/request", signed("dev-02"))
+	waitUntil(t, "dev-02 to be answered while dev-01's request is in flight", func() bool {
+		return len(peer.received("ori/dev-02/reasoning/response")) == 1
+	})
+	release()
+	waitUntil(t, "dev-01 to be answered once released", func() bool {
+		return len(peer.received("ori/dev-01/reasoning/response")) == 1
+	})
+	for _, device := range []string{"dev-01", "dev-02"} {
+		var reply contracts.ReasoningResponse
+		if err := json.Unmarshal(peer.received("ori/" + device + "/reasoning/response")[0], &reply); err != nil {
+			t.Fatal(err)
+		}
+		if reply.RequestID != "same-id" || reply.DeviceID != device || reply.Error != nil {
+			t.Fatalf("%s was answered %+v, want its own reply to same-id", device, reply)
 		}
 	}
 }
