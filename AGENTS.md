@@ -145,7 +145,9 @@ baselines through `TestHealthTransitionCorpus` (the verified export path, with
 encryption off and on) and
 `TestHealthTransitionReachesSiteHealthAndTheWeeklyReport` (into the site
 posture, the site health projection and the weekly report input), and by
-`TestALatchBelongsToTheRequestedDevice`.
+`TestALatchBelongsToTheRequestedDevice`, `TestAFaultIsLoggedOncePerEpisode`,
+`TestConcurrentReadingsShareOneReader` (under `-race`) and
+`TestSiteExportSeverityNeverReadsAnUnknownValueAsOK`.
 
 15. `GW-15` Gateway process startup and shutdown must be ordered and explicit.
 Startup order is config, provider, broker connect, optional modules, heartbeat,
@@ -277,9 +279,14 @@ was `critical` is never evicted for silence: it stays `critical` until it
 reports again or is removed from `gateway.device_ids` (`docs/OPERATIONS.md`).
 The severity read from a node's health export (GW-14) only raises its status,
 critical to critical and anything but ok to degraded, and is not itself a
-projected member.
+projected member. The registry keeps it through every heartbeat, a failed
+fetch and eviction; only a later export reading changes it, and a node whose
+export last read critical is retained on silence like a critical heartbeat.
 Verified by `TestCriticalHeartbeatKeptThroughGetHealth`,
 `TestExportSeverityOnlyRaisesANode`,
+`TestExportSeverityOutlivesEveryHeartbeat`,
+`TestASilentNodeWhoseExportReadCriticalStaysCritical`,
+`TestACriticalExportSurvivesHeartbeatsAndAFailedFetch`,
 `TestCriticalNodeNeverFoldedBelowCritical`,
 `TestFallbackAfterEvidenceHistoryStaysCritical`,
 `TestSilentCriticalNodeStaysCriticalUntilItReportsAgain`, and

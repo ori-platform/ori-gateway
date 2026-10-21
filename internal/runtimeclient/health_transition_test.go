@@ -8,9 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,7 +163,7 @@ func TestHealthTransitionCorpus(t *testing.T) {
 			logs := &lockedBuffer{}
 			opts := []MQTTClientOption{
 				WithMessageAuth(healthTransitionSecret, "", func() time.Time { return now }),
-				WithLogger(slog.New(slog.NewTextHandler(logs, nil))), WithExportWait(5 * time.Second),
+				WithLogger(slog.New(slog.NewJSONHandler(logs, nil))), WithExportWait(5 * time.Second),
 			}
 			if encrypted {
 				opts = append(opts, WithMessageEncryption(healthTransitionSecret))
@@ -200,9 +203,22 @@ func TestHealthTransitionCorpus(t *testing.T) {
 
 				c.warn("sentinel")
 				logged := logs.once(func(s string) bool { return strings.Contains(s, "sentinel") })
-				faults := strings.Count(logged, "severity unreadable")
-				if want := map[bool]int{true: 1, false: 0}[tc.Expect.Severity == HealthStatusUnknown]; faults != want {
-					t.Fatalf("%d faults logged, want %d:\n%s", faults, want, logged)
+				faults := faultRecords(t, logged)
+				if want := map[bool]int{true: 1, false: 0}[tc.Expect.Severity == HealthStatusUnknown]; len(faults) != want {
+					t.Fatalf("%d faults logged, want %d:\n%s", len(faults), want, logged)
+				}
+				// A fault names the device the export was requested from,
+				// never the item's own device_id, which its sender writes.
+				itemDevice, _ := item.(map[string]any)["device_id"].(string)
+				for _, record := range faults {
+					if record["device_id"] != tc.RequestedDeviceID || record["fault"] == "" {
+						t.Fatalf("fault record %v, want device_id %q and a fault", record, tc.RequestedDeviceID)
+					}
+					for name, value := range record {
+						if itemDevice != tc.RequestedDeviceID && value == itemDevice && name != "msg" {
+							t.Fatalf("fault record carries the item's device_id %q in %s: %v", itemDevice, name, record)
+						}
+					}
 				}
 				for _, leaked := range itemContent(item) {
 					if strings.Contains(logged, leaked) {
@@ -222,6 +238,23 @@ func TestHealthTransitionCorpus(t *testing.T) {
 			})
 		}
 	}
+}
+
+// faultRecords parses the client's JSON log records and returns the health
+// fault records among them, in order.
+func faultRecords(t *testing.T, logged string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.Lines(logged) {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if record["msg"] == "runtime health export severity unreadable; reported unknown" {
+			out = append(out, record)
+		}
+	}
+	return out
 }
 
 // itemContent is what a fault log must never carry from an item: its
@@ -276,5 +309,127 @@ func TestALatchBelongsToTheRequestedDevice(t *testing.T) {
 	}
 	if got := runtime.health(c, "dev-01", decodeItem(t, baselines["e4ba3e92"])).Status; got != HealthStatusUnknown {
 		t.Fatalf("the latched device's unmarked export reads %q, want unknown", got)
+	}
+}
+
+// TestAFaultIsLoggedOncePerEpisode reads one device's exports on one client:
+// a fault, the same fault again, a clean export, the fault again, another
+// fault, and that fault again. A fault is logged when it begins, so on the
+// first, fourth and fifth readings only: a repeat logs nothing, a clean
+// reading ends the episode, and a different fault is a new one.
+func TestAFaultIsLoggedOncePerEpisode(t *testing.T) {
+	_, baselines := loadHealthTransition(t)
+	now := time.UnixMilli(1_787_000_003_000)
+	runtime := newHealthRuntime(t, now)
+	logs := &lockedBuffer{}
+	c, err := NewMQTTClient(runtime.broker, WithMessageAuth(healthTransitionSecret, "", func() time.Time { return now }),
+		WithLogger(slog.New(slog.NewJSONHandler(logs, nil))), WithExportWait(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean := func() map[string]any { return decodeItem(t, baselines["v2.5.0"]).(map[string]any) }
+	noUptime := clean()
+	delete(noUptime, "uptime_s")
+	otherDevice := clean()
+	otherDevice["device_id"] = "dev-02"
+	steps := []struct {
+		item map[string]any
+		want string
+		log  string
+	}{
+		{noUptime, HealthStatusUnknown, "member_absent:uptime_s"},
+		{noUptime, HealthStatusUnknown, ""},
+		{clean(), HealthStatusOK, ""},
+		{noUptime, HealthStatusUnknown, "member_absent:uptime_s"},
+		{otherDevice, HealthStatusUnknown, "device_mismatch"},
+		{otherDevice, HealthStatusUnknown, ""},
+	}
+	var want []string
+	for i, step := range steps {
+		if got := runtime.health(c, "dev-01", step.item).Status; got != step.want {
+			t.Fatalf("reading %d: %q, want %q", i+1, got, step.want)
+		}
+		if step.log != "" {
+			want = append(want, fmt.Sprintf("%d:%s", i+1, step.log))
+		}
+		c.warn("sentinel", "step", i+1)
+	}
+	logged := logs.once(func(s string) bool { return strings.Contains(s, fmt.Sprintf(`"step":%d`, len(steps))) })
+	var got []string
+	step := 1
+	for line := range strings.Lines(logged) {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		switch record["msg"] {
+		case "sentinel":
+			step++
+		case "runtime health export severity unreadable; reported unknown":
+			got = append(got, fmt.Sprintf("%d:%v", step, record["fault"]))
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("faults logged %v, want %v", got, want)
+	}
+}
+
+// TestConcurrentReadingsShareOneReader reads health exports concurrently on
+// one client, marked and unmarked items for the same and different devices.
+// Run under -race, the shared reader's latch and fault state is guarded;
+// every reading is a severity, and each device that served a marked item is
+// latched afterwards.
+func TestConcurrentReadingsShareOneReader(t *testing.T) {
+	_, baselines := loadHealthTransition(t)
+	now := time.UnixMilli(1_787_000_003_000)
+	b := newFakeBroker()
+	c, err := NewMQTTClient(b, WithMessageAuth(healthTransitionSecret, "", func() time.Time { return now }),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), WithExportWait(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices := []string{"dev-01", "dev-02", "dev-03"}
+	served := map[string]*atomic.Int64{}
+	for _, device := range devices {
+		served[device] = &atomic.Int64{}
+	}
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Error(err)
+			return
+		}
+		item := decodeItem(t, baselines["e4ba3e92"]).(map[string]any)
+		item["device_id"] = req.DeviceID
+		if served[req.DeviceID].Add(1)%2 == 0 {
+			item = map[string]any{"projection": healthProjectionMarker, "status": HealthStatusDegraded}
+		}
+		resp := withEnvelope(map[string]any{
+			"request_id": req.RequestID, "device_id": req.DeviceID, "export_type": req.ExportType, "items": []any{item},
+		})
+		b.respondRaw(req.DeviceID, req.RequestID, signedExportPayload(t, resp, healthTransitionSecret, now))
+	}
+	var wg sync.WaitGroup
+	for i := range 48 {
+		wg.Go(func() {
+			snapshot, err := c.Health(context.Background(), HealthRequest{DeviceID: devices[i%len(devices)]})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			switch snapshot.Status {
+			case HealthStatusOK, HealthStatusDegraded, HealthStatusUnknown:
+			default:
+				t.Errorf("reading %q", snapshot.Status)
+			}
+		})
+	}
+	wg.Wait()
+	c.health.mu.Lock()
+	defer c.health.mu.Unlock()
+	for _, device := range devices {
+		if !c.health.latched[device] {
+			t.Errorf("%s served marked items but is not latched", device)
+		}
 	}
 }

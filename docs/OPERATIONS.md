@@ -518,9 +518,15 @@ clock from when it received the last one; the node's `last_seen_ms` plays no
 part, so a node whose clock is ahead or behind is not reported silent while it
 is still reporting.
 
-A node that goes silent after a `healthy` or `degraded` heartbeat is dropped
-from the registry after three heartbeat intervals and shows as unobserved and
-`degraded`, as before.
+A node whose health export last read `critical` is retained the same way,
+whatever its heartbeats said, and the log line is `runtime node silent after a
+critical health export; kept critical until its export reads otherwise`. Its
+next heartbeat does not end that: only a later health export that reads
+otherwise does.
+
+A node that goes silent after a `healthy` or `degraded` heartbeat, with no
+`critical` export, is dropped from the registry after three heartbeat
+intervals and shows as unobserved and `degraded`, as before.
 
 The retention has no time limit, because any time limit would be critical
 decaying through silence. It is bounded instead by the configured devices:
@@ -663,7 +669,11 @@ explicit `ok`; a missing, mistyped or inconsistent member, a status no release
 writes, or an export naming another device reads `unknown`, never `ok`. In
 site health an export that reads `critical` makes its node `critical`, and one
 that reads `degraded` or `unknown` makes a healthy node `degraded`; it never
-lowers what the node's heartbeat reported.
+lowers what the node's heartbeat reported. The node keeps the severity its
+export last read through every later heartbeat, and through a failed or
+skipped export fetch, until a later export reads otherwise; the other posture
+members (`broker_hardening`, `encryption`, `alert_outbox`) are still replaced
+by each heartbeat and filled again by the next fetch.
 
 - `WARN runtime health export severity unreadable; reported unknown`, with the
   `device_id` and a `fault` naming why, such as `member_absent:uptime_s`,

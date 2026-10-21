@@ -51,6 +51,8 @@ type exportRuntime struct {
 	mu       sync.Mutex
 	handlers map[string]broker.MessageHandler
 	item     any
+	// fail answers the health export with a runtime error.
+	fail bool
 }
 
 func (r *exportRuntime) Subscribe(_ context.Context, topic string, _ byte, handler broker.MessageHandler) error {
@@ -86,6 +88,9 @@ func (r *exportRuntime) Publish(_ context.Context, _ string, _ byte, _ bool, pay
 	resp := map[string]any{
 		"request_id": req.RequestID, "device_id": req.DeviceID, "export_type": req.ExportType,
 		"items": items, "next_page_token": "", "complete": true, "error": nil,
+	}
+	if req.ExportType == "health" && r.fail {
+		resp["items"], resp["error"] = []any{}, "health unavailable"
 	}
 	if req.ExportType != "health" && r.encrypt {
 		encryptor, err := mqttauth.NewEncryptor(healthTransitionSecret)
@@ -239,6 +244,118 @@ func TestHealthTransitionReachesSiteHealthAndTheWeeklyReport(t *testing.T) {
 					t.Fatalf("%s: weekly report input %#v, want severity %q", tc.Name, provider.inputs, tc.Expect.Severity)
 				}
 			})
+		}
+	}
+}
+
+// TestACriticalExportSurvivesHeartbeatsAndAFailedFetch runs a node through
+// the real heartbeat handler and the real export client: a heartbeat, an
+// export that reads critical, another heartbeat, and a fetch that fails. The
+// node and the site stay critical throughout. Then a heartbeat, a critical
+// export, a heartbeat and a later export that reads ok: the raise clears.
+func TestACriticalExportSurvivesHeartbeatsAndAFailedFetch(t *testing.T) {
+	raw, err := specvectors.Read("gateway-api/vectors/health-transition-v2.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus struct {
+		Cases []healthTransitionCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &corpus); err != nil {
+		t.Fatal(err)
+	}
+	items := map[string]json.RawMessage{}
+	for _, tc := range corpus.Cases {
+		items[tc.Name] = tc.Item
+	}
+	critical, healthy := items["later_critical_true"], items["producer_later_exact"]
+	if critical == nil || healthy == nil {
+		t.Fatal("corpus lacks the critical or the healthy case")
+	}
+
+	now := time.UnixMilli(1_787_000_003_000)
+	secrets := gatewayAuthSecrets{Enabled: true, CurrentSecret: healthTransitionSecret}
+	registry := site.NewRegistry()
+	heartbeats, err := runtimeHeartbeatHandlerFromSecrets(secrets, registry, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedAt := now.UnixMilli()
+	beat := func() {
+		t.Helper()
+		signedAt++
+		hb := contracts.RuntimeNodeHeartbeat{DeviceID: "dev-01", Status: site.NodeStatusHealthy, LastSeenMS: now.UnixMilli(), ActiveTriggers: []string{}}
+		auth, err := mqttauth.Sign(hb, contracts.RuntimeHeartbeatMessageType, "dev-01", "", signedAt, healthTransitionSecret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hb.Auth = &auth
+		if err := heartbeats.Handle("ori/dev-01/runtime/heartbeat", mustJSON(t, hb)); err != nil {
+			t.Fatalf("heartbeat refused: %v", err)
+		}
+	}
+	opts, err := runtimeClientOptionsFromSecrets(config.GatewayEncryptionConfig{}, secrets, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &exportRuntime{t: t, now: now, handlers: map[string]broker.MessageHandler{}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rc, err := runtimeclient.NewMQTTClient(runtime, append(opts, runtimeclient.WithLogger(logger), instantExportPacing())...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := func(item json.RawMessage, fail bool) {
+		t.Helper()
+		runtime.fail = fail
+		if item != nil {
+			runtime.item = decodeVectorItem(t, item)
+		}
+		fetchAndUpsertPosture(context.Background(), rc, registry, "dev-01", logger)
+	}
+	expect := func(step, want string) {
+		t.Helper()
+		h := site.NewProjector(registry, site.ProjectOptions{ExpectedDeviceIDs: []string{"dev-01"}, NodeTTLMS: 60_000}).
+			Project(now, site.GatewayView{Status: site.SiteStatusHealthy})
+		if h.Nodes[0].Status != want || h.Status != want {
+			t.Fatalf("%s: node %q site %q, want %q", step, h.Nodes[0].Status, h.Status, want)
+		}
+	}
+
+	beat()
+	expect("first heartbeat", site.SiteStatusHealthy)
+	fetch(critical, false)
+	expect("critical export", site.SiteStatusCritical)
+	beat()
+	expect("heartbeat after the critical export", site.SiteStatusCritical)
+	fetch(nil, true)
+	expect("failed fetch", site.SiteStatusCritical)
+	beat()
+	expect("heartbeat after the failed fetch", site.SiteStatusCritical)
+
+	fetch(critical, false)
+	beat()
+	expect("heartbeat after a second critical export", site.SiteStatusCritical)
+	fetch(healthy, false)
+	expect("a later ok export", site.SiteStatusHealthy)
+	beat()
+	expect("heartbeat after the ok export", site.SiteStatusHealthy)
+}
+
+// TestSiteExportSeverityNeverReadsAnUnknownValueAsOK maps every value the
+// runtime client returns, and values it never returns, into the site
+// posture: only ok is ok, and a value the client never returns is unknown.
+func TestSiteExportSeverityNeverReadsAnUnknownValueAsOK(t *testing.T) {
+	for status, want := range map[string]string{
+		runtimeclient.HealthStatusOK:       site.ExportSeverityOK,
+		runtimeclient.HealthStatusDegraded: site.ExportSeverityDegraded,
+		runtimeclient.HealthStatusCritical: site.ExportSeverityCritical,
+		runtimeclient.HealthStatusUnknown:  site.ExportSeverityUnknown,
+		"":                                 site.ExportSeverityUnknown,
+		"healthy":                          site.ExportSeverityUnknown,
+		"OK":                               site.ExportSeverityUnknown,
+	} {
+		if got := sitePostureFromHealth(runtimeclient.HealthSnapshot{Status: status}).ExportSeverity; got != want {
+			t.Errorf("status %q: posture severity %q, want %q", status, got, want)
 		}
 	}
 }

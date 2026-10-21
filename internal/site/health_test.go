@@ -452,3 +452,66 @@ func TestExportSeverityOnlyRaisesANode(t *testing.T) {
 		}
 	}
 }
+
+// TestExportSeverityOutlivesEveryHeartbeat records a critical export reading
+// and then heartbeats, a posture fetch that carries no severity, and an
+// eviction: the node stays critical through each, and only a later export
+// reading changes it.
+func TestExportSeverityOutlivesEveryHeartbeat(t *testing.T) {
+	nowMS := int64(10000)
+	reg := NewRegistry()
+	project := func(at int64) SiteHealth {
+		return NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
+			Project(time.UnixMilli(at), healthyGateway())
+	}
+	expect := func(step string, at int64, want string) {
+		t.Helper()
+		if h := project(at); h.Nodes[0].Status != want || h.Status != want {
+			t.Fatalf("%s: node %q site %q, want %q", step, h.Nodes[0].Status, h.Status, want)
+		}
+	}
+	beat := func(at int64) {
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: at, GatewaySeen: at})
+	}
+	beat(nowMS)
+	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityCritical})
+	expect("critical export", nowMS, SiteStatusCritical)
+	beat(nowMS + 1)
+	expect("heartbeat after a critical export", nowMS+1, SiteStatusCritical)
+	reg.UpsertPosture("node-a", SiteNodePosture{BrokerHardening: &SiteNodeBrokerPosture{Available: true}})
+	expect("posture without a severity", nowMS+1, SiteStatusCritical)
+	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityOK})
+	beat(nowMS + 2)
+	expect("a later ok export", nowMS+2, SiteStatusHealthy)
+
+	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityUnknown})
+	if evicted := reg.EvictStale(nowMS+100_000, 5000); len(evicted) != 1 {
+		t.Fatalf("a silent node whose export read unknown should be evicted, got %v", evicted)
+	}
+	beat(nowMS + 100_001)
+	expect("a heartbeat after eviction", nowMS+100_001, SiteStatusDegraded)
+	if got := reg.Snapshot()[0].ExportSeverity; got != ExportSeverityUnknown {
+		t.Fatalf("export severity after eviction %q, want unknown", got)
+	}
+}
+
+// TestASilentNodeWhoseExportReadCriticalStaysCritical lets a node whose
+// heartbeats were healthy but whose export read critical go silent: it is
+// retained, reported once, and projected stale and critical.
+func TestASilentNodeWhoseExportReadCriticalStaysCritical(t *testing.T) {
+	reg := NewRegistry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000, GatewaySeen: 1000})
+	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityCritical})
+	evicted, retained := reg.EvictStaleRetainingCritical(100_000, 5000)
+	if len(evicted) != 0 || len(retained) != 1 {
+		t.Fatalf("evicted %v retained %v, want the node retained", evicted, retained)
+	}
+	if _, again := reg.EvictStaleRetainingCritical(200_000, 5000); len(again) != 0 {
+		t.Fatalf("a silence is reported once, got %v", again)
+	}
+	h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
+		Project(time.UnixMilli(200_000), healthyGateway())
+	if n := h.Nodes[0]; n.Status != SiteStatusCritical || !n.Stale || h.Status != SiteStatusCritical {
+		t.Fatalf("silent node %+v, site %q; want stale and critical", n, h.Status)
+	}
+}

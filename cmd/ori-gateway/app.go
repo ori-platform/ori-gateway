@@ -1049,6 +1049,11 @@ func evictStaleRuntimeNodes(
 				logger.Warn("runtime node heartbeat stale", "device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
 			}
 			for _, node := range retained {
+				if node.Status != site.NodeStatusCritical {
+					logger.Error("runtime node silent after a critical health export; kept critical until its export reads otherwise",
+						"device_id", node.DeviceID, "gateway_seen_ms", node.GatewaySeen, "last_seen_ms", node.LastSeenMS)
+					continue
+				}
 				logger.Error("runtime node silent after a critical heartbeat; kept critical until it reports again",
 					"device_id", node.DeviceID, "gateway_seen_ms", node.GatewaySeen, "last_seen_ms", node.LastSeenMS)
 			}

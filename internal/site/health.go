@@ -55,8 +55,9 @@ type SiteNodePosture struct {
 	// the gateway read it under gateway-api/v2: ok, degraded, critical or
 	// unknown. It only raises the node's status, critical to critical and
 	// anything else but ok to degraded, and never lowers it. Empty means no
-	// export has been read. It is not itself a member of the projection,
-	// whose posture members gateway-api/v2 lists.
+	// export has been read. The registry keeps it for the node across
+	// heartbeats (NodeHeartbeat.ExportSeverity). It is not itself a member of
+	// the projection, whose posture members gateway-api/v2 lists.
 	ExportSeverity  string                      `json:"-"`
 	BrokerHardening *SiteNodeBrokerPosture      `json:"broker_hardening,omitempty"`
 	Encryption      *SiteNodeEncryptionPosture  `json:"encryption,omitempty"`
@@ -71,15 +72,12 @@ const (
 	ExportSeverityUnknown  = "unknown"
 )
 
-// exportSeverityFloor reads a posture's export severity into the projection's
+// exportSeverityFloor reads a node's export severity into the projection's
 // order. An export that read critical is critical; one that read anything but
 // ok, unknown included, is degraded, so a severity the gateway could not read
 // is never healthy. No export read raises nothing.
-func exportSeverityFloor(posture *SiteNodePosture) int {
-	if posture == nil {
-		return severityHealthy
-	}
-	switch posture.ExportSeverity {
+func exportSeverityFloor(severity string) int {
+	switch severity {
 	case "", ExportSeverityOK:
 		return severityHealthy
 	case ExportSeverityCritical:
@@ -258,7 +256,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 		if stale {
 			status = max(status, severityDegraded)
 		}
-		status = max(status, exportSeverityFloor(n.Posture))
+		status = max(status, exportSeverityFloor(n.ExportSeverity))
 		if n.Evidence != nil &&
 			(n.Evidence.TruncationSuspected || n.Evidence.HeadRegressed || !n.Evidence.Available) {
 			status = max(status, severityDegraded)
