@@ -53,13 +53,16 @@ it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
 a request it refuses, malformed, unauthenticated or not fresh, neither counts
 nor resets the count, so no sender can end the gateway by sending junk. A
 heartbeat that the run's own stop interrupts, or that the signing clock the
-stop has closed refuses, is not a failure.
+stop has closed refuses, is not a failure, and neither is a reasoning reply
+the stop refuses, by cancelling it or closing the signing clock, so a clean
+stop is never reported as a failure.
 Verified by `TestHeartbeatFailureLimit`,
 `TestGatewayHeartbeatFailureReturnsError`,
 `TestMainEscalatesRepeatedRequestHandlerFailures`,
 `TestMalformedReasoningRequestsNeverStopTheGateway`,
-`TestAPublishTheStopInterruptsIsNotAFailure`, and
-`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`.
+`TestAPublishTheStopInterruptsIsNotAFailure`,
+`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`, and
+`TestAReplyTheStopRefusesIsNotADeliveryFailure`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or

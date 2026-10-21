@@ -723,6 +723,11 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			if !errors.Is(err, dispatcher.ErrPublishResponse) {
 				return
 			}
+			// A reply the run's own stop refused, by cancelling it or by
+			// closing the signing clock, is not a delivery failure.
+			if runCtx.Err() != nil || errors.Is(err, mqttauth.ErrSigningClockClosed) {
+				return
+			}
 			requestFailureMu.Lock()
 			requestFailures++
 			failures := requestFailures

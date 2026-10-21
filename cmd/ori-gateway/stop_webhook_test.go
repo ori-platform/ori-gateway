@@ -279,3 +279,94 @@ func TestShutdownJoinsAnAdmittedWebhookRequest(t *testing.T) {
 		t.Fatal("runGateway did not return once the admitted request was released")
 	}
 }
+
+// cancelAwareProvider answers every request at once, except one it holds
+// until the run cancels it.
+type cancelAwareProvider struct {
+	fakeProvider
+	hold, held chan struct{}
+}
+
+func (p *cancelAwareProvider) Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
+	select {
+	case <-p.hold:
+		close(p.held)
+		<-ctx.Done()
+		return contracts.ReasoningResponse{}, ctx.Err()
+	default:
+	}
+	return p.fakeProvider.Reason(ctx, req)
+}
+
+// joinedDisconnectBroker waits, before it disconnects, until a callback the
+// test names has returned, so runGateway decides what to report only after
+// that callback has counted, or not, its reply.
+type joinedDisconnectBroker struct {
+	*fakeBroker
+	joined <-chan struct{}
+}
+
+func (b *joinedDisconnectBroker) Disconnect(ctx context.Context) error {
+	select {
+	case <-b.joined:
+	case <-time.After(5 * time.Second):
+	}
+	return b.fakeBroker.Disconnect(ctx)
+}
+
+// TestAReplyTheStopRefusesIsNotADeliveryFailure fails one reply short of the
+// request failure limit, holds a later request in the provider, and stops
+// the gateway: the held request's reply is refused by the stop, its context
+// cancelled and its signing clock closed, and that is not counted, so the
+// clean stop returns nil rather than the escalation (GW-6).
+func TestAReplyTheStopRefusesIsNotADeliveryFailure(t *testing.T) {
+	g := newStallingGateway(t, filepath.Join(t.TempDir(), "gateway-state"), false)
+	g.deps.loadConfig = func(string) (config.Config, error) { return g.cfg, nil }
+	fp := &cancelAwareProvider{fakeProvider: fakeProvider{healthy: true}, hold: make(chan struct{}), held: make(chan struct{})}
+	g.deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return fp, nil }
+	handled := make(chan struct{})
+	b := &joinedDisconnectBroker{fakeBroker: newFakeBroker(), joined: handled}
+	b.publishErr = errors.New("reply not delivered")
+	g.deps.newBroker = func(broker.Options) (brokerClient, error) { return b, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", g.deps) }()
+	waitUntil(t, "every subscription", func() bool { return b.handlerFor("ori/dev-01/runtime/heartbeat") != nil })
+	handler := b.handlerFor(contracts.GatewayReasoningRequestTopicFilter)
+	request := func(i int) []byte {
+		req := map[string]any{"request_id": fmt.Sprintf("held-%d", i), "device_id": "dev-01", "sensor_type": "current_clamp",
+			"trigger_name": "overcurrent", "prompt": "Explain anomaly.", "action_tier_hint": "C", "timeout_ms": 1000}
+		auth, err := mqttauth.Sign(req, contracts.ReasoningRequestMessageType, "dev-01", req["request_id"].(string), g.wallMS.Load(), "runtime-gateway-envelope-secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		req["auth"] = auth
+		raw, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	for i := range defaultRequestFailureLimit - 1 {
+		handler("ori/dev-01/reasoning/request", request(i))
+	}
+	b.mu.Lock()
+	b.publishErr = nil
+	b.mu.Unlock()
+	close(fp.hold)
+	go func() {
+		defer close(handled)
+		handler("ori/dev-01/reasoning/request", request(defaultRequestFailureLimit))
+	}()
+	<-fp.held
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a clean stop with a request in flight = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gateway did not stop")
+	}
+}
