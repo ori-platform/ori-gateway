@@ -616,6 +616,7 @@ first more than 300,000 ms ahead of the wall clock is logged as a warning. Verif
 `TestALoggerThatBlocksNeverHoldsUpSigning`,
 `TestLogLinesKeepTheOrderTheyWereDecidedIn`,
 `TestLogLinesBehindABlockedLoggerAreBounded`,
+`TestTheClocksRecordsHonourTheLoggersLevel`,
 `TestTheAheadWarningIsAtThreeHundredThousandMilliseconds`,
 `TestNoMarkReachesTheCeilingNearIt`,
 `TestAJumpPastTheReservationReservesAhead`,

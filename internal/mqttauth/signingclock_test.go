@@ -605,9 +605,9 @@ func TestTheValueOnePastAReservationIsPersisted(t *testing.T) {
 	restarted.next(t, durableClock(t, wall, restarted, nil))
 }
 
-// TestAClosedClockRefusesToSign closes the clock and then asks for a value
-// past its reservation: it is refused, nothing reaches the mark, and the
-// refusal is logged.
+// TestAClosedClockRefusesToSign closes the clock and then asks for values
+// past its reservation: each is refused, nothing reaches the mark, and the
+// refusal is logged once.
 func TestAClosedClockRefusesToSign(t *testing.T) {
 	wall := newTestWall()
 	mark := newMemMark(t, wall)
@@ -616,14 +616,16 @@ func TestAClosedClockRefusesToSign(t *testing.T) {
 	clock.Close()
 	stored := mark.mark()
 	wall.add(time.Minute)
-	if _, err := clock.Next(); !errors.Is(err, ErrSigningClockClosed) {
-		t.Fatalf("a closed clock signed: %v", err)
+	for range 5 {
+		if _, err := clock.Next(); !errors.Is(err, ErrSigningClockClosed) {
+			t.Fatalf("a closed clock signed: %v", err)
+		}
 	}
 	if mark.mark() != stored {
 		t.Fatal("a closed clock wrote its mark")
 	}
-	if waitLogs(t, logs, "signing clock is stopped", 1) != 1 {
-		t.Fatalf("the refusal was not logged:\n%s", logs.String())
+	if n := waitLogs(t, logs, "signing clock is stopped", 1); n != 1 {
+		t.Fatalf("%d refusals logged for five calls, want one:\n%s", n, logs.String())
 	}
 }
 
@@ -1551,5 +1553,27 @@ func TestLogLinesBehindABlockedLoggerAreBounded(t *testing.T) {
 		if late := records[i].at.Sub(decided); late > 100*time.Millisecond {
 			t.Fatalf("record %d stamped %v after it was decided, want the time it was decided", i, late)
 		}
+	}
+}
+
+// TestTheClocksRecordsHonourTheLoggersLevel logs through a handler at Warn
+// while an episode opens and closes: the warning is written and the Info
+// recovery line is not, since the drainer asks the handler first.
+func TestTheClocksRecordsHonourTheLoggersLevel(t *testing.T) {
+	timers := useFakeTimers(t)
+	wall := newTestWall()
+	mark := newMemMark(t, wall)
+	logs := &syncBuffer{}
+	clock := durableClock(t, wall, mark, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	mark.setFail(true)
+	wall.add(time.Hour)
+	mark.next(t, clock)
+	mark.setFail(false)
+	recoverEpisode(t, timers, clock)
+	if waitLogs(t, logs, "could not be persisted", 1) != 1 {
+		t.Fatalf("the episode warning was not written:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "persisted again") {
+		t.Fatalf("an Info record was written through a handler at Warn:\n%s", logs.String())
 	}
 }
