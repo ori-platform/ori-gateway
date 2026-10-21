@@ -541,3 +541,31 @@ func TestALateExportReadingAfterEvictionIsKept(t *testing.T) {
 		t.Fatalf("a posture recorded while the node was not registered was attached: %+v", h.Nodes[0].Posture)
 	}
 }
+
+// TestAnUnobservedNodeKeepsItsRecordedExportSeverity evicts a node and then
+// records a late export reading with no heartbeat after it: the unobserved
+// node is critical when the reading is critical, and degraded otherwise, ok
+// included, since it is still unobserved.
+func TestAnUnobservedNodeKeepsItsRecordedExportSeverity(t *testing.T) {
+	for severity, want := range map[string]string{
+		ExportSeverityCritical: SiteStatusCritical,
+		ExportSeverityUnknown:  SiteStatusDegraded,
+		ExportSeverityDegraded: SiteStatusDegraded,
+		ExportSeverityOK:       SiteStatusDegraded,
+	} {
+		reg := NewRegistry()
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000, GatewaySeen: 1000})
+		if evicted := reg.EvictStale(100_000, 5000); len(evicted) != 1 {
+			t.Fatalf("expected the node evicted, got %v", evicted)
+		}
+		reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: severity})
+		h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a", "node-b"}, NodeTTLMS: 5000}).
+			Project(time.UnixMilli(100_001), healthyGateway())
+		if n := h.Nodes[0]; n.Status != want || n.GatewayObserved || !n.Stale || h.Status != want {
+			t.Errorf("late %s reading: node %+v site %q, want %q, unobserved and stale", severity, n, h.Status, want)
+		}
+		if n := h.Nodes[1]; n.Status != SiteStatusDegraded {
+			t.Errorf("a device with no reading: %q, want degraded", n.Status)
+		}
+	}
+}

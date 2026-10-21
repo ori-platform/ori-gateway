@@ -225,7 +225,7 @@ func NewProjector(registry *Registry, opts ProjectOptions) *Projector {
 // Project returns a point-in-time SiteHealth snapshot.
 func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	nowMS := now.UnixMilli()
-	snapshot := p.registry.Snapshot()
+	snapshot, exportSeverity := p.registry.snapshotWithExportSeverity()
 	observed := make(map[string]NodeHeartbeat, len(snapshot))
 	for _, n := range snapshot {
 		observed[n.DeviceID] = n
@@ -235,9 +235,13 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	for _, deviceID := range p.opts.ExpectedDeviceIDs {
 		n, seen := observed[deviceID]
 		if !seen {
+			// An unobserved node is degraded, and critical when its health
+			// export last read critical: a reading recorded before or after
+			// its eviction is never folded by the node's silence.
+			status := max(severityDegraded, exportSeverityFloor(exportSeverity[deviceID]))
 			nodes = append(nodes, SiteNode{
 				DeviceID:        deviceID,
-				Status:          SiteStatusDegraded,
+				Status:          siteStatusName(status),
 				GatewayObserved: false,
 				Stale:           true,
 			})

@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,18 +51,32 @@ type exportRuntime struct {
 	encrypt  bool
 	mu       sync.Mutex
 	handlers map[string]broker.MessageHandler
-	item     any
-	// fail answers the health export with a runtime error.
-	fail atomic.Bool
-	// served counts the health exports answered.
-	served atomic.Int64
+	// item is what the health export carries, or, when fail is set, a
+	// runtime error instead. answer switches both at once, starting a new
+	// generation; served counts the health exports answered in the current
+	// generation, so an export that read the previous answer never counts.
+	item       any
+	fail       bool
+	generation int
+	served     int
 }
 
-// setItem sets the item the health export carries from now on.
-func (r *exportRuntime) setItem(item any) {
+// answer sets what every health export answered from now on carries: item,
+// or a runtime error when fail is set.
+func (r *exportRuntime) answer(item any, fail bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.item = item
+	r.item, r.fail = item, fail
+	r.generation++
+	r.served = 0
+}
+
+// servedSinceAnswer reports how many health exports were answered with the
+// current answer.
+func (r *exportRuntime) servedSinceAnswer() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.served
 }
 
 func (r *exportRuntime) Subscribe(_ context.Context, topic string, _ byte, handler broker.MessageHandler) error {
@@ -90,21 +103,27 @@ func (r *exportRuntime) Publish(_ context.Context, _ string, _ byte, _ bool, pay
 		r.t.Errorf("export request not signed: %v", err)
 		return err
 	}
-	items := []any{}
-	if req.ExportType == "health" {
-		r.mu.Lock()
-		items = []any{r.item}
-		r.mu.Unlock()
-	}
 	resp := map[string]any{
 		"request_id": req.RequestID, "device_id": req.DeviceID, "export_type": req.ExportType,
-		"items": items, "next_page_token": "", "complete": true, "error": nil,
-	}
-	if req.ExportType == "health" && r.fail.Load() {
-		resp["items"], resp["error"] = []any{}, "health unavailable"
+		"items": []any{}, "next_page_token": "", "complete": true, "error": nil,
 	}
 	if req.ExportType == "health" {
-		defer r.served.Add(1)
+		r.mu.Lock()
+		item, fail, generation := r.item, r.fail, r.generation
+		r.mu.Unlock()
+		resp["items"] = []any{item}
+		if fail {
+			resp["items"], resp["error"] = []any{}, "health unavailable"
+		}
+		// Counted once the response has been handed to the client, and only
+		// while its answer is still the current one.
+		defer func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.generation == generation {
+				r.served++
+			}
+		}()
 	}
 	if req.ExportType != "health" && r.encrypt {
 		encryptor, err := mqttauth.NewEncryptor(healthTransitionSecret)
@@ -211,12 +230,12 @@ func TestHealthTransitionReachesSiteHealthAndTheWeeklyReport(t *testing.T) {
 					t.Fatal(err)
 				}
 				if tc.Latched {
-					runtime.setItem(marker)
+					runtime.answer(marker, false)
 					if _, err := rc.Health(context.Background(), runtimeclient.HealthRequest{DeviceID: tc.RequestedDeviceID}); err != nil {
 						t.Fatal(err)
 					}
 				}
-				runtime.setItem(decodeVectorItem(t, tc.Item))
+				runtime.answer(decodeVectorItem(t, tc.Item), false)
 
 				registry := site.NewRegistry()
 				registry.Upsert(site.NodeHeartbeat{DeviceID: tc.RequestedDeviceID, Status: site.NodeStatusHealthy, LastSeenMS: now.UnixMilli()})
@@ -320,10 +339,11 @@ func TestACriticalExportSurvivesHeartbeatsAndAFailedFetch(t *testing.T) {
 	}
 	fetch := func(item json.RawMessage, fail bool) {
 		t.Helper()
-		runtime.fail.Store(fail)
+		var decoded any
 		if item != nil {
-			runtime.setItem(decodeVectorItem(t, item))
+			decoded = decodeVectorItem(t, item)
 		}
+		runtime.answer(decoded, fail)
 		fetchAndUpsertPosture(context.Background(), rc, registry, "dev-01", logger)
 	}
 	expect := func(step, want string) {
@@ -442,7 +462,7 @@ func TestARunningGatewayKeepsACriticalExportThroughAFailedFetch(t *testing.T) {
 	registry := site.NewRegistry()
 	deps.newSiteRegistry = func() *site.Registry { return registry }
 	runtime := &exportRuntime{t: t, now: now, handlers: map[string]broker.MessageHandler{}}
-	runtime.setItem(decodeVectorItem(t, items["later_critical_true"]))
+	runtime.answer(decodeVectorItem(t, items["later_critical_true"]), false)
 	deps.newRuntimeClient = func(_ brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
 		return runtimeclient.NewMQTTClient(runtime, append(opts, instantExportPacing())...)
 	}
@@ -482,15 +502,15 @@ func TestARunningGatewayKeepsACriticalExportThroughAFailedFetch(t *testing.T) {
 		hb.Auth = &auth
 		handler("ori/dev-01/runtime/heartbeat", mustJSON(t, hb))
 	}
-	// beatUntilFetched sends heartbeats until one starts a fetch the runtime
-	// answers: a heartbeat while a fetch is in flight starts none.
-	beatUntilFetched := func(what string) {
+	// beatUntilFetched sends heartbeats until the runtime has answered n
+	// fetches with its current answer: a heartbeat while a fetch is in flight
+	// starts none, and a fetch that read an earlier answer never counts.
+	beatUntilFetched := func(what string, n int) {
 		t.Helper()
-		before := runtime.served.Load()
 		waitFor(what, func() bool {
 			beat()
 			time.Sleep(5 * time.Millisecond)
-			return runtime.served.Load() > before
+			return runtime.servedSinceAnswer() >= n
 		})
 	}
 	severity := func() string {
@@ -509,18 +529,18 @@ func TestARunningGatewayKeepsACriticalExportThroughAFailedFetch(t *testing.T) {
 		}
 	}
 
-	beatUntilFetched("a critical export")
+	beatUntilFetched("a critical export", 1)
 	waitFor("the critical reading", func() bool { return severity() == site.ExportSeverityCritical })
 	expect("critical export", site.SiteStatusCritical)
 
-	runtime.fail.Store(true)
-	beatUntilFetched("a failed fetch")
-	beat()
-	expect("heartbeats and a failed fetch after the critical export", site.SiteStatusCritical)
+	// A second failed fetch starts only once the first has finished, so
+	// whatever the first did to the registry has landed.
+	runtime.answer(nil, true)
+	beatUntilFetched("two failed fetches", 2)
+	expect("heartbeats and failed fetches after the critical export", site.SiteStatusCritical)
 
-	runtime.fail.Store(false)
-	runtime.setItem(decodeVectorItem(t, items["producer_later_exact"]))
-	beatUntilFetched("a later ok export")
+	runtime.answer(decodeVectorItem(t, items["producer_later_exact"]), false)
+	beatUntilFetched("a later ok export", 1)
 	waitFor("the ok reading", func() bool { return severity() == site.ExportSeverityOK })
 	expect("a later ok export", site.SiteStatusHealthy)
 

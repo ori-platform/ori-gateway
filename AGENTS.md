@@ -283,12 +283,15 @@ projected member. The registry keeps it through every heartbeat, a failed
 fetch and eviction, and records a reading that arrives while the node is not
 registered; only a later export reading changes it, and a node whose
 export last read critical is retained on silence like a critical heartbeat.
+An expected node the registry does not hold is degraded, and critical when
+its recorded export severity is critical.
 Verified by `TestCriticalHeartbeatKeptThroughGetHealth`,
 `TestExportSeverityOnlyRaisesANode`,
 `TestExportSeverityOutlivesEveryHeartbeat`,
 `TestASilentNodeWhoseExportReadCriticalStaysCritical`,
 `TestACriticalExportSurvivesHeartbeatsAndAFailedFetch`,
 `TestALateExportReadingAfterEvictionIsKept`,
+`TestAnUnobservedNodeKeepsItsRecordedExportSeverity`,
 `TestEvictStaleRuntimeNodesReportsASilentCriticalExport`,
 `TestARunningGatewayKeepsACriticalExportThroughAFailedFetch`,
 `TestCriticalNodeNeverFoldedBelowCritical`,

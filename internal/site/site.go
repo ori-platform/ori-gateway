@@ -3,7 +3,10 @@
 
 package site
 
-import "sync"
+import (
+	"maps"
+	"sync"
+)
 
 type NodeHeartbeat struct {
 	DeviceID       string   `json:"device_id"`
@@ -79,6 +82,11 @@ func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
 func (r *Registry) Snapshot() []NodeHeartbeat {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.snapshotLocked()
+}
+
+// snapshotLocked is Snapshot, with r.mu held.
+func (r *Registry) snapshotLocked() []NodeHeartbeat {
 	out := make([]NodeHeartbeat, 0, len(r.nodes))
 	for _, hb := range r.nodes {
 		// Every reference-type field must be copied here, not just the
@@ -95,6 +103,15 @@ func (r *Registry) Snapshot() []NodeHeartbeat {
 		out = append(out, hb)
 	}
 	return out
+}
+
+// snapshotWithExportSeverity returns Snapshot and a copy of every recorded
+// export severity, taken under one lock, so a projection reads both at the
+// same moment, the severity of a device with no node included.
+func (r *Registry) snapshotWithExportSeverity() ([]NodeHeartbeat, map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotLocked(), maps.Clone(r.exportSeverity)
 }
 
 // cloneStrings copies a string slice, preserving nil. The nil/empty

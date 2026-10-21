@@ -676,7 +676,10 @@ members (`broker_hardening`, `encryption`, `alert_outbox`) are still replaced
 by each heartbeat and filled again by the next fetch. So a node whose export
 read `critical` stays `critical` while later exports fail, with only `WARN
 runtime health fetch failed for posture update` in the log, until an export
-reads otherwise or the gateway restarts.
+reads otherwise or the gateway restarts. A critical reading that arrives
+after its node was dropped for silence is kept too: the node shows unobserved,
+`stale` and `critical`, and stays `critical` when it reports again, until an
+export reads otherwise.
 
 - `WARN runtime health export severity unreadable; reported unknown`, with the
   `device_id` and a `fault` naming why, such as `member_absent:uptime_s`,
