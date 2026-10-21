@@ -316,9 +316,14 @@ func instantClock() (func() time.Time, func(context.Context, time.Duration) erro
 // instantPacing gives a client the instant pacing clock.
 func instantPacing() MQTTClientOption { return WithExportPacingClock(instantClock()) }
 
+// productionPacingClock is the pacing clock production starts every pacer
+// with, kept so a test can check it.
+var productionPacingClock = pacingClock
+
 // TestMain gives every client a test builds the instant pacing clock unless
 // the test chooses another: only the pacing tests spend paced time.
 func TestMain(m *testing.M) {
+	productionPacingClock = pacingClock
 	pacingClock = instantClock
 	os.Exit(m.Run())
 }

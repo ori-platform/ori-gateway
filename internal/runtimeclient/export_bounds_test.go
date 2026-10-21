@@ -406,24 +406,63 @@ func TestASharedSubscribeThatExpiresEndsEveryWaiterAsATimeout(t *testing.T) {
 	}
 }
 
-// TestPacedExportsSurviveArrivalJitterAtTheRuntime paces a long run of
-// requests, with idle gaps that let the burst refill, and replays their send
-// times as the runtime receives them: each delayed by up to 100 ms, in order,
-// into the runtime's own bucket of 2 a second and burst 10, starting empty as
-// after a burst just before a gateway restart. None is dropped, since the
-// runtime judges arrivals, not sends.
-func TestPacedExportsSurviveArrivalJitterAtTheRuntime(t *testing.T) {
-	now, sleep := instantClock()
-	pacer := &exportPacer{now: now, sleep: sleep, rate: exportRatePerSecond, burst: exportBurst, buckets: map[string]*paceBucket{}}
+// pacedSends drives n health exports to edge-1 through a client built with
+// the given options and returns the pacing clock's reading at each publish,
+// with idle gaps that let the burst refill every 30 requests, and the reading
+// before the first.
+func pacedSends(t *testing.T, n int, now func() time.Time, sleep func(context.Context, time.Duration) error, opts ...MQTTClientOption) (time.Time, []time.Time) {
+	t.Helper()
+	b := newFakeBroker()
 	var sent []time.Time
-	for i := range 120 {
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Error(err)
+			return
+		}
+		sent = append(sent, now())
+		b.respond(req.DeviceID, req.RequestID, map[string]any{"export_type": "health", "items": []any{map[string]any{"device_id": req.DeviceID}}})
+	}
+	ids := 0
+	opts = append([]MQTTClientOption{WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(time.Hour),
+		WithRequestIDFunc(func() (string, error) { ids++; return fmt.Sprintf("paced-%d", ids), nil })}, opts...)
+	c, err := NewMQTTClient(b, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := now()
+	for i := range n {
 		if i%30 == 29 {
 			_ = sleep(context.Background(), 10*time.Second)
 		}
-		if err := pacer.acquire(context.Background(), "edge-1"); err != nil {
-			t.Fatal(err)
+		if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
+			t.Fatalf("export %d = %v", i, err)
 		}
-		sent = append(sent, now())
+	}
+	if len(sent) != n {
+		t.Fatalf("%d requests published, want %d", len(sent), n)
+	}
+	return start, sent
+}
+
+// TestPacedExportsSurviveArrivalJitterAtTheRuntime sends a long run of
+// exports through a client, with idle gaps that let the burst refill. Every
+// send is within 1.6 a second and burst 8, starting empty. Replayed as the
+// runtime receives them, each delayed by up to 100 ms, in order, into the
+// runtime's own bucket of 2 a second and burst 10, starting empty as after a
+// burst just before a gateway restart, none is dropped, since the runtime
+// judges arrivals, not sends.
+func TestPacedExportsSurviveArrivalJitterAtTheRuntime(t *testing.T) {
+	now, sleep := instantClock()
+	start, sent := pacedSends(t, 120, now, sleep, WithExportPacingClock(now, sleep))
+	tokens, last := 0.0, start
+	for i, at := range sent {
+		tokens = min(8, tokens+at.Sub(last).Seconds()*1.6)
+		last = at
+		if tokens < 1-1e-9 {
+			t.Fatalf("request %d was sent beyond 1.6 a second and burst 8", i)
+		}
+		tokens--
 	}
 	rng := rand.New(rand.NewPCG(7, 11))
 	for run := range 500 {
@@ -435,7 +474,7 @@ func TestPacedExportsSurviveArrivalJitterAtTheRuntime(t *testing.T) {
 			}
 		}
 		tokens := 0.0
-		last := arrivals[0].Add(-time.Duration(float64(time.Second) / exportRatePerSecond))
+		last := arrivals[0].Add(-time.Duration(float64(time.Second) / 1.6))
 		for i, at := range arrivals {
 			tokens = min(10, tokens+at.Sub(last).Seconds()*2)
 			last = at
@@ -444,6 +483,18 @@ func TestPacedExportsSurviveArrivalJitterAtTheRuntime(t *testing.T) {
 			}
 			tokens--
 		}
+	}
+}
+
+// TestProductionPacingWaitsOnTheRealClock builds a client with no pacing
+// option on the clock production uses: the first request to a device, whose
+// bucket starts empty, waits about one interval at 1.6 a second.
+func TestProductionPacingWaitsOnTheRealClock(t *testing.T) {
+	pacingClock = productionPacingClock
+	t.Cleanup(func() { pacingClock = instantClock })
+	start, sent := pacedSends(t, 1, time.Now, sleepContext)
+	if waited := sent[0].Sub(start); waited < 600*time.Millisecond {
+		t.Fatalf("the first request waited %v, want about 625ms on the real clock", waited)
 	}
 }
 

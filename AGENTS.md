@@ -552,9 +552,11 @@ Export Auth Envelope). Verified by
 `TestExportsArePacedPerDeviceAtTheRuntimesRate`,
 `TestAPacingWaitPastTheBoundEndsTheExport`,
 `TestPacedExportsSurviveArrivalJitterAtTheRuntime`,
+`TestProductionPacingWaitsOnTheRealClock`,
 `TestPacingNeverSpinsOnAnInexactRate`,
 `TestAResponseHandedOverInTimeCompletesTheExport`,
-`TestEndingTheLifetimeAbandonsAStalledSubscribe` and
+`TestEndingTheLifetimeAbandonsAStalledSubscribe`,
+`TestTheRuntimeExportClientEndsWithTheRun` and
 `TestAWeeklyReportForManySensorsStaysWithinTheRuntimeExportRate`.
 
 24. `GW-24` Envelope freshness and replay follow gateway-api/v2.
