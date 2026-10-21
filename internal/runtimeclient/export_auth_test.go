@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,10 +21,10 @@ import (
 const testExportWait = 100 * time.Millisecond
 
 func healthItems(deviceID, requestID string) map[string]any {
-	return map[string]any{
+	return withEnvelope(map[string]any{
 		"device_id": deviceID, "request_id": requestID, "export_type": "health", "complete": true,
 		"items": []any{map[string]any{"device_id": deviceID}},
-	}
+	})
 }
 
 func pendingCount(c *MQTTClient) int {
@@ -229,7 +230,7 @@ func TestRepeatedForgeriesNeverExtendTheBound(t *testing.T) {
 // request's wait bounded the export as a whole is bounded.
 func TestAnExportRequestsABoundedNumberOfPages(t *testing.T) {
 	b := newFakeBroker()
-	c, err := NewMQTTClient(b, WithExportWait(testExportWait), WithLogger(slog.New(slog.DiscardHandler)))
+	c, err := NewMQTTClient(b, WithExportWait(testExportWait), WithLogger(slog.New(slog.DiscardHandler)), instantPacing())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,4 +298,16 @@ func TestAResponseOnAnotherDevicesTopicNeverAnswers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// instantPacing gives the export pacer a clock that a wait advances at once,
+// so a test that is not about pacing issues requests at the paced rate
+// without spending real time.
+func instantPacing() MQTTClientOption {
+	var mu sync.Mutex
+	at := time.Unix(1_787_000_000, 0)
+	return WithExportPacingClock(
+		func() time.Time { mu.Lock(); defer mu.Unlock(); return at },
+		func(_ context.Context, d time.Duration) error { mu.Lock(); at = at.Add(d); mu.Unlock(); return nil },
+	)
 }

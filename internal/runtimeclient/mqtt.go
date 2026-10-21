@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	canonicaljson "github.com/ori-platform/ori-canonicaljson"
+
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -34,7 +36,19 @@ const (
 	// a verified response arrives (gateway-api/v2 Export Auth Envelope). With
 	// maxExportPages it bounds an export as a whole.
 	defaultExportWait = 30 * time.Second
+	// exportRatePerSecond and exportBurst pace export requests to each
+	// device at the rate its runtime admits them (ori-runtime
+	// ori/gateway/payload_bounds.py, INGRESS_RATES): a request beyond it is
+	// dropped unanswered under gateway-api/v2 Payload Volume, which leaves
+	// the value to the runtime, and would only wait out its timeout.
+	exportRatePerSecond = 2.0
+	exportBurst         = 10
 )
+
+// exportEnvelope is every member gateway-api/v2's Runtime Export Response
+// Payload requires on an export page, validation failures included. A page
+// missing one is malformed, never complete, empty or successful.
+var exportEnvelope = []string{"request_id", "export_type", "device_id", "items", "next_page_token", "complete", "error"}
 
 type mqttBroker interface {
 	Subscribe(ctx context.Context, topic string, qos byte, handler broker.MessageHandler) error
@@ -58,11 +72,21 @@ type MQTTClient struct {
 	encryptor           *mqttauth.Encryptor
 	optionErr           error
 	now                 func() time.Time
+	pacer               *exportPacer
 
-	subscribeMu sync.Mutex
-	mu          sync.Mutex
-	pending     map[string]pendingExport
-	subscribed  map[string]bool
+	mu         sync.Mutex
+	pending    map[string]pendingExport
+	subscribed map[string]bool
+	// subscribing holds the subscribe in flight for each topic: every export
+	// to that device waits on it, each within its own remaining wait.
+	subscribing map[string]*subscribeAttempt
+}
+
+// subscribeAttempt is one subscribe to a response topic; done is closed once
+// it has ended, with err its outcome.
+type subscribeAttempt struct {
+	done chan struct{}
+	err  error
 }
 
 // MQTTClientOption customises MQTTClient construction.
@@ -112,6 +136,20 @@ func WithExportWait(wait time.Duration) MQTTClientOption {
 	}
 }
 
+// WithExportPacingClock replaces the clock export pacing reads and the wait it
+// sleeps on. It is intended for tests; production paces on the monotonic
+// clock.
+func WithExportPacingClock(now func() time.Time, sleep func(context.Context, time.Duration) error) MQTTClientOption {
+	return func(c *MQTTClient) {
+		if now != nil {
+			c.pacer.now = now
+		}
+		if sleep != nil {
+			c.pacer.sleep = sleep
+		}
+	}
+}
+
 // WithSigningClock sets the clock that issues every export request's
 // signed_at_ms; without it the client keeps its own in-process clock.
 func WithSigningClock(clock *mqttauth.SigningClock) MQTTClientOption {
@@ -150,14 +188,16 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 		return nil, fmt.Errorf("runtimeclient: broker must not be nil")
 	}
 	client := &MQTTClient{
-		broker:     b,
-		qos:        broker.QoSReasoning,
-		requestID:  randomRequestID,
-		log:        slog.Default(),
-		exportWait: defaultExportWait,
-		now:        time.Now,
-		pending:    make(map[string]pendingExport),
-		subscribed: make(map[string]bool),
+		broker:      b,
+		qos:         broker.QoSReasoning,
+		requestID:   randomRequestID,
+		log:         slog.Default(),
+		exportWait:  defaultExportWait,
+		now:         time.Now,
+		pacer:       newExportPacer(),
+		pending:     make(map[string]pendingExport),
+		subscribed:  make(map[string]bool),
+		subscribing: make(map[string]*subscribeAttempt),
 	}
 	for _, opt := range opts {
 		opt(client)
@@ -322,7 +362,7 @@ func (c *MQTTClient) exportAll(ctx context.Context, base exportRequest) ([]map[s
 	// the caller.
 	subscribeCtx, cancel := context.WithTimeoutCause(ctx, c.exportWait, ErrExportTimeout)
 	err := c.ensureResponseSubscription(subscribeCtx, base.DeviceID)
-	expired := errors.Is(context.Cause(subscribeCtx), ErrExportTimeout)
+	expired := errors.Is(context.Cause(subscribeCtx), ErrExportTimeout) || errors.Is(err, ErrExportTimeout)
 	cancel()
 	if err != nil {
 		if expired {
@@ -364,30 +404,53 @@ func (c *MQTTClient) exportAll(ctx context.Context, base exportRequest) ([]map[s
 	return nil, fmt.Errorf("runtimeclient: runtime export %s exceeded max page limit %d", base.ExportType, maxExportPages)
 }
 
+// ensureResponseSubscription subscribes to deviceID's export responses, once.
+// Each caller waits for a subscribe in flight within its own ctx, which no
+// lock and no transport window extends; a subscribe that outlives its caller
+// still completes, and the next caller finds the topic subscribed.
 func (c *MQTTClient) ensureResponseSubscription(ctx context.Context, deviceID string) error {
 	topic, err := contracts.ExportResponseTopicFilter(deviceID)
 	if err != nil {
 		return err
 	}
-
-	c.subscribeMu.Lock()
-	defer c.subscribeMu.Unlock()
-
 	c.mu.Lock()
 	if c.subscribed[topic] {
 		c.mu.Unlock()
 		return nil
 	}
-	c.mu.Unlock()
-
-	if err := c.broker.Subscribe(ctx, topic, c.qos, c.handleResponseMessage); err != nil {
-		return fmt.Errorf("runtimeclient: subscribe export response: %w", err)
+	attempt, inFlight := c.subscribing[topic]
+	if !inFlight {
+		attempt = &subscribeAttempt{done: make(chan struct{})}
+		c.subscribing[topic] = attempt
+		go c.subscribe(topic, attempt)
 	}
-
-	c.mu.Lock()
-	c.subscribed[topic] = true
 	c.mu.Unlock()
-	return nil
+	select {
+	case <-attempt.done:
+		return attempt.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// subscribe makes one subscribe to topic, bounded by the export wait, and
+// records its outcome for every caller waiting on it.
+func (c *MQTTClient) subscribe(topic string, attempt *subscribeAttempt) {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), c.exportWait, ErrExportTimeout)
+	defer cancel()
+	err := c.broker.Subscribe(ctx, topic, c.qos, c.handleResponseMessage)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.subscribing, topic)
+	switch {
+	case err != nil && errors.Is(context.Cause(ctx), ErrExportTimeout):
+		attempt.err = fmt.Errorf("%w: subscribe export response: %w", ErrExportTimeout, err)
+	case err != nil:
+		attempt.err = fmt.Errorf("runtimeclient: subscribe export response: %w", err)
+	default:
+		c.subscribed[topic] = true
+	}
+	close(attempt.done)
 }
 
 func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (exportResponse, error) {
@@ -403,13 +466,36 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	}
 	req.RequestID = requestID
 
+	// Paced to the rate the device's runtime admits, before the request's
+	// own wait starts; the pacing wait is bounded the same way.
+	paceCtx, cancelPace := context.WithTimeoutCause(ctx, c.exportWait, ErrExportTimeout)
+	err = c.pacer.acquire(paceCtx, req.DeviceID)
+	paceExpired := errors.Is(context.Cause(paceCtx), ErrExportTimeout)
+	cancelPace()
+	if err != nil {
+		if paceExpired {
+			c.log.Warn("runtime export request not sent within the wait bound at the runtime's admission rate",
+				"device_id", req.DeviceID, "export_type", req.ExportType, "wait", c.exportWait)
+			return exportResponse{}, fmt.Errorf("%w: pacing %s after %s", ErrExportTimeout, req.ExportType, c.exportWait)
+		}
+		return exportResponse{}, err
+	}
+
+	// The wait is bounded from publishing the request, the publish included,
+	// and nothing received extends it. On expiry the request ends as failed,
+	// is logged, and its pending state is released by the deferred removal; a
+	// later attempt is a new request, newly signed (gateway-api/v2 Export
+	// Auth Envelope). A response is handed over only while the wait has not
+	// expired, decided in the step that hands it over.
+	waitCtx, cancel := context.WithTimeoutCause(ctx, c.exportWait, ErrExportTimeout)
+	defer cancel()
 	responseCh := make(chan exportResult, 1)
 	c.mu.Lock()
 	if _, exists := c.pending[requestID]; exists {
 		c.mu.Unlock()
 		return exportResponse{}, fmt.Errorf("runtimeclient: duplicate request_id %q", requestID)
 	}
-	c.pending[requestID] = pendingExport{ch: responseCh, req: req}
+	c.pending[requestID] = pendingExport{ch: responseCh, req: req, wait: waitCtx}
 	c.mu.Unlock()
 	defer c.removePending(requestID)
 
@@ -424,13 +510,6 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	if err != nil {
 		return exportResponse{}, err
 	}
-	// The wait is bounded from publishing the request, the publish included,
-	// and nothing received extends it. On expiry the request ends as failed,
-	// is logged, and its pending state is released by the deferred removal; a
-	// later attempt is a new request, newly signed (gateway-api/v2 Export
-	// Auth Envelope).
-	waitCtx, cancel := context.WithTimeoutCause(ctx, c.exportWait, ErrExportTimeout)
-	defer cancel()
 	timedOut := func() (exportResponse, error) {
 		if !errors.Is(context.Cause(waitCtx), ErrExportTimeout) {
 			return exportResponse{}, ctx.Err()
@@ -450,6 +529,8 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	case <-waitCtx.Done():
 		return timedOut()
 	case result := <-responseCh:
+		// Only a response handed over before expiry reaches here: deliver
+		// decides that in the same step.
 		if result.err != nil {
 			return exportResponse{}, result.err
 		}
@@ -531,11 +612,17 @@ func (c *MQTTClient) refusedByMemberRule(err error) bool {
 }
 
 // deliver hands result to the pending request it answers, if that request is
-// still pending and not yet answered, and reports whether it did.
+// still pending, not yet answered and its wait not expired, and reports
+// whether it did. A response refused here answers nothing, so its replay key
+// is never recorded.
 func (c *MQTTClient) deliver(requestID string, ch chan exportResult, result exportResult) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.pending[requestID].ch != ch {
+	pending := c.pending[requestID]
+	if pending.ch != ch {
+		return false
+	}
+	if expired(pending.wait) {
 		return false
 	}
 	select {
@@ -588,6 +675,14 @@ func (c *MQTTClient) decodeResponsePayload(decoded map[string]any, req exportReq
 	encoded, err := json.Marshal(decoded)
 	if err != nil {
 		return exportResponse{}, err
+	}
+	// Absence is never read as complete, empty or successful: a page missing
+	// any envelope member is malformed, and the export it belongs to fails.
+	if _, err := canonicaljson.DecodeStrict(encoded, &canonicaljson.Shape{
+		Members:  contracts.DefinedMembers(contracts.FamilyExportResponse),
+		Required: exportEnvelope,
+	}); err != nil {
+		return exportResponse{}, fmt.Errorf("runtimeclient: malformed export response: %w", err)
 	}
 	var resp exportResponse
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -651,6 +746,22 @@ func (c *MQTTClient) removePending(requestID string) {
 type pendingExport struct {
 	ch  chan exportResult
 	req exportRequest
+	// wait is the request's wait, from publishing it; a response is handed
+	// over only before it expires.
+	wait context.Context
+}
+
+// expired reports whether wait has ended, or its deadline has passed though
+// its timer has not yet fired.
+func expired(wait context.Context) bool {
+	if wait == nil {
+		return false
+	}
+	if wait.Err() != nil {
+		return true
+	}
+	deadline, ok := wait.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 type exportResult struct {
@@ -1115,4 +1226,62 @@ func mapValue(m map[string]any, key string) map[string]any {
 	out := make(map[string]any, len(raw))
 	maps.Copy(out, raw)
 	return out
+}
+
+// exportPacer paces export requests to each device within the rate its
+// runtime admits: a token bucket per device, exportRatePerSecond sustained and
+// exportBurst at once.
+type exportPacer struct {
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+
+	mu      sync.Mutex
+	buckets map[string]*paceBucket
+}
+
+type paceBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newExportPacer() *exportPacer {
+	return &exportPacer{now: time.Now, sleep: sleepContext, buckets: make(map[string]*paceBucket)}
+}
+
+// acquire waits, within ctx, until deviceID may be sent one more request.
+func (p *exportPacer) acquire(ctx context.Context, deviceID string) error {
+	for {
+		p.mu.Lock()
+		now := p.now()
+		bucket, ok := p.buckets[deviceID]
+		if !ok {
+			bucket = &paceBucket{tokens: exportBurst, last: now}
+			p.buckets[deviceID] = bucket
+		}
+		if elapsed := now.Sub(bucket.last); elapsed > 0 {
+			bucket.tokens = min(exportBurst, bucket.tokens+elapsed.Seconds()*exportRatePerSecond)
+		}
+		bucket.last = now
+		if bucket.tokens >= 1 {
+			bucket.tokens--
+			p.mu.Unlock()
+			return nil
+		}
+		wait := time.Duration((1 - bucket.tokens) / exportRatePerSecond * float64(time.Second))
+		p.mu.Unlock()
+		if err := p.sleep(ctx, wait); err != nil {
+			return err
+		}
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

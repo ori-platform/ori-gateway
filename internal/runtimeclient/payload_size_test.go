@@ -76,9 +76,9 @@ func TestACancelledExportResponseAddsNoReplayState(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		response := signedExportPayload(t, map[string]any{
+		response := signedExportPayload(t, withEnvelope(map[string]any{
 			"device_id": req.DeviceID, "request_id": req.RequestID, "export_type": "action_log", "complete": true, "items": []any{},
-		}, "current-secret", now)
+		}), "current-secret", now)
 		if !pause {
 			b.respondRaw(req.DeviceID, req.RequestID, response)
 			return

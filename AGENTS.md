@@ -519,15 +519,35 @@ response topic. Every export request's wait is bounded inside the client, in
 both auth modes: from publishing the request, the publish included, with
 subscribing bounded the same way, and no message received extends it. On
 expiry the request fails with `ErrExportTimeout`, is logged, and releases its
-pending state; a later attempt is a new, newly signed request. The page count
-of one export is bounded, so no caller waits on an export without a bound
-(gateway-api/v2 Export Auth Envelope). Verified by
+pending state; a later attempt is a new, newly signed request. A response is
+handed over only while its request's wait has not expired, decided in the step
+that hands it over, so one arriving after the deadline completes nothing and
+records no replay key. One subscribe per response topic is in flight at a
+time, and every export waits on it within its own remaining bound; no lock or
+transport window extends that. Requests are paced per device at the rate the
+runtime admits export requests (2 a second, bursts of 10; ori-runtime
+`payload_bounds.py`, since gateway-api/v2 Payload Volume leaves the value to
+the runtime), and pacing is bounded like the wait. An export page missing any
+envelope member (`request_id`, `export_type`, `device_id`, `items`,
+`next_page_token`, `complete`, `error`) fails the export as malformed and is
+never read as complete, empty or successful. The page count of one export is
+bounded, so no caller waits on an export without a bound (gateway-api/v2
+Export Auth Envelope). Verified by
 `TestAForgedExportResponseLeavesTheExchangePending`,
 `TestASilentRuntimeEndsTheExportAtItsBound`,
 `TestAStalledSubscribeOrPublishEndsAtTheBound`,
 `TestRepeatedForgeriesNeverExtendTheBound`,
-`TestAResponseOnAnotherDevicesTopicNeverAnswers` and
-`TestAnExportRequestsABoundedNumberOfPages`.
+`TestAResponseOnAnotherDevicesTopicNeverAnswers`,
+`TestAnExportRequestsABoundedNumberOfPages`,
+`TestAResponseAfterTheDeadlineNeverCompletesTheExport`,
+`TestAResponseIsRefusedOnceTheDeadlineHasPassedBeforeItsTimerFires`,
+`TestConcurrentSubscribesEndWithinTheBound`,
+`TestASharedSubscribeThatExpiresEndsEveryWaiterAsATimeout`,
+`TestTheEnforcedEnvelopeIsTheContractsEnvelope`,
+`TestAnExportPageMissingAnEnvelopeMemberFailsTheExport`,
+`TestExportsArePacedPerDeviceAtTheRuntimesRate`,
+`TestAPacingWaitPastTheBoundEndsTheExport` and
+`TestAWeeklyReportForManySensorsStaysWithinTheRuntimeExportRate`.
 
 24. `GW-24` Envelope freshness and replay follow gateway-api/v2.
 Every runtime-gateway HMAC envelope the gateway verifies is checked in the

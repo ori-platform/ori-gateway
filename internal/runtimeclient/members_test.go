@@ -103,7 +103,7 @@ func TestARefusedExportPlaintextChangesNothing(t *testing.T) {
 				c.mu.Lock()
 				pendingAfterBad = len(c.pending) - len(c.pending["r"].ch)
 				c.mu.Unlock()
-				clean := []byte(`{"request_id":"r","device_id":"edge-1","export_type":"action_log","items":[],"complete":true}`)
+				clean := []byte(`{"request_id":"r","device_id":"edge-1","export_type":"action_log","items":[],"next_page_token":"","complete":true,"error":null}`)
 				b.respondRaw(req.DeviceID, req.RequestID, sealedExport(t, clean, now, 1))
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

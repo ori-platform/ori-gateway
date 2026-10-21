@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -22,6 +23,9 @@ type exportBroker struct {
 	handlers   map[string]broker.MessageHandler
 	actionLog  []any
 	exportSeen map[string]int
+	// clock, when set, is read as each request is published, into sent.
+	clock func() time.Time
+	sent  []time.Time
 }
 
 func (b *exportBroker) Subscribe(_ context.Context, topic string, _ byte, handler broker.MessageHandler) error {
@@ -48,11 +52,13 @@ func (b *exportBroker) Publish(_ context.Context, _ string, _ byte, _ bool, payl
 		items = b.actionLog
 	}
 	encoded, err := json.Marshal(map[string]any{
-		"request_id":  req.RequestID,
-		"device_id":   req.DeviceID,
-		"export_type": req.ExportType,
-		"complete":    true,
-		"items":       items,
+		"request_id":      req.RequestID,
+		"device_id":       req.DeviceID,
+		"export_type":     req.ExportType,
+		"items":           items,
+		"next_page_token": "",
+		"complete":        true,
+		"error":           nil,
 	})
 	if err != nil {
 		b.t.Fatal(err)
@@ -64,6 +70,9 @@ func (b *exportBroker) Publish(_ context.Context, _ string, _ byte, _ bool, payl
 	b.mu.Lock()
 	handler := b.handlers[topic]
 	b.exportSeen[req.ExportType]++
+	if b.clock != nil {
+		b.sent = append(b.sent, b.clock())
+	}
 	b.mu.Unlock()
 	if handler == nil {
 		b.t.Fatalf("no export response handler on %s", topic)
