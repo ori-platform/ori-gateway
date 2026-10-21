@@ -146,11 +146,16 @@ func TestRunningGatewayReleasesAHoldOnlyOnItsDevicesHandoff(t *testing.T) {
 	}
 	ackHandler("ori/dev-01/evidence/inbound/ack", signedAck("sha256:"+hex.EncodeToString(make([]byte, 32)), "superseded"))
 	ackHandler("ori/dev-01/evidence/inbound/ack", signedAck("sha256:"+hex.EncodeToString(digest[:]), "not_a\n\"reason\""))
-	out := logs.String()
-	for _, want := range []string{
+	wantLines := []string{
 		`level=WARN msg="evidence inbound acknowledgement refused" error="evidence: acknowledgement does not name the queued authority artifact"` + "\n",
 		`level=WARN msg="evidence inbound refusal reason unrecognised; authority artifact held until a receiver state change" reason="\"not_a\\n\\\"reason\\\"\""` + "\n",
-	} {
+	}
+	// Acknowledgements are handled off the broker callback, in order.
+	waitFor("both acknowledgements to be decided", func() bool {
+		return strings.Contains(logs.String(), wantLines[0]) && strings.Contains(logs.String(), wantLines[1])
+	})
+	out := logs.String()
+	for _, want := range wantLines {
 		if strings.Count(out, want) != 1 {
 			t.Fatalf("log line %q not logged once:\n%s", want, out)
 		}

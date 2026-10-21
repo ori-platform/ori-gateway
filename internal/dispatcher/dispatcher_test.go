@@ -409,10 +409,18 @@ func TestDispatcherConcurrentDuplicateRequestIDPublishesOnce(t *testing.T) {
 	}()
 	time.Sleep(5 * time.Millisecond)
 	close(block)
+	// The repeat is refused as already in flight; the first is answered.
+	var refused int
 	for range 2 {
-		if err := <-done; err != nil {
+		switch err := <-done; {
+		case errors.Is(err, ErrRequestInFlight):
+			refused++
+		case err != nil:
 			t.Fatal(err)
 		}
+	}
+	if refused != 1 {
+		t.Fatalf("%d requests refused as already in flight, want the repeat alone", refused)
 	}
 	if prov.callCount() != 1 || pub.callCount() != 1 {
 		t.Fatalf("provider/publish calls = %d/%d", prov.callCount(), pub.callCount())

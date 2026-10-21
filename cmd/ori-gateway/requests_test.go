@@ -504,10 +504,8 @@ func TestADuplicateInFlightRequestNeitherCountsNorResetsTheFailureCount(t *testi
 	deps := baseDeps(t, validConfig(), fb, &prov.fakeProvider, newFakeHeartbeat())
 	deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return selectiveHold{prov}, nil }
 	deps.logger = slog.New(slog.NewTextHandler(&logs, nil))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	go func() { done <- runGateway(t.Context(), "gateway.yaml", deps) }()
 	select {
 	case <-fb.subscribed:
 	case <-time.After(5 * time.Second):
