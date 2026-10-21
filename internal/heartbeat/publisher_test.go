@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -836,5 +837,41 @@ func TestTheHeartbeatThatOpensAnEpisodeReportsIt(t *testing.T) {
 			t.Fatalf("heartbeat %d after the jump, signed at %d during an episode, reports %q", i, beat.TimestampMS, beat.Status)
 		}
 		beat = next()
+	}
+}
+
+// TestAPublishTheStopInterruptsIsNotAFailure holds a publish until the run is
+// stopped, with a failure limit of one: the interrupted publish counts toward
+// no limit, so stopping never ends the process.
+func TestAPublishTheStopInterruptsIsNotAFailure(t *testing.T) {
+	var fatalCalls atomic.Int32
+	publishing := make(chan struct{})
+	var once sync.Once
+	publish := func(ctx context.Context, _ []byte) error {
+		once.Do(func() { close(publishing) })
+		<-ctx.Done()
+		return fmt.Errorf("broker: publish: %w", ctx.Err())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	publisher, err := NewPublisher(publish, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval:     time.Hour,
+		FailureLimit: 1,
+		Fatal:        func(int) { fatalCalls.Add(1) },
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- publisher.Run(ctx) }()
+	<-publishing
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after its context was cancelled")
+	}
+	if got := fatalCalls.Load(); got != 0 {
+		t.Fatalf("fatal calls = %d, want none: an interrupted publish was counted as a failure", got)
 	}
 }

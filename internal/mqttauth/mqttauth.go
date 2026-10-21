@@ -302,12 +302,20 @@ func replayKey(messageType string, deviceID string, requestID string, signedAtMS
 // both be applied.
 func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requestID string, auth contracts.HeartbeatAuth, unsigned map[string]any, decide func(map[string]any) (bool, error)) error {
 	key := replayKey(messageType, deviceID, requestID, auth.SignedAtMS, auth.Signature)
+	// The warning is decided under the replay lock and logged once it is
+	// released, so a logger that blocks never holds another verification.
+	var warnFloor func()
+	defer func() {
+		if warnFloor != nil {
+			warnFloor()
+		}
+	}()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	t := v.now().UnixMilli()
 	v.replay.prune(t)
 	if err := v.replay.check(key, auth.SignedAtMS, t); err != nil {
-		v.warnFloorAhead(err, t)
+		warnFloor = v.floorAheadWarning(err, t)
 		return err
 	}
 	if decide == nil {
@@ -326,13 +334,19 @@ func (v *Verifier) checkFreshAndRecord(messageType string, deviceID string, requ
 	return err
 }
 
-// warnFloorAhead logs a refusal below a floor that is ahead of the stale
-// bound, the only local record of a restart, a clock step or an eviction that
-// is refusing fresh envelopes.
-func (v *Verifier) warnFloorAhead(err error, t int64) {
-	if errors.Is(err, ErrBeforeReplayFloor) && v.replay.floor > t-v.replay.skew {
+// floorAheadWarning decides, under the replay lock, the warning for a refusal
+// below a floor that is ahead of the stale bound, the only local record of a
+// restart, a clock step or an eviction that is refusing fresh envelopes. It
+// returns nil when there is none, and otherwise the log call to make once the
+// lock is released.
+func (v *Verifier) floorAheadWarning(err error, t int64) func() {
+	if !errors.Is(err, ErrBeforeReplayFloor) || v.replay.floor <= t-v.replay.skew {
+		return nil
+	}
+	floor := v.replay.floor
+	return func() {
 		v.log.Warn("mqtt auth refused an envelope below the replay floor, which is ahead of the clock's stale bound",
-			"floor_ms", v.replay.floor, "t_ms", t)
+			"floor_ms", floor, "t_ms", t)
 	}
 }
 

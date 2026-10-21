@@ -69,6 +69,7 @@ type MQTTClient struct {
 	qos                 byte
 	requestID           requestIDFunc
 	authSecret          string
+	previousAuthSecret  string
 	authRequested       bool
 	encryptionRequested bool
 	verifier            *mqttauth.Verifier
@@ -86,8 +87,10 @@ type MQTTClient struct {
 	// subscribing holds the subscribe in flight for each topic: every export
 	// to that device waits on it, each within its own remaining wait.
 	subscribing map[string]*subscribeAttempt
-	// notes writes the client's log records off every caller's path.
-	notes noteLog
+	// notes writes the client's log records off every caller's path, and
+	// queued logs through it.
+	notes  noteLog
+	queued *slog.Logger
 }
 
 // subscribeAttempt is one subscribe to a response topic; done is closed once
@@ -114,19 +117,10 @@ func WithMessageAuth(sharedSecret string, previousSharedSecret string, now func(
 	return func(c *MQTTClient) {
 		c.authRequested = true
 		c.authSecret = sharedSecret
+		c.previousAuthSecret = previousSharedSecret
 		if now != nil {
 			c.now = now
 		}
-		verifier, err := mqttauth.NewVerifier(mqttauth.Config{
-			SharedSecret:         sharedSecret,
-			PreviousSharedSecret: previousSharedSecret,
-			Now:                  c.now,
-		})
-		if err != nil {
-			c.optionErr = fmt.Errorf("message auth: %w", err)
-			return
-		}
-		c.verifier = verifier
 	}
 }
 
@@ -220,6 +214,21 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 	}
 	for _, opt := range opts {
 		opt(client)
+	}
+	// Built once every option is applied, so the verifier logs through the
+	// client's own queue, never on the callback that delivers responses.
+	client.queued = slog.New(&queuedHandler{inner: client.log.Handler(), notes: &client.notes})
+	if client.authRequested && client.optionErr == nil {
+		verifier, err := mqttauth.NewVerifier(mqttauth.Config{
+			SharedSecret:         client.authSecret,
+			PreviousSharedSecret: client.previousAuthSecret,
+			Now:                  client.now,
+			Logger:               client.queued,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("runtimeclient: message auth: %w", err)
+		}
+		client.verifier = verifier
 	}
 	if client.signingClock == nil {
 		client.signingClock = mqttauth.NewSigningClock(client.now, client.log)
@@ -541,10 +550,8 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 		// A response handed over in time completes the request even when the
 		// publish then reports failure, a timeout included: the runtime has
 		// answered, and its replay key is already recorded.
-		select {
-		case result := <-responseCh:
+		if result, ok := c.settle(requestID, responseCh); ok {
 			return c.acceptResponse(req, requestID, result)
-		default:
 		}
 		if waitCtx.Err() != nil {
 			return timedOut()
@@ -556,10 +563,8 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	case <-waitCtx.Done():
 		// A response handed over before expiry is taken, whichever case
 		// the select chose: deliver decided it was in time.
-		select {
-		case result := <-responseCh:
+		if result, ok := c.settle(requestID, responseCh); ok {
 			return c.acceptResponse(req, requestID, result)
-		default:
 		}
 		return timedOut()
 	case result := <-responseCh:
@@ -639,7 +644,7 @@ func (c *MQTTClient) handleResponseMessage(topic string, payload []byte) {
 }
 
 // warn logs a warning without waiting on the logger.
-func (c *MQTTClient) warn(msg string, args ...any) { c.notes.warn(c.log, msg, args...) }
+func (c *MQTTClient) warn(msg string, args ...any) { c.queued.Warn(msg, args...) }
 
 // refusedByMemberRule reports, and logs with its reason only, a response whose
 // decrypted plaintext the Payload Member Rule refuses. Such a response changes
@@ -775,6 +780,20 @@ func isSensitiveExport(exportType string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// settle releases requestID's pending state, then takes a response deliver
+// handed over before that. deliver hands over only under c.mu while the
+// request is pending, so none is handed over once settle has released it, and
+// none it handed over is left unread.
+func (c *MQTTClient) settle(requestID string, ch chan exportResult) (exportResult, bool) {
+	c.removePending(requestID)
+	select {
+	case result := <-ch:
+		return result, true
+	default:
+		return exportResult{}, false
 	}
 }
 

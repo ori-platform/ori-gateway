@@ -839,3 +839,51 @@ func TestASubscribeEndsWhenItsContextIsCancelled(t *testing.T) {
 		t.Fatal("a cancelled subscribe left its subscription recorded")
 	}
 }
+
+// endingContext is a context that is live when first asked and done from
+// then on, so a wait that checks it first finds it ended only once waiting.
+type endingContext struct {
+	context.Context
+	asked atomic.Bool
+}
+
+func (c *endingContext) Err() error {
+	if c.asked.Swap(true) {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *endingContext) Done() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func TestWaitTokenTakesATokenThatCompletedAsItsContextEnded(t *testing.T) {
+	want := errors.New("mqtt refused")
+	for range 200 {
+		ctx := &endingContext{Context: context.Background()}
+		if err := waitToken(ctx, stubToken{waitOK: true, err: want}); !errors.Is(err, want) {
+			t.Fatalf("got %v, want the completed token's %v", err, want)
+		}
+	}
+}
+
+func TestWaitTokenWithoutADeadlineIsBounded(t *testing.T) {
+	saved := tokenWaitBound
+	tokenWaitBound = 20 * time.Millisecond
+	t.Cleanup(func() { tokenWaitBound = saved })
+	token := newSlowToken()
+	defer close(token.release)
+	errs := make(chan error, 1)
+	go func() { errs <- waitToken(context.Background(), token) }()
+	select {
+	case err := <-errs:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v, want %v", err, context.DeadlineExceeded)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a token wait without a deadline was not bounded")
+	}
+}

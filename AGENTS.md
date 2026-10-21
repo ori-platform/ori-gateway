@@ -51,11 +51,13 @@ The gateway process must also surface repeated reasoning-response delivery
 failures instead of logging forever while dropping all replies. Only a reply
 it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
 a request it refuses, malformed, unauthenticated or not fresh, neither counts
-nor resets the count, so no sender can end the gateway by sending junk.
+nor resets the count, so no sender can end the gateway by sending junk. A
+heartbeat publish that the run's own stop interrupts is not a failure.
 Verified by `TestHeartbeatFailureLimit`,
 `TestGatewayHeartbeatFailureReturnsError`,
-`TestMainEscalatesRepeatedRequestHandlerFailures`, and
-`TestMalformedReasoningRequestsNeverStopTheGateway`.
+`TestMainEscalatesRepeatedRequestHandlerFailures`,
+`TestMalformedReasoningRequestsNeverStopTheGateway`, and
+`TestAPublishTheStopInterruptsIsNotAFailure`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
@@ -532,13 +534,16 @@ the runtime; the gateway sends at most 1.6 a second, bursts of 8, each device
 starting empty), because the runtime judges arrivals, not sends; pacing is
 bounded like the wait. A response handed over in time completes its request
 whichever the wait sees first, and even when the publish that carried the
-request then reports failure. Every broker wait, the subscribe and publish
-acknowledgements included, ends as soon as its context does, so ending the
-run ends a shared subscribe at the transport. The client's log records are
-written off every caller's path, in order, by one drainer, at most 64 behind
-a logger that blocks and later ones counted, so no logger holds an export past
-its bound, delays the release of its pending state, or holds the broker
-callback that delivers responses. An export page missing any
+request then reports failure; the request's pending state is released before
+its response is last read, so none is handed over and then discarded. A
+broker `Connect`, `Subscribe` or `Publish` waits for its acknowledgement only
+while its caller's context lasts, and 30 seconds at most without a deadline,
+so ending the run ends a shared subscribe at the transport. The export
+client's log records, its verifier's included, are written off every caller's
+path, in order, by one drainer, at most 64 waiting behind a logger that blocks
+and later ones counted, so none of them holds an export past its bound, delays
+the release of its pending state, or holds the broker callback that delivers
+responses. An export page missing any
 envelope member (`request_id`, `export_type`, `device_id`, `items`,
 `next_page_token`, `complete`, `error`) fails the export as malformed and is
 never read as complete, empty or successful. The page count of one export is
@@ -565,9 +570,14 @@ Export Auth Envelope). Verified by
 `TestEndingTheLifetimeAbandonsAStalledSubscribe`,
 `TestTheRuntimeExportClientEndsWithTheRun`,
 `TestAResponseHandedOverInTimeSurvivesAFailedPublish`,
+`TestAResponseIsNeverRecordedWithoutCompletingItsExport`,
 `TestATimeoutNeverWaitsOnTheLogger`,
+`TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback`,
+`TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger`,
 `TestASubscribeEndsWhenItsContextIsCancelled`,
-`TestWaitTokenEndsWhenItsContextIsCancelled` and
+`TestWaitTokenEndsWhenItsContextIsCancelled`,
+`TestWaitTokenTakesATokenThatCompletedAsItsContextEnded`,
+`TestWaitTokenWithoutADeadlineIsBounded` and
 `TestAWeeklyReportForManySensorsStaysWithinTheRuntimeExportRate`.
 
 24. `GW-24` Envelope freshness and replay follow gateway-api/v2.
@@ -583,7 +593,9 @@ the start is refused, and the contract's stated limits for a receiver that
 stores nothing apply. A family that records only once an envelope answers
 something rechecks the floor and replay in one step with recording, and a
 recorded key is never un-recorded. A refusal below a floor ahead of the stale
-bound is logged with the floor and the clock. Skew is fixed at 5 minutes.
+bound is logged with the floor and the clock, once the replay lock is
+released, so a logger that blocks holds no other verification. Skew is fixed
+at 5 minutes.
 Every envelope the gateway signs takes `signed_at_ms` from a signing clock: the
 evidence families from their own durable clocks, and every envelope signed
 under the runtime–gateway HMAC outside the evidence path (today the heartbeat,
@@ -664,6 +676,7 @@ first more than 300,000 ms ahead of the wall clock is logged as a warning. Verif
 `TestLogLinesBehindABlockedLoggerAreBounded`,
 `TestTheClocksRecordsHonourTheLoggersLevel`,
 `TestTheAheadWarningIsAtThreeHundredThousandMilliseconds`,
+`TestAFloorWarningNeverHoldsAnotherVerification`,
 `TestNoMarkReachesTheCeilingNearIt`,
 `TestAJumpPastTheReservationReservesAhead`,
 `TestExtensionsKeepALeadAsTheWallClockMoves`,

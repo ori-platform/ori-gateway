@@ -319,10 +319,13 @@ func (c *Client) resubscribeAll() {
 	}
 }
 
+// tokenWaitBound bounds a token wait whose context has no deadline.
+var tokenWaitBound = 30 * time.Second
+
 // waitToken waits for token within ctx, ending the wait as soon as ctx ends,
-// cancelled or past its deadline. A context without a deadline waits 30
-// seconds at most. A token that completed is taken even when ctx ended at the
-// same moment.
+// cancelled or past its deadline. A context without a deadline waits
+// tokenWaitBound at most. A token that completed is taken even when ctx ended
+// at the same moment.
 func waitToken(ctx context.Context, token mqtt.Token) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -330,7 +333,7 @@ func waitToken(ctx context.Context, token mqtt.Token) error {
 
 	var bound <-chan time.Time
 	if _, ok := ctx.Deadline(); !ok {
-		timer := time.NewTimer(30 * time.Second)
+		timer := time.NewTimer(tokenWaitBound)
 		defer timer.Stop()
 		bound = timer.C
 	}

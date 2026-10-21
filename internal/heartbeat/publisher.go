@@ -190,6 +190,11 @@ func (p *Publisher) publishOnce(ctx context.Context, failures *int) bool {
 		return p.recordFailure(failures, err)
 	}
 	if err := p.publish(ctx, payload); err != nil {
+		// A publish the run's own stop interrupted is not a failure: the
+		// broker wait ends with its context.
+		if ctx.Err() != nil {
+			return false
+		}
 		return p.recordFailure(failures, err)
 	}
 

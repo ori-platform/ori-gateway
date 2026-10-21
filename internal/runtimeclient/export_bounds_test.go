@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -784,4 +785,154 @@ func TestATimeoutNeverWaitsOnTheLogger(t *testing.T) {
 		}
 		cancel()
 	})
+}
+
+// recordingHandler blocks its first record until released, then records
+// every message in the order written.
+type recordingHandler struct {
+	entered, release chan struct{}
+	once             sync.Once
+	mu               sync.Mutex
+	messages         []string
+	attrs            []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.once.Do(func() { close(h.entered); <-h.release })
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messages = append(h.messages, r.Message)
+	r.Attrs(func(a slog.Attr) bool { h.attrs = append(h.attrs, a.String()); return true })
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger queues 300
+// records while the logger blocks on the first: the 64 queued behind it are
+// written in the order they were decided, the other 235 are counted, and the
+// count is written last.
+func TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger(t *testing.T) {
+	h := &recordingHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	log := slog.New(&queuedHandler{inner: h, notes: &noteLog{}})
+	log.Warn("line 0")
+	<-h.entered
+	for i := 1; i < 300; i++ {
+		log.Warn(fmt.Sprintf("line %d", i))
+	}
+	close(h.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.mu.Lock()
+		n := len(h.messages)
+		h.mu.Unlock()
+		if n >= 66 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.messages) != 66 {
+		t.Fatalf("%d records written, want the one being written, the 64 queued and the count", len(h.messages))
+	}
+	for i := range 65 {
+		if want := fmt.Sprintf("line %d", i); h.messages[i] != want {
+			t.Fatalf("record %d is %q, want %q: records were written out of order", i, h.messages[i], want)
+		}
+	}
+	if !strings.Contains(h.messages[65], "dropped") || !slices.Contains(h.attrs, "dropped=235") {
+		t.Fatalf("last record %q with %v, want the count of the 235 dropped", h.messages[65], h.attrs)
+	}
+}
+
+// racingPublishBroker hands a verified response over from another goroutine
+// while the publish that carried its request reports failure at once.
+type racingPublishBroker struct {
+	*inTimePublishBroker
+	responding sync.WaitGroup
+}
+
+func (b *racingPublishBroker) Publish(_ context.Context, _ string, _ byte, _ bool, payload []byte) error {
+	var req exportRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		b.t.Error(err)
+		return err
+	}
+	signed := signedExportPayload(b.t, healthItems(req.DeviceID, req.RequestID), "current-secret", b.now)
+	b.responding.Go(func() { b.respondRaw(req.DeviceID, req.RequestID, signed) })
+	runtime.Gosched()
+	return errors.New("broker: publish: connection lost")
+}
+
+// TestAResponseIsNeverRecordedWithoutCompletingItsExport races a verified
+// response against a publish failure many times: an export either completes,
+// or its response recorded no replay key. None is answered, recorded and then
+// discarded.
+func TestAResponseIsNeverRecordedWithoutCompletingItsExport(t *testing.T) {
+	now := time.UnixMilli(1787000003000)
+	b := &racingPublishBroker{inTimePublishBroker: &inTimePublishBroker{fakeBroker: newFakeBroker(), t: t, now: now}}
+	n := 0
+	c, err := NewMQTTClient(b, WithMessageAuth("current-secret", "", func() time.Time { return now }),
+		WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(time.Second),
+		WithRequestIDFunc(func() (string, error) { n++; return fmt.Sprintf("race-%d", n), nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := 0
+	for i := range 20000 {
+		before := c.verifier.ReplayEntries()
+		_, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
+		// The response has been handed over or refused before counting.
+		b.responding.Wait()
+		recorded := c.verifier.ReplayEntries() > before
+		if err == nil {
+			completed++
+		} else if recorded {
+			t.Fatalf("exchange %d: its response recorded a replay key, but the export failed: %v", i, err)
+		}
+	}
+	t.Logf("%d of 20000 exports completed from a response that raced the publish failure", completed)
+}
+
+// TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback answers an export
+// with a response signed before the client's verifier started, behind a
+// logger that blocks: the broker callback returns at once, and the floor
+// warning is still logged.
+func TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback(t *testing.T) {
+	h := newBlockingHandler()
+	defer close(h.release)
+	now := time.UnixMilli(1787000003000)
+	b := newFakeBroker()
+	c, err := NewMQTTClient(b, WithMessageAuth("current-secret", "", func() time.Time { return now }),
+		WithLogger(slog.New(h)), WithExportWait(time.Second), WithRequestIDFunc(func() (string, error) { return "floor-1", nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered := make(chan struct{})
+	b.publishHook = func(_ string, payload []byte) {
+		var req exportRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			t.Error(err)
+			return
+		}
+		go func() {
+			defer close(answered)
+			b.respondRaw(req.DeviceID, req.RequestID, signedExportPayload(t, healthItems(req.DeviceID, req.RequestID), "current-secret", now.Add(-2*time.Second)))
+		}()
+	}
+	go func() { _, _ = c.Health(t.Context(), HealthRequest{DeviceID: "edge-1"}) }()
+	select {
+	case <-answered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("the broker callback was held by the verifier's floor warning behind a logger that blocks")
+	}
+	select {
+	case <-h.entered:
+	case <-time.After(time.Second):
+		t.Fatal("the refusal below the floor was never logged")
+	}
 }
