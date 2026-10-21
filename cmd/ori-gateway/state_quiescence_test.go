@@ -218,8 +218,7 @@ func TestAStartWhoseFirstWriteStallsIsRefusedHoldingTheLock(t *testing.T) {
 				}()
 			}
 			err := runGateway(t.Context(), "gateway.yaml", g.deps)
-			var stalled *mqttauth.StartWriteError
-			if !errors.As(err, &stalled) {
+			if _, ok := errors.AsType[*mqttauth.StartWriteError](err); !ok {
 				t.Fatalf("runGateway = %v, want the start refused for its stalled write", err)
 			}
 			if built.Load() {
@@ -392,6 +391,9 @@ func TestAStalledWriteHoldsTheLockUntilTheProcessEnds(t *testing.T) {
 				for scanner.Scan() {
 					lines <- scanner.Text()
 				}
+				if err := scanner.Err(); err != nil {
+					lines <- "scan error: " + err.Error()
+				}
 				close(lines)
 			}()
 			deadline := time.After(20 * time.Second)
@@ -404,6 +406,9 @@ func TestAStalledWriteHoldsTheLockUntilTheProcessEnds(t *testing.T) {
 					}
 					if line == "exiting" {
 						break wait
+					}
+					if strings.HasPrefix(line, "scan error") {
+						t.Fatalf("reading the child's output: %s", line)
 					}
 					if strings.HasPrefix(line, "returned") {
 						t.Fatalf("the child's runGateway %s instead of ending the process", line)
