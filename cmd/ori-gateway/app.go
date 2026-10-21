@@ -542,14 +542,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	// once shutdown begins none starts, and runGateway never returns while
 	// one is still running (GW-15).
 	postureDebounce := newPostureDebouncer()
-	// decideStop is the decision to stop: it stops admitting work, every
-	// broker callback and posture fetch, and stops issuing signing values, in
-	// one step, before anything already admitted is joined (rule 13).
-	decideStop := func() {
-		callbacks.refuse()
-		postureDebounce.refuse()
-		stopSigning()
-	}
+	decision := &stopDecision{callbacks: callbacks, posture: postureDebounce, stopSigning: stopSigning}
+	decideStop := decision.decide
 	defer func() {
 		decideStop()
 		cancel()
@@ -557,6 +551,11 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		postureDebounce.close()
 	}()
 	runners := newSupervisedRunners(runCtx)
+	// The stop is decided where it happens: when the runner group's context
+	// ends, on the parent's cancellation or a runner's failure, before the
+	// group cancels and joins its runners, not once that is noticed here.
+	stopOnRunnersEnd := context.AfterFunc(runners.ctx, decideStop)
+	defer stopOnRunnersEnd()
 	shutdownRunners := func() {
 		decideStop()
 		cancel()
@@ -665,7 +664,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	}
 	runners.start("heartbeat", hb.Run)
 
-	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
+	// Supervised like every long-running task, so it stops with the others
+	// and never outlives runGateway (GW-15).
+	runners.start("site node eviction", func(ctx context.Context) error {
+		evictStaleRuntimeNodes(ctx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
+		<-ctx.Done()
+		return ctx.Err()
+	})
 
 	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now, SigningClock: signingClock}
 	if gatewaySecrets.Enabled {
@@ -1411,6 +1416,23 @@ func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCo
 		view[family] = site.MQTTIngressCount{PayloadTooLarge: count.PayloadTooLarge, VolumeDropped: count.VolumeDropped}
 	}
 	return view
+}
+
+// stopDecision is the decision to stop (gateway-config/v2
+// gateway.state_directory rule 13): one step that stops admitting work, every
+// broker callback and posture fetch, and stops issuing signing values, before
+// anything already admitted is joined. It may be taken more than once, and
+// concurrently.
+type stopDecision struct {
+	callbacks   *callbackGate
+	posture     *postureDebouncer
+	stopSigning func()
+}
+
+func (d *stopDecision) decide() {
+	d.callbacks.refuse()
+	d.posture.refuse()
+	d.stopSigning()
 }
 
 // callbackGate admits broker callbacks while the gateway runs and joins them

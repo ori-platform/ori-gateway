@@ -138,10 +138,13 @@ while one is still running. The decision to stop is one step
 (gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
 broker callback, on both broker clients, and every later posture fetch, and
 stops the signing clock, which from then on refuses to sign and starts no
-write of its mark, so a callback still running sends no reply. Every
-supervised runner, the webhook bridge and site health server among them, is
-cancelled straight after it on every stop path; callbacks and fetches already
-admitted are joined after that. The state directory is released only once no write of the mark is
+write of its mark, so a callback still running sends no reply. It is taken
+where the stop happens: the moment the supervised runners' context ends, on
+the parent's cancellation or a runner's failure, before the runners are
+joined, as well as on every other stop path. Every supervised runner, the
+webhook bridge, site health server and site node eviction among them, is
+cancelled with it; callbacks and fetches already admitted are joined after
+that. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
 from the decision to stop, the process ends with status 1 without releasing it,
 and no further run begins in that process. A start refused while its first
@@ -168,7 +171,9 @@ Verified by `TestMainStartupMissingConfig`,
 `TestABlockedLoggerNeverDelaysTheRequiredExit`,
 `TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`,
 `TestAStateDirectoryRefusalCreatesNoEvidenceQueue`,
-`TestNoCallbackIsAdmittedAfterTheDecisionToStop` and
+`TestNoCallbackIsAdmittedAfterTheDecisionToStop`,
+`TestARunnerFailureDecidesTheStopBeforeTheRunnersAreJoined`,
+`TestTheDecisionToStopRefusesEveryAdmissionInOneStep` and
 `TestARefusedGateStillJoinsWhatItAdmitted`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.

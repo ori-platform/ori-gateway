@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/heartbeat"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/site"
+	"github.com/ori-platform/ori-gateway/internal/webhookbridge"
 )
 
 // stopHeldRunner stands in for a supervised runner that takes its time to
@@ -184,3 +186,97 @@ func TestARefusedGateStillJoinsWhatItAdmitted(t *testing.T) {
 	close(release)
 	<-closed
 }
+
+// TestTheDecisionToStopRefusesEveryAdmissionInOneStep takes the decision and
+// checks each part of it: the callback gate refuses, the posture debouncer
+// refuses, and signing has stopped, before anything is joined.
+func TestTheDecisionToStopRefusesEveryAdmissionInOneStep(t *testing.T) {
+	gate, posture := newCallbackGate(), newPostureDebouncer()
+	stopped := false
+	decision := &stopDecision{callbacks: gate, posture: posture, stopSigning: func() { stopped = true }}
+	decision.decide()
+	if gate.enter() {
+		t.Fatal("the callback gate admitted a callback after the decision to stop")
+	}
+	if posture.tryStart("dev-01") {
+		t.Fatal("a posture fetch started after the decision to stop")
+	}
+	if !stopped {
+		t.Fatal("the decision to stop did not stop signing")
+	}
+	decision.decide() // taken again, harmlessly
+}
+
+// TestARunnerFailureDecidesTheStopBeforeTheRunnersAreJoined fails the
+// heartbeat runner while another runner is slow to return: the decision is
+// taken as the runner group ends, so while the slow runner is still being
+// joined the clock refuses to sign and an authenticated runtime heartbeat is
+// not admitted.
+func TestARunnerFailureDecidesTheStopBeforeTheRunnersAreJoined(t *testing.T) {
+	g := newStallingGateway(t, filepath.Join(t.TempDir(), "gateway-state"), false)
+	g.cfg.WebhookBridge.Enabled = true
+	g.deps.loadConfig = func(string) (config.Config, error) { return g.cfg, nil }
+	fb := newFakeBroker()
+	g.deps.newBroker = func(broker.Options) (brokerClient, error) { return fb, nil }
+	registry := site.NewRegistry()
+	g.deps.newSiteRegistry = func() *site.Registry { return registry }
+	held := &stopHeldRunner{stopping: make(chan struct{}), release: make(chan struct{})}
+	g.deps.newWebhookBridge = func(config.WebhookBridgeConfig, webhookbridge.Options) (webhookBridgeRunner, error) {
+		return held, nil
+	}
+	fail := make(chan struct{})
+	g.deps.newHeartbeat = func(_ heartbeat.PublishFunc, _ heartbeat.ProviderStatus, _ heartbeat.SIMStatus, opts heartbeat.Options) (heartbeatRunner, error) {
+		g.signers <- opts.SigningClock
+		return heartbeatRunnerFunc(func(ctx context.Context) error {
+			select {
+			case <-fail:
+				return errors.New("heartbeat publication failed")
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}), nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- runGateway(context.Background(), "gateway.yaml", g.deps) }()
+	signer := <-g.signers
+	const heartbeatTopic = "ori/dev-01/runtime/heartbeat"
+	waitUntil(t, "the runtime heartbeat subscription", func() bool { return fb.handlerFor(heartbeatTopic) != nil })
+
+	close(fail)
+	select {
+	case <-held.stopping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner group never cancelled its runners")
+	}
+	defer func() {
+		close(held.release)
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Error("runGateway returned no error after a runner failed")
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("runGateway did not return once the runner was released")
+		}
+	}()
+	// Taken as the group's context ends, on its own goroutine; without it the
+	// decision would come only once the held runner is released.
+	waitUntil(t, "the decision to stop while a failed group's runners are joined", func() bool {
+		_, err := signer.Next()
+		return err != nil
+	})
+	beat := contracts.RuntimeNodeHeartbeat{DeviceID: "dev-01", Status: site.NodeStatusHealthy, LastSeenMS: g.wallMS.Load(), ActiveTriggers: []string{}}
+	auth, err := mqttauth.Sign(beat, contracts.RuntimeHeartbeatMessageType, "dev-01", "", g.wallMS.Load(), "runtime-gateway-envelope-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beat.Auth = &auth
+	fb.handlerFor(heartbeatTopic)(heartbeatTopic, mustJSON(t, beat))
+	if n := len(registry.Snapshot()); n != 0 {
+		t.Fatalf("a runtime heartbeat was admitted while a failed group's runners were joined: %d node(s)", n)
+	}
+}
+
+type heartbeatRunnerFunc func(context.Context) error
+
+func (f heartbeatRunnerFunc) Run(ctx context.Context) error { return f(ctx) }
