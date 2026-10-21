@@ -875,3 +875,48 @@ func TestAPublishTheStopInterruptsIsNotAFailure(t *testing.T) {
 		t.Fatalf("fatal calls = %d, want none: an interrupted publish was counted as a failure", got)
 	}
 }
+
+// TestAHeartbeatTheStoppedClockRefusesIsNotAFailure runs the publisher on a
+// signing clock the decision to stop has already closed, while the run's own
+// context is still live, as between the two steps of a stop, with a failure
+// limit of one: the refusal counts toward no limit.
+func TestAHeartbeatTheStoppedClockRefusesIsNotAFailure(t *testing.T) {
+	var fatalCalls atomic.Int32
+	clock, err := mqttauth.NewDurableSigningClock(time.Now, persistedMark{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Close()
+	if _, err := clock.Next(); !errors.Is(err, mqttauth.ErrSigningClockClosed) {
+		t.Fatalf("a closed clock issued %v, want ErrSigningClockClosed", err)
+	}
+	publisher, err := NewPublisher(func(context.Context, []byte) error { return nil }, stubProvider{name: "echo", healthy: true}, SIMStatus{}, Options{
+		Interval:     time.Millisecond,
+		FailureLimit: 1,
+		Fatal:        func(int) { fatalCalls.Add(1) },
+		Logger:       slog.New(slog.DiscardHandler),
+		SigningClock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- publisher.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after its context was cancelled")
+	}
+	if got := fatalCalls.Load(); got != 0 {
+		t.Fatalf("fatal calls = %d, want none: a refusal by the stopped clock was counted as a failure", got)
+	}
+}
+
+// persistedMark is a mark every write of which completes at once.
+type persistedMark struct{}
+
+func (persistedMark) Found() (int64, bool) { return 0, false }
+func (persistedMark) Persist(int64) error  { return nil }

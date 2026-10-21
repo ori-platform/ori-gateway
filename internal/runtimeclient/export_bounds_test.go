@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -849,53 +848,42 @@ func TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger(t *testin
 	}
 }
 
-// racingPublishBroker hands a verified response over from another goroutine
-// while the publish that carried its request reports failure at once.
-type racingPublishBroker struct {
-	*inTimePublishBroker
-	responding sync.WaitGroup
-}
-
-func (b *racingPublishBroker) Publish(_ context.Context, _ string, _ byte, _ bool, payload []byte) error {
-	var req exportRequest
-	if err := json.Unmarshal(payload, &req); err != nil {
-		b.t.Error(err)
-		return err
-	}
-	signed := signedExportPayload(b.t, healthItems(req.DeviceID, req.RequestID), "current-secret", b.now)
-	b.responding.Go(func() { b.respondRaw(req.DeviceID, req.RequestID, signed) })
-	runtime.Gosched()
-	return errors.New("broker: publish: connection lost")
-}
-
-// TestAResponseIsNeverRecordedWithoutCompletingItsExport races a verified
-// response against a publish failure many times: an export either completes,
-// or its response recorded no replay key. None is answered, recorded and then
+// TestAResponseHandedOverAsItsRequestIsReleasedIsNeverDiscarded fails the
+// publish that carries a request, and hands a verified response over at the
+// moment the request is released, before the release takes the lock: it is
+// handed over first and completes the export, never recorded and then
 // discarded.
-func TestAResponseIsNeverRecordedWithoutCompletingItsExport(t *testing.T) {
+func TestAResponseHandedOverAsItsRequestIsReleasedIsNeverDiscarded(t *testing.T) {
 	now := time.UnixMilli(1787000003000)
-	b := &racingPublishBroker{inTimePublishBroker: &inTimePublishBroker{fakeBroker: newFakeBroker(), t: t, now: now}}
-	n := 0
-	c, err := NewMQTTClient(b, WithMessageAuth("current-secret", "", func() time.Time { return now }),
+	b := newFakeBroker()
+	failing := &stallingBroker{fakeBroker: b}
+	c, err := NewMQTTClient(&publishFailsBroker{failing}, WithMessageAuth("current-secret", "", func() time.Time { return now }),
 		WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(time.Second),
-		WithRequestIDFunc(func() (string, error) { n++; return fmt.Sprintf("race-%d", n), nil }))
+		WithRequestIDFunc(func() (string, error) { return "released-1", nil }))
 	if err != nil {
 		t.Fatal(err)
 	}
-	completed := 0
-	for i := range 20000 {
-		before := c.verifier.ReplayEntries()
-		_, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
-		// The response has been handed over or refused before counting.
-		b.responding.Wait()
-		recorded := c.verifier.ReplayEntries() > before
-		if err == nil {
-			completed++
-		} else if recorded {
-			t.Fatalf("exchange %d: its response recorded a replay key, but the export failed: %v", i, err)
-		}
+	var once sync.Once
+	c.beforeRelease = func() {
+		once.Do(func() {
+			b.respondRaw("edge-1", "released-1", signedExportPayload(t, healthItems("edge-1", "released-1"), "current-secret", now))
+		})
 	}
-	t.Logf("%d of 20000 exports completed from a response that raced the publish failure", completed)
+	_, err = c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
+	if err != nil {
+		t.Fatalf("Health = %v with %d replay keys recorded, want the response handed over before the release", err, c.verifier.ReplayEntries())
+	}
+	if n := c.verifier.ReplayEntries(); n != 1 {
+		t.Fatalf("%d replay keys recorded, want the one answer's", n)
+	}
+}
+
+// publishFailsBroker reports every publish failed at once, as a broker whose
+// connection dropped.
+type publishFailsBroker struct{ *stallingBroker }
+
+func (b *publishFailsBroker) Publish(context.Context, string, byte, bool, []byte) error {
+	return errors.New("broker: publish: connection lost")
 }
 
 // TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback answers an export

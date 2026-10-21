@@ -52,12 +52,14 @@ failures instead of logging forever while dropping all replies. Only a reply
 it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
 a request it refuses, malformed, unauthenticated or not fresh, neither counts
 nor resets the count, so no sender can end the gateway by sending junk. A
-heartbeat publish that the run's own stop interrupts is not a failure.
+heartbeat that the run's own stop interrupts, or that the signing clock the
+stop has closed refuses, is not a failure.
 Verified by `TestHeartbeatFailureLimit`,
 `TestGatewayHeartbeatFailureReturnsError`,
 `TestMainEscalatesRepeatedRequestHandlerFailures`,
-`TestMalformedReasoningRequestsNeverStopTheGateway`, and
-`TestAPublishTheStopInterruptsIsNotAFailure`.
+`TestMalformedReasoningRequestsNeverStopTheGateway`,
+`TestAPublishTheStopInterruptsIsNotAFailure`, and
+`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
@@ -570,7 +572,7 @@ Export Auth Envelope). Verified by
 `TestEndingTheLifetimeAbandonsAStalledSubscribe`,
 `TestTheRuntimeExportClientEndsWithTheRun`,
 `TestAResponseHandedOverInTimeSurvivesAFailedPublish`,
-`TestAResponseIsNeverRecordedWithoutCompletingItsExport`,
+`TestAResponseHandedOverAsItsRequestIsReleasedIsNeverDiscarded`,
 `TestATimeoutNeverWaitsOnTheLogger`,
 `TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback`,
 `TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger`,

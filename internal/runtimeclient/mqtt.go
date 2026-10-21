@@ -91,6 +91,10 @@ type MQTTClient struct {
 	// queued logs through it.
 	notes  noteLog
 	queued *slog.Logger
+	// beforeRelease, when set, runs as a request is released, before the
+	// lock is taken; a test sets it to hand a response over at exactly that
+	// point.
+	beforeRelease func()
 }
 
 // subscribeAttempt is one subscribe to a response topic; done is closed once
@@ -798,6 +802,9 @@ func (c *MQTTClient) settle(requestID string, ch chan exportResult) (exportResul
 }
 
 func (c *MQTTClient) removePending(requestID string) {
+	if c.beforeRelease != nil {
+		c.beforeRelease()
+	}
 	c.mu.Lock()
 	delete(c.pending, requestID)
 	c.mu.Unlock()
