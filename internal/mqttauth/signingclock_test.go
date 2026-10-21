@@ -1428,6 +1428,7 @@ func TestLogLinesKeepTheOrderTheyWereDecidedIn(t *testing.T) {
 type orderHandler struct {
 	mu       sync.Mutex
 	messages []string
+	records  []writtenRecord
 	held     bool
 	entered  chan struct{}
 	release  chan struct{}
@@ -1452,55 +1453,103 @@ func (h *orderHandler) Handle(_ context.Context, r slog.Record) error {
 		close(h.entered)
 		<-h.release
 	}
+	written := writtenRecord{message: r.Message, at: r.Time}
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "signed_at_ms":
+			written.signedAt = a.Value.Int64()
+		case "dropped":
+			written.dropped = int(a.Value.Int64())
+		}
+		return true
+	})
 	h.mu.Lock()
 	h.messages = append(h.messages, r.Message)
+	h.records = append(h.records, written)
 	h.mu.Unlock()
 	return nil
+}
+
+type writtenRecord struct {
+	message  string
+	at       time.Time
+	signedAt int64
+	dropped  int
+}
+
+func (h *orderHandler) recorded() []writtenRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]writtenRecord(nil), h.records...)
 }
 func (h *orderHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *orderHandler) WithGroup(string) slog.Handler      { return h }
 
-// TestLogLinesBehindABlockedLoggerAreBounded queues more refusals than the
-// log queue holds while the logger blocks: once it unblocks, the queue's lines
-// are written and the rest are counted in one line, never held.
-func TestLogLinesBehindABlockedLoggerAreBounded(t *testing.T) {
-	wall := newTestWall()
-	mark := newMemMark(t, wall)
-	handler := &orderHandler{release: make(chan struct{}), entered: make(chan struct{})}
-	clock := durableClock(t, wall, mark, slog.New(handler))
-	t.Cleanup(handler.unblock)
-	clock.Close()
-	// The drainer's first batch and a full queue hold at most two queues'
-	// worth, so a third is always dropped.
-	for range 3 * maxNotes {
-		if _, err := clock.Next(); !errors.Is(err, ErrSigningClockClosed) {
-			t.Fatalf("a closed clock signed: %v", err)
+// queueAheadWarnings has an in-process clock decide n ahead-of-the-wall
+// warnings, each with its own signed_at_ms, by stepping the wall clock back
+// past the default skew and forward again.
+func queueAheadWarnings(t *testing.T, wall *testWall, clock *SigningClock, n int) {
+	t.Helper()
+	for range n {
+		wall.add(-time.Hour)
+		if _, err := clock.Next(); err != nil {
+			t.Fatal(err)
+		}
+		wall.add(2 * time.Hour)
+		if _, err := clock.Next(); err != nil {
+			t.Fatal(err)
 		}
 	}
-	<-handler.entered
+}
+
+// TestLogLinesBehindABlockedLoggerAreBounded blocks the logger on a first
+// warning, then decides three queues' worth more: the queue holds at most its
+// bound, the records are written in the order decided, each stamped when it
+// was decided, and the dropped count comes after them.
+func TestLogLinesBehindABlockedLoggerAreBounded(t *testing.T) {
+	wall := newTestWall()
+	handler := &orderHandler{release: make(chan struct{}), entered: make(chan struct{})}
+	clock := NewSigningClock(wall.now, slog.New(handler))
+	t.Cleanup(handler.unblock)
+	// A first value, so stepping the wall clock back leaves signing ahead.
+	if _, err := clock.Next(); err != nil {
+		t.Fatal(err)
+	}
+	queueAheadWarnings(t, wall, clock, 1)
+	select {
+	case <-handler.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no warning reached the logger")
+	}
+	decided := time.Now()
+	queueAheadWarnings(t, wall, clock, 3*maxNotes)
 	clock.mu.Lock()
 	queued := len(clock.notes)
 	clock.mu.Unlock()
-	if queued > maxNotes {
-		t.Fatalf("%d log lines queued behind a blocked logger, want at most %d", queued, maxNotes)
+	if queued != maxNotes {
+		t.Fatalf("%d records queued behind a blocked logger, want the bound %d", queued, maxNotes)
 	}
+	time.Sleep(200 * time.Millisecond)
 	handler.unblock()
-	waitFor(t, "the dropped count", func() bool {
-		for _, line := range handler.lines() {
-			if strings.Contains(line, "dropped") {
-				return true
-			}
-		}
-		return false
-	})
 	waitFor(t, "the drainer to finish", func() bool {
 		clock.mu.Lock()
 		defer clock.mu.Unlock()
-		return !clock.draining
+		return !clock.draining && len(handler.lines()) > 0
 	})
-	// The drainer holds one batch, with its count, while it writes, and the
-	// queue refills behind it to its bound.
-	if n := len(handler.lines()); n > 2*(maxNotes+1) {
-		t.Fatalf("%d lines written, want at most two queues, each with a count", n)
+	records := handler.recorded()
+	if len(records) != 1+maxNotes+1 {
+		t.Fatalf("%d records written, want the first, the queue and one count", len(records))
+	}
+	last := records[len(records)-1]
+	if !strings.Contains(last.message, "dropped") || last.dropped != 2*maxNotes {
+		t.Fatalf("last record %q (dropped %d), want the count of %d dropped", last.message, last.dropped, 2*maxNotes)
+	}
+	for i := 1; i < len(records)-1; i++ {
+		if records[i].signedAt <= records[i-1].signedAt {
+			t.Fatalf("record %d signed_at_ms %d written after %d: out of the order decided", i, records[i].signedAt, records[i-1].signedAt)
+		}
+		if late := records[i].at.Sub(decided); late > 100*time.Millisecond {
+			t.Fatalf("record %d stamped %v after it was decided, want the time it was decided", i, late)
+		}
 	}
 }

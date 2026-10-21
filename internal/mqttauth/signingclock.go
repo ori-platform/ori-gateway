@@ -4,6 +4,7 @@
 package mqttauth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -134,12 +135,14 @@ type SigningClock struct {
 	// changed is closed and replaced whenever coverage, the episode or the
 	// outstanding write changes, waking every value waiting for coverage.
 	changed chan struct{}
-	// notes are log lines decided under mu, in that order; one drainer at a
-	// time writes them off every lock, so a logger that blocks holds up no
-	// caller and lines never pass one another.
-	notes    []func()
+	// notes are log records decided under mu, stamped and kept in that
+	// order; one drainer at a time writes them off every lock, so a logger
+	// that blocks holds up no caller and records never pass one another.
+	notes    []slog.Record
 	draining bool
 	dropped  int
+	// refused is set once the refusal of a stopped clock has been logged.
+	refused bool
 }
 
 // NewSigningClock returns an in-process clock over now: its values never
@@ -240,7 +243,10 @@ func (c *SigningClock) Next() (int64, error) {
 			case c.closed:
 				// Once the stop is decided no value is issued and no write
 				// starts, so the state directory can reach quiescence.
-				c.noteLocked(func() { c.log.Info("signing clock is stopped; refusing to sign") })
+				if !c.refused {
+					c.refused = true
+					c.noteLocked(slog.LevelInfo, "signing clock is stopped; refusing to sign")
+				}
 				return 0, ErrSigningClockClosed
 			case at > c.covered && !c.episode:
 				// Past the coverage: wait for a write to cover it, for no
@@ -273,10 +279,8 @@ func (c *SigningClock) Next() (int64, error) {
 		}
 		switch ahead := at-wall > signingAheadWarning; {
 		case ahead && !c.ahead:
-			c.noteLocked(func() {
-				c.log.Warn("signing clock is ahead of the wall clock by more than receivers' default skew; they refuse what is signed until the wall clock catches up",
-					"signed_at_ms", at, "wall_ms", wall)
-			})
+			c.noteLocked(slog.LevelWarn, "signing clock is ahead of the wall clock by more than receivers' default skew; they refuse what is signed until the wall clock catches up",
+				"signed_at_ms", at, "wall_ms", wall)
 			c.ahead = true
 		case !ahead:
 			c.ahead = false
@@ -321,7 +325,7 @@ func (c *SigningClock) persist(mark int64, done chan struct{}, stopBound func() 
 		// between the comparison and the episode's end.
 		if c.episode && c.covered >= c.last {
 			c.episode = false
-			c.noteLocked(func() { c.log.Info("signing clock mark persisted again; every value issued is covered") })
+			c.noteLocked(slog.LevelInfo, "signing clock mark persisted again; every value issued is covered")
 		}
 	}
 	if c.episode {
@@ -336,9 +340,7 @@ func (c *SigningClock) openEpisodeLocked(cause error) {
 		return
 	}
 	c.episode = true
-	c.noteLocked(func() {
-		c.log.Warn("signing clock mark could not be persisted; signing goes on uncovered until a write completes", "error", cause)
-	})
+	c.noteLocked(slog.LevelWarn, "signing clock mark could not be persisted; signing goes on uncovered until a write completes", "error", cause)
 	c.scheduleRetryLocked()
 	c.broadcastLocked()
 }
@@ -363,26 +365,32 @@ func (c *SigningClock) retryWrite() {
 	c.startWriteLocked(reservationFor(c.now().UnixMilli(), c.last))
 }
 
-// maxNotes bounds the log lines queued behind a logger that blocks; later
-// lines are counted and the count is logged once the queue drains.
+// maxNotes bounds the log records queued behind a logger that blocks; later
+// ones are counted, and the count is logged after the records queued before
+// them.
 const maxNotes = 64
 
-// noteLocked queues a log line, in the order decided under mu, and starts the
-// drainer if none is running.
-func (c *SigningClock) noteLocked(note func()) {
+// noteLocked queues a log record stamped now, in the order decided under mu,
+// and starts the drainer if none is running.
+func (c *SigningClock) noteLocked(level slog.Level, msg string, args ...any) {
 	if len(c.notes) >= maxNotes {
 		c.dropped++
 		return
 	}
-	c.notes = append(c.notes, note)
+	record := slog.NewRecord(time.Now(), level, msg, 0)
+	record.Add(args...)
+	c.notes = append(c.notes, record)
 	if !c.draining {
 		c.draining = true
 		go c.drain()
 	}
 }
 
-// drain writes the queued log lines in order until none is left.
+// drain writes the queued records in order, each with the time it was
+// decided, until none is left.
 func (c *SigningClock) drain() {
+	ctx := context.Background()
+	handler := c.log.Handler()
 	for {
 		c.mu.Lock()
 		notes, dropped := c.notes, c.dropped
@@ -393,8 +401,10 @@ func (c *SigningClock) drain() {
 			return
 		}
 		c.mu.Unlock()
-		for _, note := range notes {
-			note()
+		for _, record := range notes {
+			if handler.Enabled(ctx, record.Level) {
+				_ = handler.Handle(ctx, record)
+			}
 		}
 		if dropped > 0 {
 			c.log.Warn("signing clock log lines dropped behind a logger that blocked", "dropped", dropped)

@@ -580,7 +580,11 @@ long: it is warned about once, the heartbeat and site health report `degraded`
 without waiting on the write, no value waits on the disk, and the write is
 retried no sooner than 1,000 ms after the previous one started, never per
 message. It closes, under the issuing lock, only on a completion covering the
-last value issued. An episode is not a GW-6 heartbeat failure. A start whose
+last value issued. An episode is not a GW-6 heartbeat failure. The clock's log records are decided
+under its lock, stamped then, and written in that order by one drainer off
+every lock, so no caller waits on the logger; at most 64 wait behind a
+logger that blocks, later ones are counted, and the refusal after a stop is
+logged once. A start whose
 first value would reach the ceiling is refused, and `Next` refuses a value at
 it (`ErrSigningClockExhausted`) or once stopped (`ErrSigningClockClosed`).
 Rule 9's upper bound is judged against the wall clock read when a mark is
@@ -607,6 +611,11 @@ first more than 300,000 ms ahead of the wall clock is logged as a warning. Verif
 `TestParallelSignersAcrossAStalledReservation`,
 `TestAStalledMarkWriteDegradesTheHeartbeatWithoutStoppingIt`,
 `TestSiteHealthReportsAnEpisodeWithoutWaitingOnTheWrite`,
+`TestTheHeartbeatThatOpensAnEpisodeReportsIt`,
+`TestAStopDuringAnEpisodeStartsNoWrite`, `TestAWriteFailingAfterStopArmsNoRetry`,
+`TestALoggerThatBlocksNeverHoldsUpSigning`,
+`TestLogLinesKeepTheOrderTheyWereDecidedIn`,
+`TestLogLinesBehindABlockedLoggerAreBounded`,
 `TestTheAheadWarningIsAtThreeHundredThousandMilliseconds`,
 `TestNoMarkReachesTheCeilingNearIt`,
 `TestAJumpPastTheReservationReservesAhead`,

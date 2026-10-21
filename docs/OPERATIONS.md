@@ -753,7 +753,14 @@ outstanding after that, it logs `ERROR gateway state directory is not
 quiescent; ending the process without releasing it` and exits with status 1
 without releasing the lock, which ends with the process; restart it as usual
 once the disk answers. A start whose first write has not completed within
-1,000 ms is refused the same way. On a disk that has stopped answering, the
+1,000 ms is refused the same way. The signing clock's own lines (the episode warning
+and recovery, the ahead warning and `signing clock is stopped; refusing to
+sign`, logged once per stop) are written in order by a background writer,
+each stamped with the time it was decided, so a logger that blocks never
+holds up signing. Behind such a logger at most 64 of them wait; later ones
+are counted in `WARN signing clock log lines dropped behind a logger that
+blocked` with `dropped`, and lines still waiting when the process ends,
+including the status 1 exit, are lost. On a disk that has stopped answering, the
 operating system may not end the process until it does, and the gateway stays
 stuck: a second gateway on the same directory is still refused. A mark so
 large that the clock would run out (at or above 9223372036854773806) refuses the
