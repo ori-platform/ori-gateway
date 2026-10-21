@@ -403,20 +403,25 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	var webhookBridge webhookBridgeRunner
 	var webhookBridgeReady atomic.Bool
 	webhookBridgeRefusals := webhookbridge.NewRefusals()
+	// Every webhook request is admitted through its own gate, which the
+	// decision to stop refuses with the broker callbacks (rule 13).
+	webhookIngress := newCallbackGate()
 	if cfg.WebhookBridge.Enabled {
 		webhookBridge, err = deps.newWebhookBridge(cfg.WebhookBridge, webhookbridge.Options{
 			Logger:   deps.logger,
 			Now:      deps.now,
 			Refusals: webhookBridgeRefusals,
+			Admit:    webhookIngress.admit,
 		})
 		if err != nil {
 			return fmt.Errorf("construct webhook bridge: %w", err)
 		}
 	}
 
-	// Every broker callback runs through one gate. Shutdown closes it, which
-	// refuses any later callback and waits for those running, before any
-	// state they may sign or write is released (GW-15).
+	// Every broker callback runs through one gate. The decision to stop
+	// refuses any later callback at once; shutdown then waits for those
+	// running, before any state they may sign or write is released (GW-15;
+	// gateway-config/v2 gateway.state_directory rule 13).
 	callbacks := newCallbackGate()
 
 	// One count of size and volume refusals for every broker client, projected
@@ -541,15 +546,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	// once shutdown begins none starts, and runGateway never returns while
 	// one is still running (GW-15).
 	postureDebounce := newPostureDebouncer()
+	decision := &stopDecision{callbacks: callbacks, webhook: webhookIngress, posture: postureDebounce, stopSigning: stopSigning, cancel: cancel}
+	decideStop := decision.decide
 	defer func() {
-		stopSigning()
+		decideStop()
 		cancel()
 		callbacks.close()
+		webhookIngress.close()
 		postureDebounce.close()
 	}()
 	runners := newSupervisedRunners(runCtx)
+	// The stop is decided where it happens: when the runner group's context
+	// ends, on the parent's cancellation or a runner's failure, before the
+	// group cancels and joins its runners, not once that is noticed here.
+	stopOnRunnersEnd := context.AfterFunc(runners.ctx, decideStop)
+	defer stopOnRunnersEnd()
 	shutdownRunners := func() {
-		stopSigning()
+		decideStop()
 		cancel()
 		postureDebounce.close()
 		_ = runners.wait()
@@ -656,7 +669,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	}
 	runners.start("heartbeat", hb.Run)
 
-	go evictStaleRuntimeNodes(runCtx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
+	// Supervised like every long-running task, so it stops with the others
+	// and never outlives runGateway (GW-15).
+	runners.start("site node eviction", func(ctx context.Context) error {
+		evictStaleRuntimeNodes(ctx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
+		<-ctx.Done()
+		return ctx.Err()
+	})
 
 	dispatcherOptions := dispatcher.Options{ProviderTimeoutMS: cfg.Provider.TimeoutMS, Now: deps.now, SigningClock: signingClock}
 	if gatewaySecrets.Enabled {
@@ -681,6 +700,17 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	}
 
 	requestErr := make(chan error, 1)
+	// stopCause is the request failure escalation when a callback decided
+	// the stop on it, which ended the run's context: a later step that fails
+	// for that reason reports the escalation, not its own cancellation.
+	stopCause := func(err error) error {
+		select {
+		case escalation := <-requestErr:
+			return escalation
+		default:
+			return err
+		}
+	}
 	var requestFailureMu sync.Mutex
 	requestFailures := 0
 	if err := client.Subscribe(runCtx, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
@@ -693,15 +723,26 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			if !errors.Is(err, dispatcher.ErrPublishResponse) {
 				return
 			}
+			// A reply the run's own stop refused, by cancelling it or by
+			// closing the signing clock, is not a delivery failure.
+			if runCtx.Err() != nil || errors.Is(err, mqttauth.ErrSigningClockClosed) {
+				return
+			}
 			requestFailureMu.Lock()
 			requestFailures++
 			failures := requestFailures
 			requestFailureMu.Unlock()
 			if failures >= defaultRequestFailureLimit {
+				// The escalation is recorded first, so whatever the decision's
+				// cancellation ends reports it. The stop is then decided here,
+				// where it happens, not once the escalation is noticed;
+				// refusing never waits, so it is safe from inside an admitted
+				// callback.
 				select {
 				case requestErr <- fmt.Errorf("reasoning request failure limit reached: %w", err):
 				default:
 				}
+				decideStop()
 			}
 			return
 		}
@@ -710,7 +751,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		requestFailureMu.Unlock()
 	}); err != nil {
 		shutdownRunners()
-		return fmt.Errorf("subscribe reasoning requests: %w", err)
+		return stopCause(fmt.Errorf("subscribe reasoning requests: %w", err))
 	}
 
 	if evidenceIngress != nil {
@@ -741,7 +782,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			}
 		}); err != nil {
 			shutdownRunners()
-			return fmt.Errorf("subscribe outbound evidence: %w", err)
+			return stopCause(fmt.Errorf("subscribe outbound evidence: %w", err))
 		}
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
 			ackTopic, err := contracts.EvidenceInboundAckTopic(deviceID)
@@ -753,7 +794,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 				logInboundAckResult(deps.logger, returnPublisher.HandleAck(topic, payload))
 			}); err != nil {
 				shutdownRunners()
-				return fmt.Errorf("subscribe evidence inbound acknowledgements: %w", err)
+				return stopCause(fmt.Errorf("subscribe evidence inbound acknowledgements: %w", err))
 			}
 		}
 	}
@@ -781,7 +822,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			}
 		}); err != nil {
 			shutdownRunners()
-			return fmt.Errorf("subscribe runtime node heartbeats: %w", err)
+			return stopCause(fmt.Errorf("subscribe runtime node heartbeats: %w", err))
 		}
 	}
 
@@ -824,7 +865,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 				}
 			}); err != nil {
 				shutdownRunners()
-				return fmt.Errorf("subscribe tier c enrichment requests: %w", err)
+				return stopCause(fmt.Errorf("subscribe tier c enrichment requests: %w", err))
 			}
 		}
 	}
@@ -862,11 +903,16 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	select {
 	case <-ctx.Done():
 		shutdownRunners()
-		return disconnectBroker(client, &disconnect)
+		// A stop a callback already decided on the escalation is reported as
+		// that, even when the caller cancels before it is noticed.
+		return stopCause(disconnectBroker(client, &disconnect))
 	case err := <-runners.done():
-		stopSigning()
+		decideStop()
 		cancel()
 		postureDebounce.close()
+		if escalation := stopCause(nil); escalation != nil {
+			return escalation
+		}
 		if ctx.Err() != nil {
 			return disconnectBroker(client, &disconnect)
 		}
@@ -1303,12 +1349,17 @@ func (d *postureDebouncer) done(deviceID string) {
 	d.running.Done()
 }
 
-// close refuses every later fetch and waits for those running to finish. It
-// may be called more than once.
-func (d *postureDebouncer) close() {
+// refuse refuses every later fetch, without waiting for those running.
+func (d *postureDebouncer) refuse() {
 	d.mu.Lock()
 	d.closed = true
 	d.mu.Unlock()
+}
+
+// close refuses every later fetch and waits for those running to finish. It
+// may be called more than once.
+func (d *postureDebouncer) close() {
+	d.refuse()
 	d.running.Wait()
 }
 
@@ -1399,9 +1450,32 @@ func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCo
 	return view
 }
 
+// stopDecision is the decision to stop (gateway-config/v2
+// gateway.state_directory rule 13): one step that stops admitting work, every
+// broker callback, webhook request and posture fetch, stops issuing signing
+// values, and cancels the run, before anything already admitted is joined.
+// It may be taken more than once, and concurrently.
+type stopDecision struct {
+	callbacks   *callbackGate
+	webhook     *callbackGate
+	posture     *postureDebouncer
+	stopSigning func()
+	// cancel ends the run's context, so every supervised runner stops at
+	// once, not when runGateway next looks.
+	cancel func()
+}
+
+func (d *stopDecision) decide() {
+	d.callbacks.refuse()
+	d.webhook.refuse()
+	d.posture.refuse()
+	d.stopSigning()
+	d.cancel()
+}
+
 // callbackGate admits broker callbacks while the gateway runs and joins them
-// at shutdown: once closed it refuses every later callback, and close returns
-// only when every callback it admitted has returned.
+// at shutdown. refuse stops admission at the decision to stop; close also
+// returns only once every callback it admitted has returned.
 type callbackGate struct {
 	mu      sync.Mutex
 	closed  bool
@@ -1420,11 +1494,24 @@ func (g *callbackGate) enter() bool {
 	return true
 }
 
-func (g *callbackGate) close() {
+// refuse refuses every later callback, without waiting for those running.
+func (g *callbackGate) refuse() {
 	g.mu.Lock()
 	g.closed = true
 	g.mu.Unlock()
+}
+
+func (g *callbackGate) close() {
+	g.refuse()
 	g.running.Wait()
+}
+
+// admit is enter for a caller that releases what it was admitted to.
+func (g *callbackGate) admit() (release func(), admitted bool) {
+	if !g.enter() {
+		return nil, false
+	}
+	return g.running.Done, true
 }
 
 // wrap returns b with every handler it subscribes run through the gate.

@@ -53,13 +53,18 @@ it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
 a request it refuses, malformed, unauthenticated or not fresh, neither counts
 nor resets the count, so no sender can end the gateway by sending junk. A
 heartbeat that the run's own stop interrupts, or that the signing clock the
-stop has closed refuses, is not a failure.
+stop has closed refuses, is not a failure, and neither is a reasoning reply
+the stop refuses, by cancelling it or closing the signing clock, so a clean
+stop is never reported as a failure.
 Verified by `TestHeartbeatFailureLimit`,
 `TestGatewayHeartbeatFailureReturnsError`,
 `TestMainEscalatesRepeatedRequestHandlerFailures`,
 `TestMalformedReasoningRequestsNeverStopTheGateway`,
-`TestAPublishTheStopInterruptsIsNotAFailure`, and
-`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`.
+`TestAPublishTheStopInterruptsIsNotAFailure`,
+`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`,
+`TestAReplyTheStopRefusesIsNotADeliveryFailure`,
+`TestAReplyFailingAfterTheCallerCancelsIsNotCounted`, and
+`TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
@@ -134,10 +139,23 @@ new runner does not require updating every early-return drain path by hand.
 Every broker callback, on both broker clients, runs through one callback gate,
 and posture fetches started from the runtime heartbeat callback are owned the
 same way: once shutdown begins none starts, and `runGateway` does not return
-while one is still running. Deciding to stop stops the signing clock first
-(gateway-config/v2 `gateway.state_directory` rule 13): from then on it refuses
-to sign and starts no write of its mark, so a callback still running sends no
-reply. The state directory is released only once no write of the mark is
+while one is still running. The decision to stop is one step
+(gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
+broker callback, on both broker clients, every later webhook request, which
+the bridge answers 503 without reading it, and every later posture fetch,
+stops the signing clock, which from then on refuses to sign and starts no
+write of its mark, so a callback still running sends no reply, and cancels
+the run. It is taken where the stop happens: when the supervised runners' context ends, on the
+parent's cancellation or a runner's failure, and in the callback that reaches
+the request failure limit, as well as on every other stop path; it always
+comes before any callback is joined or the state directory released. Every
+supervised runner, the webhook bridge, site health server and site node
+eviction among them, is cancelled by the decision itself, so none runs on
+while runGateway is still in a startup step, and a startup step that then
+fails, or a caller that cancels before it is noticed, reports the request
+failure escalation, not its own cancellation;
+callbacks, webhook requests and fetches already admitted are joined after
+that. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
 from the decision to stop, the process ends with status 1 without releasing it,
 and no further run begins in that process. A start refused while its first
@@ -162,8 +180,17 @@ Verified by `TestMainStartupMissingConfig`,
 `TestAStartWhoseFirstWriteStallsIsRefusedHoldingTheLock`,
 `TestAStalledWriteHoldsTheLockUntilTheProcessEnds` (a child process),
 `TestABlockedLoggerNeverDelaysTheRequiredExit`,
-`TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`, and
-`TestAStateDirectoryRefusalCreatesNoEvidenceQueue`.
+`TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`,
+`TestAStateDirectoryRefusalCreatesNoEvidenceQueue`,
+`TestNoCallbackIsAdmittedAfterTheDecisionToStop`,
+`TestARunnerFailureDecidesTheStopBeforeTheRunnersAreJoined`,
+`TestTheDecisionToStopRefusesEveryAdmissionInOneStep`,
+`TestARefusedGateStillJoinsWhatItAdmitted`,
+`TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt`,
+`TestTheFailureLimitIsReportedWhenStartupCompletes`,
+`TestTheFailureLimitIsReportedWhenTheCallerCancelsLater`,
+`TestShutdownJoinsAnAdmittedWebhookRequest` and
+`TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
@@ -186,7 +213,10 @@ refused request is answered 429 and never forwarded. Sender state is capped
 refused at load if tighter than the runtime's own on approval replies (10 a
 minute, burst 5), and the ceiling if below it; the bridge never decides
 authority or filters by an approver list. Refusals are counted for site health (`webhook_bridge_refused`)
-and logged paced with the limit name only. Verified by
+and logged paced with the limit name only. Once the gateway has decided to
+stop, the bridge answers every request 503 without reading it, and releases
+an admitted request only once it is answered (GW-15).
+Verified by
 `TestOneSendersBurstIsRefusedWhileAnotherSenderIsForwarded`,
 `TestEverySpellingOfOneNumberIsOneSender`,
 `TestSendersTheBridgeCannotReadShareOneLimitedBucket`,
@@ -196,8 +226,9 @@ and logged paced with the limit name only. Verified by
 `TestSiteHealthCountsTheBridgesRefusals`,
 `TestDistinctSendersAreHeldByTheGlobalCeilingInBoundedMemory`,
 `TestForwardedBodiesStayExactAndSignedUnderLimiting`,
-`TestRefusalsLogNoSenderHashOrContent` and
-`TestWebhookBridgeRejectsInvalidConfig`.
+`TestRefusalsLogNoSenderHashOrContent`,
+`TestWebhookBridgeRejectsInvalidConfig` and
+`TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded`.
 
 17. `GW-17` Runtime export clients must match runtime MQTT security posture.
 When `gateway.auth.enabled=true`, export requests must be HMAC-signed and
