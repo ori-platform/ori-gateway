@@ -4,150 +4,185 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/ori-platform/ori-gateway/internal/broker"
+	"github.com/ori-platform/ori-gateway/internal/contracts"
 )
 
-// requestPool runs a family's handler off the broker callback, so a provider
-// call or a reply's publish never holds the client's ordered message
-// delivery. A reply waits for its PUBACK, which paho cannot read while the
-// callback that published it still holds delivery; every later message on
-// the client, runtime heartbeats included, would wait with it.
+// requestPool runs the handlers of the families it serves off the broker
+// callback, so a provider call or a reply's publish never holds the client's
+// ordered message delivery. A reply waits for its PUBACK, which paho cannot
+// read while the callback that published it still holds delivery; every
+// later message on the client, runtime heartbeats included, would wait with
+// it.
 //
-// Requests held are bounded per device as the ingress rate is: each
+// What a device holds of each family is bounded as the ingress rate is: each
 // configured device has its own allowance, the family's burst, and every
 // other device segment shares one, so no sender can take a configured
-// device's. A request over the bound is dropped unanswered and counted as a
+// device's. A message over the bound is dropped unanswered and counted as a
 // volume drop (gateway-api/v2 Payload Volume); its runtime times out and
-// falls back, or keeps its bytes and carries them again. Each request is
+// falls back, or keeps its bytes and carries them again. Each message is
 // admitted through the callback gate as it is accepted, so none is accepted
-// once the stop is decided and shutdown joins every one accepted (GW-15).
+// once the stop is decided and shutdown joins every one accepted (GW-15);
+// one still waiting when the run stops is released without being handled.
 //
-// An unordered pool runs each request on its own goroutine. An ordered pool
-// runs each device's requests one at a time in the order they arrived, on a
-// goroutine that lives while that device has requests waiting, so a family
-// whose handling must keep arrival order per device keeps it.
+// An unordered pool runs each message on its own goroutine. An ordered pool
+// runs each device's messages, of every family it serves, one at a time in
+// the order they arrived, on a goroutine that lives while that device has
+// messages waiting.
 type requestPool struct {
-	family     string
-	limit      int
 	ordered    bool
+	limits     map[string]int
 	gate       *callbackGate
+	stopped    <-chan struct{}
 	ingress    *broker.IngressStats
 	logger     *slog.Logger
 	configured map[string]bool
 
 	mu       sync.Mutex
-	held     map[string]int
+	held     map[heldKey]int
 	queued   map[string][]pendingRequest
 	draining map[string]bool
+}
+
+type heldKey struct {
+	device string
+	family string
 }
 
 type pendingRequest struct {
 	topic   string
 	payload []byte
+	family  string
+	handle  broker.MessageHandler
 	release func()
 }
 
-func newRequestPool(family string, devices []string, gate *callbackGate, ingress *broker.IngressStats, logger *slog.Logger) *requestPool {
+// newRequestPool returns an unordered pool for families. stopped is the
+// run's end: a message still waiting then is not handled.
+func newRequestPool(devices []string, gate *callbackGate, stopped <-chan struct{}, ingress *broker.IngressStats, logger *slog.Logger, families ...string) *requestPool {
 	configured := make(map[string]bool, len(devices))
 	for _, deviceID := range devices {
 		configured[deviceID] = true
 	}
+	limits := make(map[string]int, len(families))
+	for _, family := range families {
+		limits[family] = broker.IngressRates[family].Burst
+	}
 	return &requestPool{
-		family:     family,
-		limit:      broker.IngressRates[family].Burst,
+		limits:     limits,
 		gate:       gate,
+		stopped:    stopped,
 		ingress:    ingress,
 		logger:     logger,
 		configured: configured,
-		held:       make(map[string]int),
+		held:       make(map[heldKey]int),
 		queued:     make(map[string][]pendingRequest),
 		draining:   make(map[string]bool),
 	}
 }
 
-// newOrderedRequestPool is newRequestPool for a family whose requests from
-// one device are handled one at a time, in arrival order.
-func newOrderedRequestPool(family string, devices []string, gate *callbackGate, ingress *broker.IngressStats, logger *slog.Logger) *requestPool {
-	p := newRequestPool(family, devices, gate, ingress, logger)
+// newOrderedRequestPool is newRequestPool for families whose messages from
+// one device are handled one at a time, in arrival order across them all.
+func newOrderedRequestPool(devices []string, gate *callbackGate, stopped <-chan struct{}, ingress *broker.IngressStats, logger *slog.Logger, families ...string) *requestPool {
+	p := newRequestPool(devices, gate, stopped, ingress, logger, families...)
 	p.ordered = true
 	return p
 }
 
-// handler returns a broker handler that runs handle for each request off the
-// callback, within the pool's bound.
-func (p *requestPool) handler(handle broker.MessageHandler) broker.MessageHandler {
+// subscribe subscribes topic on client with handle run through the pool. A
+// topic outside the families the pool serves is refused.
+func (p *requestPool) subscribe(ctx context.Context, client brokerClient, topic string, qos byte, handle broker.MessageHandler) error {
+	family, ok := contracts.PayloadFamily(topic)
+	if _, served := p.limits[family]; !ok || !served {
+		return fmt.Errorf("request pool does not serve the family of %q", topic)
+	}
+	return client.Subscribe(ctx, topic, qos, p.handler(family, handle))
+}
+
+func (p *requestPool) handler(family string, handle broker.MessageHandler) broker.MessageHandler {
 	return func(topic string, payload []byte) {
-		key := requestDeviceSegment(topic)
-		if !p.configured[key] {
-			key = ""
+		device := requestDeviceSegment(topic)
+		if !p.configured[device] {
+			device = ""
 		}
+		key := heldKey{device: device, family: family}
 		p.mu.Lock()
-		if p.held[key] >= p.limit {
-			p.mu.Unlock()
-			p.ingress.Drop(p.family, len(payload))
-			return
-		}
 		release, admitted := p.gate.admit()
 		if !admitted {
 			p.mu.Unlock()
 			return
 		}
+		if p.held[key] >= p.limits[family] {
+			p.mu.Unlock()
+			release()
+			p.ingress.Drop(family, len(payload))
+			return
+		}
 		p.held[key]++
-		req := pendingRequest{topic: topic, payload: payload, release: release}
+		req := pendingRequest{topic: topic, payload: payload, family: family, handle: handle, release: release}
 		if !p.ordered {
 			p.mu.Unlock()
-			go p.run(key, req, handle)
+			go p.run(device, req)
 			return
 		}
-		p.queued[key] = append(p.queued[key], req)
-		start := !p.draining[key]
-		p.draining[key] = true
+		p.queued[device] = append(p.queued[device], req)
+		start := !p.draining[device]
+		p.draining[device] = true
 		p.mu.Unlock()
 		if start {
-			go p.drain(key, handle)
+			go p.drain(device)
 		}
 	}
 }
 
-// drain runs key's queued requests in order until none is left.
-func (p *requestPool) drain(key string, handle broker.MessageHandler) {
+// drain runs device's queued messages in order until none is left.
+func (p *requestPool) drain(device string) {
 	for {
 		p.mu.Lock()
-		req := p.queued[key][0]
-		p.queued[key] = p.queued[key][1:]
+		req := p.queued[device][0]
+		p.queued[device] = p.queued[device][1:]
 		p.mu.Unlock()
-		if last := p.run(key, req, handle); last {
+		if last := p.run(device, req); last {
 			return
 		}
 	}
 }
 
-// run handles req and reports whether it was the last one an ordered pool
-// held queued for key. Releasing req's admission is the last thing it does,
-// so nothing touches the pool once the gate has joined every request.
-func (p *requestPool) run(key string, req pendingRequest, handle broker.MessageHandler) (last bool) {
+// run handles req, unless the run has stopped, and reports whether it was
+// the last message an ordered pool held queued for device. Releasing req's
+// admission is the last thing it does, so nothing touches the pool once the
+// gate has joined every message.
+func (p *requestPool) run(device string, req pendingRequest) (last bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.logger.Warn("mqtt message handler panic", "topic", req.topic, "recover", r)
 		}
+		key := heldKey{device: device, family: req.family}
 		p.mu.Lock()
 		p.held[key]--
 		if p.held[key] == 0 {
 			delete(p.held, key)
 		}
-		if p.ordered && len(p.queued[key]) == 0 {
-			delete(p.queued, key)
-			delete(p.draining, key)
+		if p.ordered && len(p.queued[device]) == 0 {
+			delete(p.queued, device)
+			delete(p.draining, device)
 			last = true
 		}
 		p.mu.Unlock()
 		req.release()
 	}()
-	handle(req.topic, req.payload)
+	select {
+	case <-p.stopped:
+		return false
+	default:
+	}
+	req.handle(req.topic, req.payload)
 	return false
 }
 

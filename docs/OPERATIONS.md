@@ -609,17 +609,28 @@ gateway started, one member for each family above. Abbreviated to one family:
 }
 ```
 
-`volume_dropped` also counts reasoning and enrichment requests, and outbound
-evidence carriages, dropped because their device already held its family's
-burst (20 reasoning requests, 10 enrichment requests, 160 carriages waiting
-or being handled), each logged with the family as `WARN mqtt ingress dropped
-messages over the family rate`. A dropped request is not answered; its runtime
-times out and falls back. A dropped carriage is not acknowledged; its runtime
-keeps the bytes and carries them again.
+`volume_dropped` also counts reasoning and enrichment requests, outbound
+evidence carriages and inbound evidence acknowledgements dropped because their
+device already held its family's burst (20 reasoning requests, 10 enrichment
+requests, 160 carriages and 64 acknowledgements waiting or being handled).
+These are logged apart from rate drops, with the family, as `WARN mqtt ingress
+dropped messages over what one device may hold`. A dropped request is not
+answered; its runtime times out and falls back. A dropped carriage is not
+acknowledged; its runtime keeps the bytes and carries them again. A dropped
+acknowledgement leaves its artifact queued and carried again.
 
-A non-zero count does not degrade the gateway. A count that keeps rising names
-a runtime that is misconfigured or misbehaving; find it from the broker's own
-logs, since the gateway never records which device sent a refused message.
+A non-zero count does not degrade the gateway. A rate drop that keeps rising
+names a runtime that is misconfigured or misbehaving; find it from the
+broker's own logs, since the gateway never records which device sent a
+refused message. A drop over what one device may hold can also mean the
+gateway itself is slow: a slow reasoning or enrichment provider, or slow
+evidence storage. Check the provider's latency and the storage before the
+runtime.
+
+Requests run concurrently: up to 20 reasoning requests per configured device
+(and 20 shared by any other device) and 10 enrichment requests per device can
+reach their provider at once. A provider that serves one request at a time,
+or limits its rate, sees that load.
 
 ## Runtime exports time out or are not verified
 

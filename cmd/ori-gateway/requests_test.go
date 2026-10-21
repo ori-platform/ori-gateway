@@ -5,8 +5,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -19,6 +22,7 @@ import (
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/enrichment"
 	"github.com/ori-platform/ori-gateway/internal/provider"
 	"github.com/ori-platform/ori-gateway/internal/runtimeclient"
 )
@@ -136,15 +140,15 @@ func TestAHeartbeatIsNotDelayedByAReasoningCall(t *testing.T) {
 func TestEachDeviceHasItsOwnAllowanceOfRequestsInFlight(t *testing.T) {
 	gate := newCallbackGate()
 	ingress := broker.NewIngressStats(slog.New(slog.DiscardHandler))
-	pool := newRequestPool(contracts.FamilyReasoningRequest, []string{"dev-01", "dev-02"}, gate, ingress, slog.New(slog.DiscardHandler))
+	pool := newRequestPool([]string{"dev-01", "dev-02"}, gate, nil, ingress, slog.New(slog.DiscardHandler), contracts.FamilyReasoningRequest)
 	limit := broker.IngressRates[contracts.FamilyReasoningRequest].Burst
-	if pool.limit != limit || limit < 1 {
-		t.Fatalf("allowance = %d, want the family burst %d", pool.limit, limit)
+	if pool.limits[contracts.FamilyReasoningRequest] != limit || limit < 1 {
+		t.Fatalf("allowance = %d, want the family burst %d", pool.limits[contracts.FamilyReasoningRequest], limit)
 	}
 	release := make(chan struct{})
 	var mu sync.Mutex
 	ran := map[string]int{}
-	handler := pool.handler(func(topic string, _ []byte) {
+	handler := pool.handler(contracts.FamilyReasoningRequest, func(topic string, _ []byte) {
 		mu.Lock()
 		ran[topic]++
 		mu.Unlock()
@@ -177,6 +181,12 @@ func TestEachDeviceHasItsOwnAllowanceOfRequestsInFlight(t *testing.T) {
 	if got := dropped(); got != 2 {
 		t.Fatalf("volume drops = %d, want unconfigured device segments to share one allowance", got)
 	}
+	// After the stop nothing is accepted, so nothing is counted either.
+	gate.refuse()
+	handler("ori/dev-01/reasoning/request", []byte(`{}`))
+	if got := dropped(); got != 2 {
+		t.Fatalf("volume drops = %d after the stop, want a refused message uncounted", got)
+	}
 
 	close(release)
 	gate.close()
@@ -190,10 +200,10 @@ func TestEachDeviceHasItsOwnAllowanceOfRequestsInFlight(t *testing.T) {
 func TestNoRequestStartsOnceTheStopIsDecided(t *testing.T) {
 	gate := newCallbackGate()
 	ingress := broker.NewIngressStats(slog.New(slog.DiscardHandler))
-	pool := newRequestPool(contracts.FamilyReasoningRequest, []string{"dev-01"}, gate, ingress, slog.New(slog.DiscardHandler))
+	pool := newRequestPool([]string{"dev-01"}, gate, nil, ingress, slog.New(slog.DiscardHandler), contracts.FamilyReasoningRequest)
 	gate.refuse()
 	ran := make(chan struct{}, 1)
-	pool.handler(func(string, []byte) { ran <- struct{}{} })("ori/dev-01/reasoning/request", []byte(`{}`))
+	pool.handler(contracts.FamilyReasoningRequest, func(string, []byte) { ran <- struct{}{} })("ori/dev-01/reasoning/request", []byte(`{}`))
 	gate.close()
 	select {
 	case <-ran:
@@ -210,10 +220,10 @@ func TestNoRequestStartsOnceTheStopIsDecided(t *testing.T) {
 // does, so no request outlives the run (GW-15).
 func TestShutdownJoinsARequestRunningOffTheCallback(t *testing.T) {
 	gate := newCallbackGate()
-	pool := newRequestPool(contracts.FamilyReasoningRequest, []string{"dev-01"}, gate,
-		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler))
+	pool := newRequestPool([]string{"dev-01"}, gate, nil,
+		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler), contracts.FamilyReasoningRequest)
 	entered, release := make(chan struct{}), make(chan struct{})
-	pool.handler(func(string, []byte) {
+	pool.handler(contracts.FamilyReasoningRequest, func(string, []byte) {
 		close(entered)
 		<-release
 	})("ori/dev-01/reasoning/request", []byte(`{}`))
@@ -242,9 +252,9 @@ func TestShutdownJoinsARequestRunningOffTheCallback(t *testing.T) {
 func TestAPanickingRequestIsRecoveredAndReleased(t *testing.T) {
 	gate := newCallbackGate()
 	var logs syncBuffer
-	pool := newRequestPool(contracts.FamilyReasoningRequest, []string{"dev-01"}, gate,
-		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.NewTextHandler(&logs, nil)))
-	pool.handler(func(string, []byte) { panic("provider exploded") })("ori/dev-01/reasoning/request", []byte(`{}`))
+	pool := newRequestPool([]string{"dev-01"}, gate, nil,
+		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.NewTextHandler(&logs, nil)), contracts.FamilyReasoningRequest)
+	pool.handler(contracts.FamilyReasoningRequest, func(string, []byte) { panic("provider exploded") })("ori/dev-01/reasoning/request", []byte(`{}`))
 	gate.close()
 	if len(pool.held) != 0 {
 		t.Fatalf("a panicking request kept its place: %v", pool.held)
@@ -314,10 +324,13 @@ func TestABurstOfOutboundCarriagesIsAcknowledgedWithoutStalling(t *testing.T) {
 	waitUntil(t, "site health", func() bool { ingress, _ := siteIngress(t, siteAddr); return ingress != nil })
 	peer := newRuntimePeer(t, brokerURL, "ori/dev-01/evidence/outbound/ack")
 
-	const burst = 10
+	const burst = 20
+	var want []string
 	started := time.Now()
 	for i := range burst {
 		artifact := mustJSON(t, map[string]any{"v": 1, "device_id": "dev-01", "high_water_seq": i + 1, "signature": "ed25519:opaque"})
+		digest := sha256.Sum256(artifact)
+		want = append(want, "sha256:"+hex.EncodeToString(digest[:]))
 		peer.publish(t, "ori/dev-01/evidence/outbound", mustJSON(t, map[string]string{
 			"device_id": "dev-01", "artifact_type": "checkpoint", "artifact_b64": base64.StdEncoding.EncodeToString(artifact),
 		}))
@@ -328,9 +341,13 @@ func TestABurstOfOutboundCarriagesIsAcknowledgedWithoutStalling(t *testing.T) {
 	if elapsed := time.Since(started); elapsed >= 4*time.Second {
 		t.Fatalf("the burst took %v to acknowledge, want well within the publish bound", elapsed)
 	}
+	// Admission order is the courier's delivery order, so each carriage is
+	// admitted, and acknowledged, in the order it arrived.
+	var got []string
 	for _, raw := range peer.received("ori/dev-01/evidence/outbound/ack") {
 		var ack struct {
-			Outcome string `json:"outcome"`
+			Outcome        string `json:"outcome"`
+			ArtifactDigest string `json:"artifact_digest"`
 		}
 		if err := json.Unmarshal(raw, &ack); err != nil {
 			t.Fatal(err)
@@ -338,6 +355,10 @@ func TestABurstOfOutboundCarriagesIsAcknowledgedWithoutStalling(t *testing.T) {
 		if ack.Outcome != "queued" {
 			t.Fatalf("a carriage was acknowledged %q, want queued: %s", ack.Outcome, raw)
 		}
+		got = append(got, ack.ArtifactDigest)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("carriages were acknowledged in the order\n%v\nwant arrival order\n%v", got, want)
 	}
 }
 
@@ -347,11 +368,11 @@ func TestABurstOfOutboundCarriagesIsAcknowledgedWithoutStalling(t *testing.T) {
 func TestAnOrderedPoolKeepsEachDevicesArrivalOrder(t *testing.T) {
 	gate := newCallbackGate()
 	ingress := broker.NewIngressStats(slog.New(slog.DiscardHandler))
-	pool := newOrderedRequestPool(contracts.FamilyEvidenceOutbound, []string{"dev-01", "dev-02"}, gate, ingress, slog.New(slog.DiscardHandler))
+	pool := newOrderedRequestPool([]string{"dev-01", "dev-02"}, gate, nil, ingress, slog.New(slog.DiscardHandler), contracts.FamilyEvidenceOutbound)
 	release := make(chan struct{})
 	var mu sync.Mutex
 	var order []string
-	handler := pool.handler(func(topic string, payload []byte) {
+	handler := pool.handler(contracts.FamilyEvidenceOutbound, func(topic string, payload []byte) {
 		if string(payload) == "dev-01:0" {
 			<-release
 		}
@@ -396,13 +417,13 @@ func TestAnOrderedPoolKeepsEachDevicesArrivalOrder(t *testing.T) {
 func TestAnOrderedPoolBoundsWhatADeviceHolds(t *testing.T) {
 	gate := newCallbackGate()
 	ingress := broker.NewIngressStats(slog.New(slog.DiscardHandler))
-	pool := newOrderedRequestPool(contracts.FamilyEvidenceOutbound, []string{"dev-01"}, gate, ingress, slog.New(slog.DiscardHandler))
+	pool := newOrderedRequestPool([]string{"dev-01"}, gate, nil, ingress, slog.New(slog.DiscardHandler), contracts.FamilyEvidenceOutbound)
 	limit := broker.IngressRates[contracts.FamilyEvidenceOutbound].Burst
 	release := make(chan struct{})
 	var ran sync.WaitGroup
 	ran.Add(1)
 	var once sync.Once
-	handler := pool.handler(func(string, []byte) {
+	handler := pool.handler(contracts.FamilyEvidenceOutbound, func(string, []byte) {
 		once.Do(ran.Done)
 		<-release
 	})
@@ -420,5 +441,210 @@ func TestAnOrderedPoolBoundsWhatADeviceHolds(t *testing.T) {
 	gate.close()
 	if len(pool.held) != 0 || len(pool.queued) != 0 {
 		t.Fatalf("state left after the gate closed: held %v queued %v", pool.held, pool.queued)
+	}
+}
+
+// TestABurstOfEnrichmentRequestsIsAnsweredWithoutStalling is the enrichment
+// family's burst through a real broker: every request is answered well
+// within the 5s publish timeout.
+func TestABurstOfEnrichmentRequestsIsAnsweredWithoutStalling(t *testing.T) {
+	brokerURL := startEmbeddedBroker(t)
+	siteAddr := loopbackAddr(t)
+	cfg := validConfig()
+	cfg.Gateway.BrokerURL = brokerURL
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: siteAddr}
+	cfg.Reporting = config.ReportingConfig{
+		Provider:        config.ReportingProviderGemini,
+		Gemini:          config.ReportingGeminiConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-flash"},
+		TierCEnrichment: config.TierCEnrichmentConfig{Enabled: true},
+	}
+	deps := baseDeps(t, cfg, newFakeBroker(), &fakeProvider{healthy: true}, newFakeHeartbeat())
+	deps.newBroker = func(opts broker.Options) (brokerClient, error) { return broker.New(opts) }
+	deps.newTierCEnrichmentProvider = func(config.ReportingConfig) (enrichment.Provider, error) {
+		return &fakeTierCEnrichmentProvider{}, nil
+	}
+	deps.newRuntimeClient = func(brokerClient, ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		return &runtimeclient.FakeClient{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	t.Cleanup(func() { cancel(); <-done })
+	waitUntil(t, "site health", func() bool { ingress, _ := siteIngress(t, siteAddr); return ingress != nil })
+	peer := newRuntimePeer(t, brokerURL, "ori/dev-01/tier_c/enrichment/response")
+
+	const burst = 8
+	started := time.Now()
+	for i := range burst {
+		var req contracts.TierCEnrichmentRequest
+		if err := json.Unmarshal(validTierCEnrichmentRequestPayload(t), &req); err != nil {
+			t.Fatal(err)
+		}
+		req.RequestID = fmt.Sprintf("enrich-%d", i)
+		peer.publish(t, "ori/dev-01/tier_c/enrichment/request", mustJSON(t, req))
+	}
+	waitUntil(t, "every enrichment request in the burst to be answered", func() bool {
+		return len(peer.received("ori/dev-01/tier_c/enrichment/response")) == burst
+	})
+	if elapsed := time.Since(started); elapsed >= 4*time.Second {
+		t.Fatalf("the burst took %v to answer, want well within the 5s publish timeout", elapsed)
+	}
+}
+
+// TestADuplicateInFlightRequestNeitherCountsNorResetsTheFailureCount fails
+// every reply, holds one request in the provider and sends its request_id
+// again after four failures: the refused repeat leaves the count alone, so
+// the fifth failure still reaches the limit (GW-6).
+func TestADuplicateInFlightRequestNeitherCountsNorResetsTheFailureCount(t *testing.T) {
+	fb := newFakeBroker()
+	fb.publishErr = errors.New("broker refuses replies")
+	prov := &heldProvider{fakeProvider: fakeProvider{healthy: true}, entered: make(chan struct{}), release: make(chan struct{})}
+	var logs syncBuffer
+	deps := baseDeps(t, validConfig(), fb, &prov.fakeProvider, newFakeHeartbeat())
+	deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return selectiveHold{prov}, nil }
+	deps.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gateway did not subscribe")
+	}
+	handler := fb.currentHandler()
+	request := func(id string) []byte {
+		return mustJSON(t, contracts.ReasoningRequest{
+			RequestID: id, DeviceID: "site-a", SensorType: "current_clamp", TriggerName: "overcurrent",
+			Prompt: "Explain anomaly.", ActionTierHint: contracts.ActionTierC, TimeoutMS: 1000,
+		})
+	}
+	lines := func(text string) int { return strings.Count(logs.String(), text) }
+
+	handler("ori/site-a/reasoning/request", request("held"))
+	<-prov.entered
+	for i := range defaultRequestFailureLimit - 1 {
+		handler("ori/site-a/reasoning/request", request(fmt.Sprintf("fail-%d", i)))
+	}
+	waitUntil(t, "four delivery failures", func() bool { return lines("publish response") == defaultRequestFailureLimit-1 })
+	handler("ori/site-a/reasoning/request", request("held"))
+	waitUntil(t, "the repeat to be refused", func() bool { return lines("already in flight") == 1 })
+	handler("ori/site-a/reasoning/request", request("fail-last"))
+	select {
+	case err := <-done:
+		t.Fatalf("the gateway returned %v while the held request was still running", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(prov.release)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
+			t.Fatalf("runGateway = %v, want the request failure escalation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("five delivery failures with a refused repeat between them did not escalate:\n%s", logs.String())
+	}
+}
+
+// selectiveHold holds only the request named "held" in its provider.
+type selectiveHold struct{ *heldProvider }
+
+func (p selectiveHold) Reason(ctx context.Context, req contracts.ReasoningRequest) (contracts.ReasoningResponse, error) {
+	if req.RequestID == "held" {
+		return p.heldProvider.Reason(ctx, req)
+	}
+	return p.heldProvider.fakeProvider.Reason(ctx, req)
+}
+
+// TestAPoolRefusesATopicOutsideItsFamilies subscribes a pool to a topic of a
+// family it does not serve: the subscription is refused, so a pool wired to
+// the wrong family stops the start rather than bounding with another
+// family's allowance.
+func TestAPoolRefusesATopicOutsideItsFamilies(t *testing.T) {
+	pool := newOrderedRequestPool([]string{"dev-01"}, newCallbackGate(), nil,
+		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler), contracts.FamilyEvidenceOutbound)
+	fb := newFakeBroker()
+	if err := pool.subscribe(context.Background(), fb, contracts.GatewayReasoningRequestTopicFilter, 1, func(string, []byte) {}); err == nil {
+		t.Fatal("a pool for outbound evidence subscribed reasoning requests")
+	}
+	if err := pool.subscribe(context.Background(), fb, "not/a/family", 1, func(string, []byte) {}); err == nil {
+		t.Fatal("a pool subscribed a topic of no family")
+	}
+	if err := pool.subscribe(context.Background(), fb, contracts.EvidenceOutboundTopicFilter, 1, func(string, []byte) {}); err != nil {
+		t.Fatalf("a pool refused its own family: %v", err)
+	}
+}
+
+// TestAMessageWaitingWhenTheRunStopsIsReleasedUnhandled queues messages
+// behind a held one and stops the run: the waiting messages are not handled,
+// and every admission is still released, so nothing durable is done after the
+// stop and shutdown is not held up by a queue.
+func TestAMessageWaitingWhenTheRunStopsIsReleasedUnhandled(t *testing.T) {
+	gate := newCallbackGate()
+	stopped := make(chan struct{})
+	pool := newOrderedRequestPool([]string{"dev-01"}, gate, stopped,
+		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler), contracts.FamilyEvidenceOutbound)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var handled []string
+	handler := pool.handler(contracts.FamilyEvidenceOutbound, func(_ string, payload []byte) {
+		if string(payload) == "first" {
+			close(entered)
+			<-release
+		}
+		mu.Lock()
+		handled = append(handled, string(payload))
+		mu.Unlock()
+	})
+	handler("ori/dev-01/evidence/outbound", []byte("first"))
+	<-entered
+	handler("ori/dev-01/evidence/outbound", []byte("second"))
+	handler("ori/dev-01/evidence/outbound", []byte("third"))
+	close(stopped)
+	gate.refuse()
+	close(release)
+	gate.close()
+	if strings.Join(handled, ",") != "first" {
+		t.Fatalf("handled %v after the stop, want only the one already running", handled)
+	}
+	if len(pool.held) != 0 || len(pool.queued) != 0 || len(pool.draining) != 0 {
+		t.Fatalf("state left after the stop: held %v queued %v draining %v", pool.held, pool.queued, pool.draining)
+	}
+}
+
+// TestCarriagesAndAcknowledgementsShareEachDevicesOrder interleaves two
+// families in one ordered pool: a device's messages run in arrival order
+// across both, so an acknowledgement never overtakes a carriage that arrived
+// before it, and each family keeps its own allowance.
+func TestCarriagesAndAcknowledgementsShareEachDevicesOrder(t *testing.T) {
+	gate := newCallbackGate()
+	pool := newOrderedRequestPool([]string{"dev-01"}, gate, nil,
+		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler),
+		contracts.FamilyEvidenceOutbound, contracts.FamilyEvidenceInboundAck)
+	if pool.limits[contracts.FamilyEvidenceOutbound] != broker.IngressRates[contracts.FamilyEvidenceOutbound].Burst ||
+		pool.limits[contracts.FamilyEvidenceInboundAck] != broker.IngressRates[contracts.FamilyEvidenceInboundAck].Burst {
+		t.Fatalf("allowances = %v, want each family's burst", pool.limits)
+	}
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var order []string
+	record := func(_ string, payload []byte) {
+		if string(payload) == "carriage-0" {
+			<-release
+		}
+		mu.Lock()
+		order = append(order, string(payload))
+		mu.Unlock()
+	}
+	carriage := pool.handler(contracts.FamilyEvidenceOutbound, record)
+	ack := pool.handler(contracts.FamilyEvidenceInboundAck, record)
+	carriage("ori/dev-01/evidence/outbound", []byte("carriage-0"))
+	ack("ori/dev-01/evidence/inbound/ack", []byte("ack-0"))
+	carriage("ori/dev-01/evidence/outbound", []byte("carriage-1"))
+	ack("ori/dev-01/evidence/inbound/ack", []byte("ack-1"))
+	close(release)
+	gate.close()
+	if got := strings.Join(order, ","); got != "carriage-0,ack-0,carriage-1,ack-1" {
+		t.Fatalf("ran %s, want arrival order across both families", got)
 	}
 }

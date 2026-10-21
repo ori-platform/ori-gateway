@@ -20,6 +20,10 @@ import (
 const (
 	RefusalPayloadTooLarge = "payload_too_large"
 	RefusalVolumeDropped   = "volume_dropped"
+	// refusalHeldLimit is a volume drop at a handler's own bound on what a
+	// device may hold, counted as volume_dropped but logged apart from the
+	// rate: it can follow the gateway's own slowness as well as a sender's.
+	refusalHeldLimit = "held_limit"
 )
 
 // ingressLogInterval paces the refusal log: one line per family and reason at
@@ -134,12 +138,11 @@ func (s *IngressStats) Snapshot() map[string]IngressCount {
 	return out
 }
 
-// Drop counts and logs a message its handler dropped over the subscription's
-// own bound on requests in flight, as a volume drop: the rate at which a
-// receiver processes messages is bounded there too (gateway-api/v2 Payload
-// Volume).
+// Drop counts and logs a message its handler dropped over its own bound on
+// what one device may hold, as a volume drop: the rate at which a receiver
+// processes messages is bounded there too (gateway-api/v2 Payload Volume).
 func (s *IngressStats) Drop(family string, length int) {
-	s.refuse(family, RefusalVolumeDropped, length)
+	s.refuse(family, refusalHeldLimit, length)
 }
 
 func (s *IngressStats) refuse(family, reason string, length int) {
@@ -152,7 +155,7 @@ func (s *IngressStats) refuse(family, reason string, length int) {
 	switch reason {
 	case RefusalPayloadTooLarge:
 		count.PayloadTooLarge++
-	case RefusalVolumeDropped:
+	case RefusalVolumeDropped, refusalHeldLimit:
 		count.VolumeDropped++
 	}
 	key := ingressLogKey{family: family, reason: reason}
@@ -218,6 +221,11 @@ func (s *IngressStats) write(key ingressLogKey, line ingressLine) {
 	}
 	if key.reason == RefusalVolumeDropped {
 		s.log.Warn("mqtt ingress dropped messages over the family rate",
+			"family", key.family, "dropped", line.count)
+		return
+	}
+	if key.reason == refusalHeldLimit {
+		s.log.Warn("mqtt ingress dropped messages over what one device may hold",
 			"family", key.family, "dropped", line.count)
 		return
 	}

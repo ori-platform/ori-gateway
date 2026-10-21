@@ -462,3 +462,35 @@ func TestNewRejectsInvalidDependencies(t *testing.T) {
 		t.Fatal("expected negative publish timeout error")
 	}
 }
+
+// TestARequestAlreadyInFlightIsRefusedAndDeliversNothing holds a request in
+// the provider and sends its request_id again: the repeat is refused as
+// ErrRequestInFlight, reaches no provider and publishes nothing, so it is
+// neither a delivery failure nor a delivered reply (GW-6). The request in
+// flight still answers its request_id (GW-2).
+func TestARequestAlreadyInFlightIsRefusedAndDeliversNothing(t *testing.T) {
+	pub := &fakePublisher{}
+	prov := &fakeProvider{block: make(chan struct{})}
+	d := newTestDispatcher(t, pub, prov, Options{ProviderTimeoutMS: 1000})
+	first := make(chan error, 1)
+	go func() {
+		first <- d.HandleRequest(context.Background(), "ori/site-a/reasoning/request", validPayload(t, nil))
+	}()
+	for prov.callCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	err := d.HandleRequest(context.Background(), "ori/site-a/reasoning/request", validPayload(t, nil))
+	if !errors.Is(err, ErrRequestInFlight) || errors.Is(err, ErrPublishResponse) {
+		t.Fatalf("repeat = %v, want ErrRequestInFlight alone", err)
+	}
+	if prov.callCount() != 1 || pub.callCount() != 0 {
+		t.Fatalf("the repeat reached the provider or published: provider %d, published %d", prov.callCount(), pub.callCount())
+	}
+	close(prov.block)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if resp := pub.publishedResponse(t); resp.RequestID != "req-1" || pub.callCount() != 1 {
+		t.Fatalf("the request in flight answered %q in %d replies, want req-1 once", resp.RequestID, pub.callCount())
+	}
+}

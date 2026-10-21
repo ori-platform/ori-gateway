@@ -32,6 +32,11 @@ var (
 	// request it accepted: the one failure the gateway escalates under GW-6.
 	// A request it refuses, malformed, unauthenticated or not fresh, is not.
 	ErrPublishResponse = errors.New("dispatcher: publish response")
+	// ErrRequestInFlight refuses a request whose request_id is already being
+	// handled: it is not answered on its own, since the request in flight
+	// answers that request_id, and it delivers nothing, so it is neither a
+	// delivery failure nor a delivered reply.
+	ErrRequestInFlight = errors.New("dispatcher: request_id already in flight")
 )
 
 // confidenceDecimals bounds `confidence` to four decimal places at emission.
@@ -147,7 +152,7 @@ func (d *Dispatcher) HandleRequest(ctx context.Context, topic string, payload []
 	}
 	req.Auth = nil
 	if !d.begin(req.RequestID) {
-		return nil
+		return ErrRequestInFlight
 	}
 	defer d.finish(req.RequestID)
 
