@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -292,6 +293,28 @@ func TestExportsArePacedPerDeviceAtTheRuntimesRate(t *testing.T) {
 			}
 		}
 	}
+	// After an idle spell refills both bursts, edge-1 spends its whole burst:
+	// edge-2's next request is sent at once, from its own.
+	mu.Lock()
+	clock = clock.Add(10 * time.Second)
+	mu.Unlock()
+	for range 8 {
+		if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	before := clock
+	mu.Unlock()
+	if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-2"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	waited := clock.Sub(before)
+	mu.Unlock()
+	if waited != 0 {
+		t.Fatalf("edge-2's request waited %v after edge-1 spent its burst, want none: the devices share a bucket", waited)
+	}
 	for device, times := range sent {
 		if over := overRuntimeRate(times); over >= 0 {
 			t.Fatalf("%s's request %d was sent beyond 2 a second, burst 10", device, over)
@@ -488,8 +511,24 @@ func TestPacedExportsSurviveArrivalJitterAtTheRuntime(t *testing.T) {
 
 // TestProductionPacingWaitsOnTheRealClock builds a client with no pacing
 // option on the clock production uses: the first request to a device, whose
-// bucket starts empty, waits about one interval at 1.6 a second.
+// bucket starts empty, waits about one interval at 1.6 a second. The clock is
+// monotonic and its wait blocks rather than spins.
 func TestProductionPacingWaitsOnTheRealClock(t *testing.T) {
+	now, sleep := productionPacingClock()
+	if !strings.Contains(now().String(), " m=") {
+		t.Fatalf("the production pacing clock reads %v, want a monotonic reading", now())
+	}
+	began := time.Now()
+	cpu, measured := processCPU(t)
+	if err := sleep(context.Background(), 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if slept := time.Since(began); slept < 100*time.Millisecond {
+		t.Fatalf("the production pacing wait returned after %v, want 100ms", slept)
+	}
+	if after, _ := processCPU(t); measured && after-cpu > 50*time.Millisecond {
+		t.Fatalf("the production pacing wait spent %v of CPU over 100ms, want it to block", after-cpu)
+	}
 	pacingClock = productionPacingClock
 	t.Cleanup(func() { pacingClock = instantClock })
 	start, sent := pacedSends(t, 1, time.Now, sleepContext)
