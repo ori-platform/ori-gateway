@@ -898,7 +898,9 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	select {
 	case <-ctx.Done():
 		shutdownRunners()
-		return disconnectBroker(client, &disconnect)
+		// A stop a callback already decided on the escalation is reported as
+		// that, even when the caller cancels before it is noticed.
+		return stopCause(disconnectBroker(client, &disconnect))
 	case err := <-runners.done():
 		decideStop()
 		cancel()

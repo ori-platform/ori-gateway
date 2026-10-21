@@ -59,7 +59,7 @@ func (b *heldSubscribeBroker) Subscribe(ctx context.Context, topic string, qos b
 // (gateway-config/v2 gateway.state_directory rule 13). The held subscribe
 // then fails with the cancellation, and runGateway reports the escalation.
 func TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt(t *testing.T) {
-	if err := stopAtTheFailureLimit(t, false); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
+	if err := stopAtTheFailureLimit(t, false, false); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
 		t.Fatalf("runGateway = %v, want the request failure escalation", err)
 	}
 }
@@ -70,7 +70,19 @@ func TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt(t *testing.
 // always reports the escalation.
 func TestTheFailureLimitIsReportedWhenStartupCompletes(t *testing.T) {
 	for i := range 20 {
-		if err := stopAtTheFailureLimit(t, true); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
+		if err := stopAtTheFailureLimit(t, true, false); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
+			t.Fatalf("run %d: runGateway = %v, want the request failure escalation", i, err)
+		}
+	}
+}
+
+// TestTheFailureLimitIsReportedWhenTheCallerCancelsLater runs the same stop,
+// then has the caller cancel the run before the held subscribe completes, so
+// runGateway reaches its wait with both the escalation and the caller's
+// cancellation ready, many times over: it always reports the escalation.
+func TestTheFailureLimitIsReportedWhenTheCallerCancelsLater(t *testing.T) {
+	for i := range 20 {
+		if err := stopAtTheFailureLimit(t, true, true); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
 			t.Fatalf("run %d: runGateway = %v, want the request failure escalation", i, err)
 		}
 	}
@@ -78,8 +90,9 @@ func TestTheFailureLimitIsReportedWhenStartupCompletes(t *testing.T) {
 
 // stopAtTheFailureLimit runs the gateway to the request failure limit while
 // it is held in a startup subscribe, checks that the decision stopped every
-// admission, then releases the subscribe and returns what runGateway returns.
-func stopAtTheFailureLimit(t *testing.T, heldCompletes bool) error {
+// admission, then releases the subscribe, after cancelling the run first if
+// cancelFirst is set, and returns what runGateway returns.
+func stopAtTheFailureLimit(t *testing.T, heldCompletes, cancelFirst bool) error {
 	t.Helper()
 	var forwards atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -196,7 +209,10 @@ func stopAtTheFailureLimit(t *testing.T, heldCompletes bool) error {
 	if n := forwards.Load(); n != 0 {
 		t.Fatalf("a webhook request after the decision to stop was forwarded %d times, want none", n)
 	}
-	// The run ends on its own decision, without the caller cancelling it.
+	// The run ends on its own decision, unless the caller cancels it first.
+	if cancelFirst {
+		cancel()
+	}
 	releaseHeld()
 	select {
 	case err := <-done:

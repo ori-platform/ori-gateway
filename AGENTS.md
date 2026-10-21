@@ -147,7 +147,8 @@ comes before any callback is joined or the state directory released. Every
 supervised runner, the webhook bridge, site health server and site node
 eviction among them, is cancelled by the decision itself, so none runs on
 while runGateway is still in a startup step, and a startup step that then
-fails reports the request failure escalation, not its own cancellation;
+fails, or a caller that cancels before it is noticed, reports the request
+failure escalation, not its own cancellation;
 callbacks, webhook requests and fetches already admitted are joined after
 that. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
@@ -182,6 +183,7 @@ Verified by `TestMainStartupMissingConfig`,
 `TestARefusedGateStillJoinsWhatItAdmitted`,
 `TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt`,
 `TestTheFailureLimitIsReportedWhenStartupCompletes`,
+`TestTheFailureLimitIsReportedWhenTheCallerCancelsLater`,
 `TestShutdownJoinsAnAdmittedWebhookRequest` and
 `TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded`.
 
