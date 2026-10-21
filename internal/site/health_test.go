@@ -577,23 +577,26 @@ func TestAnUnobservedNodeKeepsItsRecordedExportSeverity(t *testing.T) {
 func TestProjectionReadsSeverityUnderTheLock(t *testing.T) {
 	reg := NewRegistry()
 	projector := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a", "node-b"}, NodeTTLMS: 5000})
+	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for i := range 500 {
+	// The writer runs for as long as the projector reads, so they overlap.
+	wg.Go(func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			severity := ExportSeverityCritical
 			if i%2 == 0 {
 				severity = ExportSeverityOK
 			}
 			reg.UpsertPosture([]string{"node-a", "node-b"}[i%2], SiteNodePosture{ExportSeverity: severity})
 		}
-	}()
-	go func() {
-		defer wg.Done()
-		for range 500 {
-			projector.Project(time.UnixMilli(100_000), healthyGateway())
-		}
-	}()
+	})
+	for range 2000 {
+		projector.Project(time.UnixMilli(100_000), healthyGateway())
+	}
+	close(stop)
 	wg.Wait()
 }
