@@ -518,9 +518,15 @@ clock from when it received the last one; the node's `last_seen_ms` plays no
 part, so a node whose clock is ahead or behind is not reported silent while it
 is still reporting.
 
-A node that goes silent after a `healthy` or `degraded` heartbeat is dropped
-from the registry after three heartbeat intervals and shows as unobserved and
-`degraded`, as before.
+A node whose health export last read `critical` is retained the same way,
+whatever its heartbeats said, and the log line is `runtime node silent after a
+critical health export; kept critical until its export reads otherwise`. Its
+next heartbeat does not end that: only a later health export that reads
+otherwise does.
+
+A node that goes silent after a `healthy` or `degraded` heartbeat, with no
+`critical` export, is dropped from the registry after three heartbeat
+intervals and shows as unobserved and `degraded`, as before.
 
 The retention has no time limit, because any time limit would be critical
 decaying through silence. It is bounded instead by the configured devices:
@@ -650,6 +656,45 @@ same 30 seconds.
   verify. The request keeps waiting for a verified one. Repeated lines while
   exports still complete point to another client publishing on runtime topics;
   check the broker's ACLs.
+
+## A runtime's health export reads unknown
+
+The gateway reads the severity of a runtime's `health` export, for site health
+and the weekly report, by gateway-api/v2's reading of `status` while runtimes
+adopt runtime-health/v4: `ok`, `degraded`, `critical` or `unknown`. `critical`
+always reads `critical`, from `critical: true` or a `critical` status, however
+the rest of the export looks. `ok` comes only from an export the gateway
+recognises as a runtime release's healthy snapshot, or from the projection's
+explicit `ok`; a missing, mistyped or inconsistent member, a status no release
+writes, or an export naming another device reads `unknown`, never `ok`. In
+site health an export that reads `critical` makes its node `critical`, and one
+that reads `degraded` or `unknown` makes a healthy node `degraded`; it never
+lowers what the node's heartbeat reported. The node keeps the severity its
+export last read through every later heartbeat, and through a failed or
+skipped export fetch, until a later export reads otherwise; the other posture
+members (`broker_hardening`, `encryption`, `alert_outbox`) are still replaced
+by each heartbeat and filled again by the next fetch. So a node whose export
+read `critical` stays `critical` while later exports fail, with only `WARN
+runtime health fetch failed for posture update` in the log, until an export
+reads otherwise or the gateway restarts. A critical reading that arrives
+after its node was dropped for silence is kept too: the node shows unobserved,
+`stale` and `critical`, and stays `critical` when it reports again, until an
+export reads otherwise.
+
+- `WARN runtime health export severity unreadable; reported unknown`, with the
+  `device_id` and a `fault` naming why, such as `member_absent:uptime_s`,
+  `status_unrecognised`, `device_mismatch` or `inconsistent_degradation_reasons`.
+  It is logged once when the fault begins, and again only after the device's
+  export has read without it. The fault never carries the export's content,
+  its degradation reasons or its `health_socket_path`. A runtime release the
+  gateway does not recognise, or a misbehaving runtime, causes it; check the
+  runtime's version.
+- `fault=unmarked_after_projection`: once the gateway has read the
+  runtime-health/v4 projection from a device, it refuses every later export
+  from that device that is not the projection, until the gateway restarts. A
+  runtime rolled back to an earlier release, as its installer does after a
+  failed health check, reads `unknown` (or `critical`, if it reports critical)
+  until then; restart the gateway once the rollback is intended.
 
 ## SMS webhook bridge refuses requests with 429
 

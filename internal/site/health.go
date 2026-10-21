@@ -51,9 +51,40 @@ type SiteNode struct {
 // zero-import invariant. LockoutRiskLevels is intentionally excluded — its keys
 // are phone numbers (sender identities) and must never appear in projected output.
 type SiteNodePosture struct {
+	// ExportSeverity is the severity of the node's runtime health export as
+	// the gateway read it under gateway-api/v2: ok, degraded, critical or
+	// unknown. It only raises the node's status, critical to critical and
+	// anything else but ok to degraded, and never lowers it. Empty means no
+	// export has been read. The registry keeps it for the node across
+	// heartbeats (NodeHeartbeat.ExportSeverity). It is not itself a member of
+	// the projection, whose posture members gateway-api/v2 lists.
+	ExportSeverity  string                      `json:"-"`
 	BrokerHardening *SiteNodeBrokerPosture      `json:"broker_hardening,omitempty"`
 	Encryption      *SiteNodeEncryptionPosture  `json:"encryption,omitempty"`
 	AlertOutbox     *SiteNodeAlertOutboxPosture `json:"alert_outbox,omitempty"`
+}
+
+// Export severities, as SiteNodePosture.ExportSeverity carries them.
+const (
+	ExportSeverityOK       = "ok"
+	ExportSeverityDegraded = "degraded"
+	ExportSeverityCritical = "critical"
+	ExportSeverityUnknown  = "unknown"
+)
+
+// exportSeverityFloor reads a node's export severity into the projection's
+// order. An export that read critical is critical; one that read anything but
+// ok, unknown included, is degraded, so a severity the gateway could not read
+// is never healthy. No export read raises nothing.
+func exportSeverityFloor(severity string) int {
+	switch severity {
+	case "", ExportSeverityOK:
+		return severityHealthy
+	case ExportSeverityCritical:
+		return severityCritical
+	default:
+		return severityDegraded
+	}
 }
 
 // SiteNodeBrokerPosture mirrors runtimeclient.GatewayBrokerPosture for the site projection.
@@ -194,7 +225,7 @@ func NewProjector(registry *Registry, opts ProjectOptions) *Projector {
 // Project returns a point-in-time SiteHealth snapshot.
 func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	nowMS := now.UnixMilli()
-	snapshot := p.registry.Snapshot()
+	snapshot, exportSeverity := p.registry.snapshotWithExportSeverity()
 	observed := make(map[string]NodeHeartbeat, len(snapshot))
 	for _, n := range snapshot {
 		observed[n.DeviceID] = n
@@ -204,9 +235,13 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	for _, deviceID := range p.opts.ExpectedDeviceIDs {
 		n, seen := observed[deviceID]
 		if !seen {
+			// An unobserved node is degraded, and critical when its health
+			// export last read critical: a reading recorded before or after
+			// its eviction is never folded by the node's silence.
+			status := max(severityDegraded, exportSeverityFloor(exportSeverity[deviceID]))
 			nodes = append(nodes, SiteNode{
 				DeviceID:        deviceID,
-				Status:          SiteStatusDegraded,
+				Status:          siteStatusName(status),
 				GatewayObserved: false,
 				Stale:           true,
 			})
@@ -215,7 +250,8 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 		stale := siteNodeIsStale(n.LastSeenMS, nowMS, p.opts.NodeTTLMS)
 		// The node's own status is a floor, never a ceiling: staleness and an
 		// evidence-integrity problem raise a healthy node to degraded and leave
-		// a critical one critical. An evidence-integrity problem is a truncated
+		// a critical one critical, and the severity read from its health
+		// export raises it the same way. An evidence-integrity problem is a truncated
 		// or rolled-back chain, or signing reported unavailable while evidence
 		// is enabled: Tier C/D actions are accumulating without verifiable
 		// attestation. Gap count alone stays informational — transient signing
@@ -224,6 +260,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 		if stale {
 			status = max(status, severityDegraded)
 		}
+		status = max(status, exportSeverityFloor(n.ExportSeverity))
 		if n.Evidence != nil &&
 			(n.Evidence.TruncationSuspected || n.Evidence.HeadRegressed || !n.Evidence.Available) {
 			status = max(status, severityDegraded)
