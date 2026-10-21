@@ -80,6 +80,9 @@ type MQTTClient struct {
 	// lifetime ends the client's own background work, the shared subscribe,
 	// when its owner stops.
 	lifetime context.Context
+	// health reads every health export's severity, and holds each device's
+	// latch for as long as the client runs.
+	health healthReader
 
 	mu         sync.Mutex
 	pending    map[string]pendingExport
@@ -264,7 +267,15 @@ func (c *MQTTClient) Health(ctx context.Context, req HealthRequest) (HealthSnaps
 	if len(items) == 0 {
 		return HealthSnapshot{}, fmt.Errorf("runtimeclient: health export returned no items")
 	}
-	return mapHealthSnapshot(items[0], normalized.DeviceID)
+	// Severity is read only here, after the export has verified, from the
+	// device the request named and the response topic carried; every
+	// consumer of the export reads it through this one reading.
+	reading, fault := c.health.read(items[0], normalized.DeviceID)
+	if fault != "" {
+		c.warn("runtime health export severity unreadable; reported unknown",
+			"device_id", normalized.DeviceID, "fault", fault)
+	}
+	return mapHealthSnapshot(items[0], normalized.DeviceID, reading.severity), nil
 }
 
 func (c *MQTTClient) SensorHistory(ctx context.Context, req SensorHistoryRequest) ([]SensorAggregate, error) {
@@ -865,11 +876,10 @@ func randomRequestID() (string, error) {
 	return hex.EncodeToString(buf[:]), nil
 }
 
-func mapHealthSnapshot(item map[string]any, fallbackDeviceID string) (HealthSnapshot, error) {
-	status := stringValue(item, "status", "")
-	if status == "" {
-		status = "ok"
-	}
+// mapHealthSnapshot maps a health export item already read as severity. The
+// snapshot names the device the export was requested from, never the item's
+// own device_id, which its sender writes.
+func mapHealthSnapshot(item map[string]any, deviceID string, severity string) HealthSnapshot {
 	lastReadingMS := int64Value(item, "last_reading_ms")
 	if lastReadingMS == 0 {
 		lastReadingMS = latestSensorSeenMS(item["sensors"])
@@ -886,8 +896,8 @@ func mapHealthSnapshot(item map[string]any, fallbackDeviceID string) (HealthSnap
 		}
 	}
 	return HealthSnapshot{
-		DeviceID:             stringValue(item, "device_id", fallbackDeviceID),
-		Status:               status,
+		DeviceID:             deviceID,
+		Status:               severity,
 		UptimeS:              floatValue(item, "uptime_s"),
 		LastReadingMS:        lastReadingMS,
 		GatewaySeen:          gatewaySeen,
@@ -896,7 +906,7 @@ func mapHealthSnapshot(item map[string]any, fallbackDeviceID string) (HealthSnap
 		StateStoreEncryption: mapStateStoreEncryptionPosture(item),
 		AlertOutbox:          mapAlertOutboxPosture(item),
 		LockoutRiskLevels:    mapLockoutRiskLevels(item),
-	}, nil
+	}
 }
 
 func mapGatewayBrokerPosture(item map[string]any) *GatewayBrokerPosture {

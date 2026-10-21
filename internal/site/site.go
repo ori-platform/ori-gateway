@@ -102,7 +102,7 @@ func cloneSiteNodePosture(p *SiteNodePosture) *SiteNodePosture {
 	if p == nil {
 		return nil
 	}
-	clone := &SiteNodePosture{}
+	clone := &SiteNodePosture{ExportSeverity: p.ExportSeverity}
 	if p.BrokerHardening != nil {
 		b := *p.BrokerHardening
 		clone.BrokerHardening = &b

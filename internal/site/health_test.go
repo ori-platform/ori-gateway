@@ -415,3 +415,40 @@ func TestSiteHealthViewerInterface(t *testing.T) {
 	// Projector must satisfy the Viewer interface.
 	var _ Viewer = NewProjector(reg, ProjectOptions{})
 }
+
+// TestExportSeverityOnlyRaisesANode projects every heartbeat status beside
+// every export severity: the node takes the more severe, an export that read
+// critical is critical, one that read anything but ok is degraded, and no
+// export severity lowers what the heartbeat reported.
+func TestExportSeverityOnlyRaisesANode(t *testing.T) {
+	nowMS := int64(10000)
+	want := map[string]map[string]string{
+		NodeStatusHealthy: {
+			"": SiteStatusHealthy, ExportSeverityOK: SiteStatusHealthy, ExportSeverityDegraded: SiteStatusDegraded,
+			ExportSeverityUnknown: SiteStatusDegraded, ExportSeverityCritical: SiteStatusCritical, "healthy": SiteStatusDegraded,
+		},
+		NodeStatusDegraded: {
+			"": SiteStatusDegraded, ExportSeverityOK: SiteStatusDegraded, ExportSeverityDegraded: SiteStatusDegraded,
+			ExportSeverityUnknown: SiteStatusDegraded, ExportSeverityCritical: SiteStatusCritical, "healthy": SiteStatusDegraded,
+		},
+		NodeStatusCritical: {
+			"": SiteStatusCritical, ExportSeverityOK: SiteStatusCritical, ExportSeverityDegraded: SiteStatusCritical,
+			ExportSeverityUnknown: SiteStatusCritical, ExportSeverityCritical: SiteStatusCritical, "healthy": SiteStatusCritical,
+		},
+	}
+	for heartbeat, bySeverity := range want {
+		for severity, status := range bySeverity {
+			reg := NewRegistry()
+			reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: heartbeat, LastSeenMS: nowMS - 100})
+			reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: severity})
+			h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
+				Project(time.UnixMilli(nowMS), healthyGateway())
+			if h.Nodes[0].Status != status || h.Status != status {
+				t.Errorf("heartbeat %q, export %q: node %q site %q, want %q", heartbeat, severity, h.Nodes[0].Status, h.Status, status)
+			}
+			if encoded, _ := json.Marshal(h); strings.Contains(string(encoded), "export_severity") || strings.Contains(string(encoded), "ExportSeverity") {
+				t.Errorf("export severity projected as a member: %s", encoded)
+			}
+		}
+	}
+}

@@ -128,6 +128,24 @@ enforcement is structural: the gateway has no SQLite driver dependency and
 runtime-client tests such as `TestTierCDecisionLogRequestValidation` validate
 the export request contract. Future transport tests must preserve this boundary
 and must not add direct SQLite access.
+The severity of a runtime health export is read once, in
+`runtimeclient.MQTTClient.Health` after the export has verified, by
+gateway-api/v2's reading of `status` while runtimes adopt runtime-health/v4,
+and every consumer, site health and the weekly report among them, reads it
+from `HealthSnapshot.Status`: `ok`, `degraded`, `critical` or `unknown`.
+Critical is never read as less; `ok` comes only from an explicit `ok` in a
+marked projection or from an unmarked item well formed for the after-v2.5.0 or
+the v2.5.0 encoding that states no condition holds, so an absent, unknown,
+mistyped or inconsistent member reads `unknown`, logged once with a fixed fault
+name and never the export's content. Once a device has served the projection,
+its unmarked items read `unknown`, unless critical, for as long as the client
+runs; the device is the requested one, never the item's `device_id`.
+Verified by the `gateway-api/vectors/health-transition-v2.json` corpus and its
+baselines through `TestHealthTransitionCorpus` (the verified export path, with
+encryption off and on) and
+`TestHealthTransitionReachesSiteHealthAndTheWeeklyReport` (into the site
+posture, the site health projection and the weekly report input), and by
+`TestALatchBelongsToTheRequestedDevice`.
 
 15. `GW-15` Gateway process startup and shutdown must be ordered and explicit.
 Startup order is config, provider, broker connect, optional modules, heartbeat,
@@ -257,7 +275,11 @@ node's status, and the site status is the most severe of the gateway and every
 node, `critical` over `degraded` over `healthy`. A node whose last heartbeat
 was `critical` is never evicted for silence: it stays `critical` until it
 reports again or is removed from `gateway.device_ids` (`docs/OPERATIONS.md`).
+The severity read from a node's health export (GW-14) only raises its status,
+critical to critical and anything but ok to degraded, and is not itself a
+projected member.
 Verified by `TestCriticalHeartbeatKeptThroughGetHealth`,
+`TestExportSeverityOnlyRaisesANode`,
 `TestCriticalNodeNeverFoldedBelowCritical`,
 `TestFallbackAfterEvidenceHistoryStaysCritical`,
 `TestSilentCriticalNodeStaysCriticalUntilItReportsAgain`, and

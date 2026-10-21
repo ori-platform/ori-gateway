@@ -595,12 +595,12 @@ func TestMQTTRuntimeClientIgnoresUnmatchedResponseID(t *testing.T) {
 		b.respond(req.DeviceID, "other-id", map[string]any{
 			"export_type": "health",
 			"complete":    true,
-			"items":       []any{map[string]any{"device_id": "wrong"}},
+			"items":       []any{map[string]any{"device_id": "wrong", "uptime_s": 1}},
 		})
 		b.respond(req.DeviceID, req.RequestID, map[string]any{
 			"export_type": "health",
 			"complete":    true,
-			"items":       []any{map[string]any{"device_id": "edge-1", "status": "healthy"}},
+			"items":       []any{map[string]any{"device_id": "edge-1", "uptime_s": 42}},
 		})
 	}
 
@@ -608,7 +608,7 @@ func TestMQTTRuntimeClientIgnoresUnmatchedResponseID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.DeviceID != "edge-1" || health.Status != "healthy" {
+	if health.DeviceID != "edge-1" || health.UptimeS != 42 {
 		t.Fatalf("unmatched response was not ignored: %#v", health)
 	}
 }

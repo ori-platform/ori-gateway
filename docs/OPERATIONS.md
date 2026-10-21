@@ -651,6 +651,35 @@ same 30 seconds.
   exports still complete point to another client publishing on runtime topics;
   check the broker's ACLs.
 
+## A runtime's health export reads unknown
+
+The gateway reads the severity of a runtime's `health` export, for site health
+and the weekly report, by gateway-api/v2's reading of `status` while runtimes
+adopt runtime-health/v4: `ok`, `degraded`, `critical` or `unknown`. `critical`
+always reads `critical`, from `critical: true` or a `critical` status, however
+the rest of the export looks. `ok` comes only from an export the gateway
+recognises as a runtime release's healthy snapshot, or from the projection's
+explicit `ok`; a missing, mistyped or inconsistent member, a status no release
+writes, or an export naming another device reads `unknown`, never `ok`. In
+site health an export that reads `critical` makes its node `critical`, and one
+that reads `degraded` or `unknown` makes a healthy node `degraded`; it never
+lowers what the node's heartbeat reported.
+
+- `WARN runtime health export severity unreadable; reported unknown`, with the
+  `device_id` and a `fault` naming why, such as `member_absent:uptime_s`,
+  `status_unrecognised`, `device_mismatch` or `inconsistent_degradation_reasons`.
+  It is logged once when the fault begins, and again only after the device's
+  export has read without it. The fault never carries the export's content,
+  its degradation reasons or its `health_socket_path`. A runtime release the
+  gateway does not recognise, or a misbehaving runtime, causes it; check the
+  runtime's version.
+- `fault=unmarked_after_projection`: once the gateway has read the
+  runtime-health/v4 projection from a device, it refuses every later export
+  from that device that is not the projection, until the gateway restarts. A
+  runtime rolled back to an earlier release, as its installer does after a
+  failed health check, reads `unknown` (or `critical`, if it reports critical)
+  until then; restart the gateway once the rollback is intended.
+
 ## SMS webhook bridge refuses requests with 429
 
 The SMS webhook bridge bounds how many provider requests it signs and forwards

@@ -1373,7 +1373,7 @@ func fetchAndUpsertPosture(ctx context.Context, rc runtimeclient.Client, registr
 }
 
 func sitePostureFromHealth(h runtimeclient.HealthSnapshot) site.SiteNodePosture {
-	var posture site.SiteNodePosture
+	posture := site.SiteNodePosture{ExportSeverity: siteExportSeverity(h.Status)}
 	if h.GatewayBrokerPosture != nil {
 		b := h.GatewayBrokerPosture
 		posture.BrokerHardening = &site.SiteNodeBrokerPosture{
@@ -1412,6 +1412,22 @@ func sitePostureFromHealth(h runtimeclient.HealthSnapshot) site.SiteNodePosture 
 	}
 	// h.LockoutRiskLevels intentionally excluded — keys are phone numbers.
 	return posture
+}
+
+// siteExportSeverity carries the severity the runtime client read from a
+// health export into the site projection. A value the client never returns is
+// unknown, never ok.
+func siteExportSeverity(status string) string {
+	switch status {
+	case runtimeclient.HealthStatusOK:
+		return site.ExportSeverityOK
+	case runtimeclient.HealthStatusDegraded:
+		return site.ExportSeverityDegraded
+	case runtimeclient.HealthStatusCritical:
+		return site.ExportSeverityCritical
+	default:
+		return site.ExportSeverityUnknown
+	}
 }
 
 func providerStatusFromProvider(reasoningProvider provider.Provider) heartbeat.ProviderStatus {
