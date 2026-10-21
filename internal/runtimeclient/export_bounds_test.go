@@ -1018,18 +1018,21 @@ func (h *errorOnlyHandler) WithGroup(string) slog.Handler      { return h }
 // the count of those dropped, which is a warning too.
 func TestALoggerThatEnablesOnlyErrorsIsWrittenNothing(t *testing.T) {
 	h := &errorOnlyHandler{entered: make(chan struct{}), release: make(chan struct{})}
-	log := slog.New(&queuedHandler{inner: h, notes: &noteLog{}})
+	notes := &noteLog{}
+	log := slog.New(&queuedHandler{inner: h, notes: notes})
 	log.Warn("line 0")
 	<-h.entered
 	for i := 1; i < 300; i++ {
 		log.Warn(fmt.Sprintf("line %d", i))
 	}
 	close(h.release)
-	// The one being checked, the 64 queued and the count line.
+	// The drainer is idle only once it has finished with the count line.
+	idle := func() bool { notes.mu.Lock(); defer notes.mu.Unlock(); return !notes.draining }
 	deadline := time.Now().Add(2 * time.Second)
-	for h.asked.Load() < 66 && time.Now().Before(deadline) {
+	for !idle() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+	// The one being checked, the 64 queued and the count line.
 	if n := h.asked.Load(); n != 66 {
 		t.Fatalf("the logger was asked its level %d times, want 66", n)
 	}
