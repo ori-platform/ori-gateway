@@ -746,7 +746,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		requestFailureMu.Unlock()
 	}); err != nil {
 		shutdownRunners()
-		return fmt.Errorf("subscribe reasoning requests: %w", err)
+		return stopCause(fmt.Errorf("subscribe reasoning requests: %w", err))
 	}
 
 	if evidenceIngress != nil {

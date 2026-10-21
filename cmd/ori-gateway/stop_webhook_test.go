@@ -28,8 +28,9 @@ import (
 
 // heldSubscribeBroker holds runGateway in its subscribe to one topic, so it
 // cannot yet notice anything a callback reports. Once released, the held
-// subscribe fails with its context's end, as the production broker's does,
-// unless completes is set, as when its acknowledgement arrives anyway.
+// subscribe fails because its context has ended, as a subscribe started
+// after the decision does, unless completes is set, as when an
+// acknowledgement already awaited arrives anyway.
 type heldSubscribeBroker struct {
 	*fakeBroker
 	topic            string
