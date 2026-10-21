@@ -142,10 +142,10 @@ write of its mark, so a callback still running sends no reply. It is taken
 where the stop happens: when the supervised runners' context ends, on the
 parent's cancellation or a runner's failure, and in the callback that reaches
 the request failure limit, as well as on every other stop path; it always
-comes before any callback is joined or the state directory released. Every supervised runner, the
-webhook bridge, site health server and site node eviction among them, is
-cancelled with it; callbacks and fetches already admitted are joined after
-that. The state directory is released only once no write of the mark is
+comes before any callback is joined or the state directory released. Every
+supervised runner, the webhook bridge, site health server and site node
+eviction among them, is cancelled once the stop is decided, before anything is
+joined; callbacks and fetches already admitted are joined after that. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
 from the decision to stop, the process ends with status 1 without releasing it,
 and no further run begins in that process. A start refused while its first
