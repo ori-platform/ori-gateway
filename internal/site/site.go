@@ -3,7 +3,9 @@
 
 package site
 
-import "sync"
+import (
+	"sync"
+)
 
 type NodeHeartbeat struct {
 	DeviceID       string   `json:"device_id"`
@@ -17,6 +19,10 @@ type NodeHeartbeat struct {
 	DegradationReasons []string         `json:"degradation_reasons,omitempty"`
 	Posture            *SiteNodePosture `json:"posture,omitempty"`
 	Evidence           *NodeEvidence    `json:"evidence,omitempty"`
+	// ExportSeverity is the severity last read from the node's runtime health
+	// export, kept by the registry across heartbeats and eviction: only a
+	// later export reading changes it. It is not a projected member.
+	ExportSeverity string `json:"-"`
 }
 
 type Registry struct {
@@ -25,6 +31,10 @@ type Registry struct {
 	// evidence outlives individual heartbeats: it remembers recent chain
 	// heads per device so truncation/rollback stays detectable and sticky.
 	evidence map[string]*evidenceTrack
+	// exportSeverity is the severity last read from each device's health
+	// export. A heartbeat never carries one, so it outlives every heartbeat
+	// and eviction, bounded like the registry by the configured devices.
+	exportSeverity map[string]string
 	// silentCritical holds the devices EvictStale has retained as critical
 	// since their last heartbeat, so the retention is reported once.
 	silentCritical map[string]struct{}
@@ -34,6 +44,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		nodes:          map[string]NodeHeartbeat{},
 		evidence:       map[string]*evidenceTrack{},
+		exportSeverity: map[string]string{},
 		silentCritical: map[string]struct{}{},
 	}
 }
@@ -59,6 +70,10 @@ func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
 		missing := track.observeMissing()
 		heartbeat.Evidence = &missing
 	}
+	// A heartbeat replaces the node's record, posture included, but not the
+	// severity its health export last read: a heartbeat says nothing about
+	// it, so a critical export is never folded by the next heartbeat.
+	heartbeat.ExportSeverity = r.exportSeverity[heartbeat.DeviceID]
 	r.nodes[heartbeat.DeviceID] = heartbeat
 	delete(r.silentCritical, heartbeat.DeviceID)
 }
@@ -66,6 +81,11 @@ func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
 func (r *Registry) Snapshot() []NodeHeartbeat {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.snapshotLocked()
+}
+
+// snapshotLocked is Snapshot, with r.mu held.
+func (r *Registry) snapshotLocked() []NodeHeartbeat {
 	out := make([]NodeHeartbeat, 0, len(r.nodes))
 	for _, hb := range r.nodes {
 		// Every reference-type field must be copied here, not just the
@@ -82,6 +102,25 @@ func (r *Registry) Snapshot() []NodeHeartbeat {
 		out = append(out, hb)
 	}
 	return out
+}
+
+// snapshotWithExportSeverity returns Snapshot and a copy of every recorded
+// export severity, taken under one lock, so a projection reads both at the
+// same moment, the severity of a device with no node included.
+func (r *Registry) snapshotWithExportSeverity() ([]NodeHeartbeat, map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Copied under the lock with nodes, so a projection never pairs a node
+	// set with a later severity. An explicit loop, not maps.Clone, so the
+	// race detector sees the read (TestProjectionReadsSeverityUnderTheLock).
+	// Only a reading is recorded, never an empty severity.
+	severity := make(map[string]string, len(r.exportSeverity))
+	for deviceID, value := range r.exportSeverity {
+		if value != "" {
+			severity[deviceID] = value
+		}
+	}
+	return r.snapshotLocked(), severity
 }
 
 // cloneStrings copies a string slice, preserving nil. The nil/empty
@@ -102,7 +141,7 @@ func cloneSiteNodePosture(p *SiteNodePosture) *SiteNodePosture {
 	if p == nil {
 		return nil
 	}
-	clone := &SiteNodePosture{}
+	clone := &SiteNodePosture{ExportSeverity: p.ExportSeverity}
 	if p.BrokerHardening != nil {
 		b := *p.BrokerHardening
 		clone.BrokerHardening = &b
@@ -118,15 +157,24 @@ func cloneSiteNodePosture(p *SiteNodePosture) *SiteNodePosture {
 	return clone
 }
 
-// UpsertPosture updates the posture for an already-registered node.
-// It is a no-op if the device has not yet been registered via Upsert.
+// UpsertPosture records the severity a health export read, when the posture
+// carries one, which the device keeps until a later export reading, and
+// updates the posture for an already-registered node. The severity is
+// recorded even while the device is not registered, such as a fetch that
+// returns after its node was evicted, so its next heartbeat carries it; the
+// posture itself is not. The caller passes only configured devices, whose
+// heartbeats alone reach the registry, so the record stays bounded by them.
 func (r *Registry) UpsertPosture(deviceID string, posture SiteNodePosture) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if posture.ExportSeverity != "" {
+		r.exportSeverity[deviceID] = posture.ExportSeverity
+	}
 	hb, ok := r.nodes[deviceID]
 	if !ok {
 		return
 	}
+	hb.ExportSeverity = r.exportSeverity[deviceID]
 	hb.Posture = &posture
 	r.nodes[deviceID] = hb
 }
@@ -134,17 +182,19 @@ func (r *Registry) UpsertPosture(deviceID string, posture SiteNodePosture) {
 // EvictStale removes nodes where nowMS-lastSeenMS > ttlMS and returns them.
 // A node exactly at the TTL boundary is retained. Future-dated heartbeats are
 // evicted because clock-skewed nodes must not become immortal in the registry.
-// A node whose last heartbeat was critical is never evicted: see
-// EvictStaleRetainingCritical.
+// A node whose last heartbeat or health export read critical is never
+// evicted: see EvictStaleRetainingCritical.
 func (r *Registry) EvictStale(nowMS, ttlMS int64) []NodeHeartbeat {
 	evicted, _ := r.EvictStaleRetainingCritical(nowMS, ttlMS)
 	return evicted
 }
 
 // EvictStaleRetainingCritical evicts as EvictStale does, except that a node
-// whose last accepted heartbeat was critical stays in the registry, stale and
-// critical, until it reports again: silence after critical may be the failure
-// itself, and a projection must not fold critical. A critical node is silent
+// whose last accepted heartbeat was critical, or whose health export last
+// read critical, stays in the registry, stale and critical, until it reports
+// again (and, for the export, until a later export reads otherwise): silence
+// after critical may be the failure itself, and a projection must not fold
+// critical. A critical node is silent
 // when the gateway has accepted no heartbeat from it for longer than ttlMS,
 // judged on GatewaySeen, the gateway's own receipt time. retained lists the
 // nodes first found silent by this call, so the caller can report each silence
@@ -157,7 +207,7 @@ func (r *Registry) EvictStaleRetainingCritical(nowMS, ttlMS int64) (evicted, ret
 	defer r.mu.Unlock()
 	evicted = make([]NodeHeartbeat, 0)
 	for deviceID, heartbeat := range r.nodes {
-		if heartbeat.Status == NodeStatusCritical {
+		if heartbeat.Status == NodeStatusCritical || heartbeat.ExportSeverity == ExportSeverityCritical {
 			// Silence is the gateway's observation: the time since it last
 			// accepted a heartbeat, never the producer's last_seen_ms.
 			if nowMS-heartbeat.GatewaySeen > ttlMS {

@@ -1057,6 +1057,11 @@ func evictStaleRuntimeNodes(
 				logger.Warn("runtime node heartbeat stale", "device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
 			}
 			for _, node := range retained {
+				if node.Status != site.NodeStatusCritical {
+					logger.Error("runtime node silent after a critical health export; kept critical until its export reads otherwise",
+						"device_id", node.DeviceID, "gateway_seen_ms", node.GatewaySeen, "last_seen_ms", node.LastSeenMS)
+					continue
+				}
 				logger.Error("runtime node silent after a critical heartbeat; kept critical until it reports again",
 					"device_id", node.DeviceID, "gateway_seen_ms", node.GatewaySeen, "last_seen_ms", node.LastSeenMS)
 			}
@@ -1381,7 +1386,7 @@ func fetchAndUpsertPosture(ctx context.Context, rc runtimeclient.Client, registr
 }
 
 func sitePostureFromHealth(h runtimeclient.HealthSnapshot) site.SiteNodePosture {
-	var posture site.SiteNodePosture
+	posture := site.SiteNodePosture{ExportSeverity: siteExportSeverity(h.Status)}
 	if h.GatewayBrokerPosture != nil {
 		b := h.GatewayBrokerPosture
 		posture.BrokerHardening = &site.SiteNodeBrokerPosture{
@@ -1420,6 +1425,22 @@ func sitePostureFromHealth(h runtimeclient.HealthSnapshot) site.SiteNodePosture 
 	}
 	// h.LockoutRiskLevels intentionally excluded — keys are phone numbers.
 	return posture
+}
+
+// siteExportSeverity carries the severity the runtime client read from a
+// health export into the site projection. A value the client never returns is
+// unknown, never ok.
+func siteExportSeverity(status string) string {
+	switch status {
+	case runtimeclient.HealthStatusOK:
+		return site.ExportSeverityOK
+	case runtimeclient.HealthStatusDegraded:
+		return site.ExportSeverityDegraded
+	case runtimeclient.HealthStatusCritical:
+		return site.ExportSeverityCritical
+	default:
+		return site.ExportSeverityUnknown
+	}
 }
 
 func providerStatusFromProvider(reasoningProvider provider.Provider) heartbeat.ProviderStatus {

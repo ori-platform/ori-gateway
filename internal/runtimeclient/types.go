@@ -35,7 +35,10 @@ type HealthRequest struct {
 	DeviceID string
 }
 
-// HealthSnapshot is a gateway-consumable subset of runtime health.
+// HealthSnapshot is a gateway-consumable subset of runtime health. Status is
+// the export's severity, HealthStatusOK, HealthStatusDegraded,
+// HealthStatusCritical or HealthStatusUnknown, read under gateway-api/v2; it
+// is never ok for an item whose severity cannot be read.
 type HealthSnapshot struct {
 	DeviceID             string                       `json:"device_id"`
 	Status               string                       `json:"status"`
