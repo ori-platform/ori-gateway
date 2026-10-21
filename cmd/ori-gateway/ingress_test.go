@@ -96,7 +96,7 @@ func TestEverySubscriptionHasAPayloadMaximum(t *testing.T) {
 		return mainBroker, nil
 	}
 	deps.newRuntimeClient = func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
-		return runtimeclient.NewMQTTClient(b, opts...)
+		return runtimeclient.NewMQTTClient(b, append(opts, instantExportPacing())...)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

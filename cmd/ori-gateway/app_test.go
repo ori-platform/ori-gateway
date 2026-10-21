@@ -1714,10 +1714,10 @@ func TestGatewayConstructsSecureRuntimeClientForWeeklyReports(t *testing.T) {
 		if b == nil {
 			t.Fatal("runtime client broker is nil")
 		}
-		if len(opts) != 4 {
-			t.Fatalf("expected auth, encryption, logger and signing clock options, got %d", len(opts))
+		if len(opts) != 5 {
+			t.Fatalf("expected auth, encryption, logger, signing clock and lifetime options, got %d", len(opts))
 		}
-		return runtimeclient.NewMQTTClient(b, opts...)
+		return runtimeclient.NewMQTTClient(b, append(opts, instantExportPacing())...)
 	}
 	deps.newReportingProvider = func(got config.ReportingConfig) (reporting.Provider, error) {
 		reportingProviderCalled = true

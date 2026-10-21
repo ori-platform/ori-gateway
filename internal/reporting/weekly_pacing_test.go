@@ -44,7 +44,7 @@ func TestAWeeklyReportForManySensorsStaysWithinTheRuntimeExportRate(t *testing.T
 		t.Fatalf("%d export requests, want at least %d (health, every sensor, action and Tier C logs)", got, want)
 	}
 	// The runtime's admission, written apart from the client's pacer: a token
-	// bucket of 2 a second and burst 10.
+	// bucket of 2 a second and burst 10, judged at the sends.
 	tokens := 10.0
 	for i, sent := range b.sent {
 		if i > 0 {
@@ -55,4 +55,13 @@ func TestAWeeklyReportForManySensorsStaysWithinTheRuntimeExportRate(t *testing.T
 		}
 		tokens--
 	}
+}
+
+// instantPacingClock is a pacing clock a wait advances at once, for tests that
+// are not about pacing.
+func instantPacingClock() (func() time.Time, func(context.Context, time.Duration) error) {
+	var mu sync.Mutex
+	at := time.Unix(1_787_000_000, 0)
+	return func() time.Time { mu.Lock(); defer mu.Unlock(); return at },
+		func(_ context.Context, d time.Duration) error { mu.Lock(); at = at.Add(d); mu.Unlock(); return nil }
 }

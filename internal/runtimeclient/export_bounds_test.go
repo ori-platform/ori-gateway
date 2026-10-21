@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"testing"
@@ -285,8 +286,9 @@ func TestExportsArePacedPerDeviceAtTheRuntimesRate(t *testing.T) {
 			mu.Lock()
 			waited := clock.Sub(before)
 			mu.Unlock()
-			if waited > 0 {
-				t.Fatalf("edge-2's request waited %v behind edge-1's backlog", waited)
+			// At most its own bucket's interval; edge-1's backlog is many.
+			if interval := time.Duration(float64(time.Second) / exportRatePerSecond); waited > interval {
+				t.Fatalf("edge-2's request waited %v, over its own interval %v: it waited behind edge-1's backlog", waited, interval)
 			}
 		}
 	}
@@ -316,12 +318,14 @@ func overRuntimeRate(times []time.Time) int {
 	return -1
 }
 
-// TestAPacingWaitPastTheBoundEndsTheExport exhausts a device's burst, then
-// asks for one more request with a wait shorter than the pacing would take:
-// it ends with ErrExportTimeout without being sent.
+// TestAPacingWaitPastTheBoundEndsTheExport asks a device whose bucket is still
+// empty, as at a start, for a request with a wait shorter than the pacing
+// would take: it ends with ErrExportTimeout without being sent.
 func TestAPacingWaitPastTheBoundEndsTheExport(t *testing.T) {
 	b := newFakeBroker()
-	c, err := NewMQTTClient(b, WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(50*time.Millisecond))
+	// On the real clock: the pacing wait itself is under test.
+	c, err := NewMQTTClient(b, WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(50*time.Millisecond),
+		WithExportPacingClock(time.Now, sleepContext))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,16 +339,13 @@ func TestAPacingWaitPastTheBoundEndsTheExport(t *testing.T) {
 		}
 		b.respond(req.DeviceID, req.RequestID, healthItems(req.DeviceID, req.RequestID))
 	}
-	for range exportBurst {
-		if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// A device's bucket starts empty, so its first request already waits
+	// longer than this bound.
 	if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); !errors.Is(err, ErrExportTimeout) {
 		t.Fatalf("a request paced past its bound = %v, want ErrExportTimeout", err)
 	}
-	if published != exportBurst {
-		t.Fatalf("%d requests sent, want the burst of %d and none past the bound", published, exportBurst)
+	if published != 0 {
+		t.Fatalf("%d requests sent past the pacing bound, want none", published)
 	}
 }
 
@@ -377,7 +378,7 @@ func TestAResponseIsRefusedOnceTheDeadlineHasPassedBeforeItsTimerFires(t *testin
 // the shared subscribe's bound passes before the second caller's: both end
 // with ErrExportTimeout, never a bare context error.
 func TestASharedSubscribeThatExpiresEndsEveryWaiterAsATimeout(t *testing.T) {
-	const wait = 100 * time.Millisecond
+	const wait = 400 * time.Millisecond
 	b := &stallingBroker{fakeBroker: newFakeBroker(), stallSubscribe: true}
 	c, err := NewMQTTClient(b, WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(wait), instantPacing())
 	if err != nil {
@@ -388,7 +389,7 @@ func TestASharedSubscribeThatExpiresEndsEveryWaiterAsATimeout(t *testing.T) {
 		_, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
 		errs <- err
 	}()
-	time.Sleep(wait / 2)
+	time.Sleep(wait / 4)
 	go func() {
 		_, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
 		errs <- err
@@ -397,5 +398,149 @@ func TestASharedSubscribeThatExpiresEndsEveryWaiterAsATimeout(t *testing.T) {
 		if err := <-errs; !errors.Is(err, ErrExportTimeout) {
 			t.Fatalf("a waiter on an expired shared subscribe = %v, want ErrExportTimeout", err)
 		}
+	}
+	// Both waited on the one subscribe, so the second really waited on a
+	// shared attempt whose bound came before its own.
+	if n := b.subscribes.Load(); n != 1 {
+		t.Fatalf("%d subscribes made, want the one shared", n)
+	}
+}
+
+// TestPacedExportsSurviveArrivalJitterAtTheRuntime paces a long run of
+// requests, with idle gaps that let the burst refill, and replays their send
+// times as the runtime receives them: each delayed by up to 100 ms, in order,
+// into the runtime's own bucket of 2 a second and burst 10, starting empty as
+// after a burst just before a gateway restart. None is dropped, since the
+// runtime judges arrivals, not sends.
+func TestPacedExportsSurviveArrivalJitterAtTheRuntime(t *testing.T) {
+	now, sleep := instantClock()
+	pacer := &exportPacer{now: now, sleep: sleep, rate: exportRatePerSecond, burst: exportBurst, buckets: map[string]*paceBucket{}}
+	var sent []time.Time
+	for i := range 120 {
+		if i%30 == 29 {
+			_ = sleep(context.Background(), 10*time.Second)
+		}
+		if err := pacer.acquire(context.Background(), "edge-1"); err != nil {
+			t.Fatal(err)
+		}
+		sent = append(sent, now())
+	}
+	rng := rand.New(rand.NewPCG(7, 11))
+	for run := range 500 {
+		arrivals := make([]time.Time, len(sent))
+		for i, at := range sent {
+			arrivals[i] = at.Add(time.Duration(rng.IntN(100_000)) * time.Microsecond)
+			if i > 0 && arrivals[i].Before(arrivals[i-1]) {
+				arrivals[i] = arrivals[i-1]
+			}
+		}
+		tokens := 0.0
+		last := arrivals[0].Add(-time.Duration(float64(time.Second) / exportRatePerSecond))
+		for i, at := range arrivals {
+			tokens = min(10, tokens+at.Sub(last).Seconds()*2)
+			last = at
+			if tokens < 1-1e-9 {
+				t.Fatalf("run %d: request %d arrived beyond the runtime's admission and would be dropped", run, i)
+			}
+			tokens--
+		}
+	}
+}
+
+// inTimePublishBroker answers every publish at once with a signed response,
+// then holds the publish's return until its wait has expired, as a broker
+// whose completion is slow while the runtime is fast.
+type inTimePublishBroker struct {
+	*fakeBroker
+	t   *testing.T
+	now time.Time
+}
+
+func (b *inTimePublishBroker) Publish(ctx context.Context, _ string, _ byte, _ bool, payload []byte) error {
+	var req exportRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		b.t.Error(err)
+		return err
+	}
+	b.respondRaw(req.DeviceID, req.RequestID, signedExportPayload(b.t, healthItems(req.DeviceID, req.RequestID), "current-secret", b.now))
+	<-ctx.Done()
+	return nil
+}
+
+// TestAResponseHandedOverInTimeCompletesTheExport delivers a verified response
+// before the deadline while the publish only returns at it, many times over:
+// every export succeeds, since the response was handed over in time, whichever
+// the wait's select sees first.
+func TestAResponseHandedOverInTimeCompletesTheExport(t *testing.T) {
+	now := time.UnixMilli(1787000003000)
+	b := &inTimePublishBroker{fakeBroker: newFakeBroker(), t: t, now: now}
+	n := 0
+	c, err := NewMQTTClient(b, WithRequestIDFunc(func() (string, error) { n++; return fmt.Sprintf("in-time-%d", n), nil }),
+		WithMessageAuth("current-secret", "", func() time.Time { return now }),
+		WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 60 {
+		if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
+			t.Fatalf("exchange %d = %v, want the response handed over in time", i, err)
+		}
+	}
+}
+
+// TestPacingNeverSpinsOnAnInexactRate paces at rates whose arithmetic is not
+// exact in binary on a clock that only a wait advances: every wait moves the
+// clock on, so acquiring never spins.
+func TestPacingNeverSpinsOnAnInexactRate(t *testing.T) {
+	for _, rate := range []float64{exportRatePerSecond, 1.8, 2.2, 0.7, 1.3} {
+		now, sleep := instantClock()
+		zeroWaits := 0
+		pacer := &exportPacer{now: now, rate: rate, burst: exportBurst, sleep: func(ctx context.Context, d time.Duration) error {
+			if d <= 0 {
+				zeroWaits++
+				if zeroWaits > 1000 {
+					return errors.New("the pacer is spinning on waits that never move the clock")
+				}
+			}
+			return sleep(ctx, d)
+		}, buckets: map[string]*paceBucket{}}
+		for range 200 {
+			if err := pacer.acquire(context.Background(), "edge-1"); err != nil {
+				t.Fatalf("rate %v: %v", rate, err)
+			}
+		}
+		if zeroWaits != 0 {
+			t.Fatalf("rate %v: %d waits of no time, want every wait to move the clock", rate, zeroWaits)
+		}
+	}
+}
+
+// TestEndingTheLifetimeAbandonsAStalledSubscribe stalls a subscribe, with an
+// export wait far longer than the test, then ends the client's lifetime, as
+// the gateway's stop does: the shared subscribe ends at once rather than at
+// its bound.
+func TestEndingTheLifetimeAbandonsAStalledSubscribe(t *testing.T) {
+	b := &stallingBroker{fakeBroker: newFakeBroker(), stallSubscribe: true}
+	lifetime, end := context.WithCancel(context.Background())
+	c, err := NewMQTTClient(b, WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(time.Hour), WithLifetime(lifetime))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, _ = c.Health(ctx, HealthRequest{DeviceID: "edge-1"})
+	end()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		inFlight := len(c.subscribing)
+		c.mu.Unlock()
+		if inFlight == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a stalled subscribe outlived the client's lifetime")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

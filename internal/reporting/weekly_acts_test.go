@@ -84,7 +84,7 @@ func (b *exportBroker) Publish(_ context.Context, _ string, _ byte, _ bool, payl
 func generateFromActionLogExport(t *testing.T, actionLog []any) (WeeklyReportArtifact, *fakeProvider) {
 	t.Helper()
 	b := &exportBroker{t: t, handlers: map[string]broker.MessageHandler{}, actionLog: actionLog, exportSeen: map[string]int{}}
-	client, err := runtimeclient.NewMQTTClient(b)
+	client, err := runtimeclient.NewMQTTClient(b, runtimeclient.WithExportPacingClock(instantPacingClock()))
 	if err != nil {
 		t.Fatal(err)
 	}

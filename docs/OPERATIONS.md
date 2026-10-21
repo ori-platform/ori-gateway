@@ -618,9 +618,12 @@ logs, since the gateway never records which device sent a refused message.
 The gateway reads runtime data (site posture, weekly reports) through export
 requests over MQTT. Each request waits at most 30 seconds, from publishing it,
 for a response it can verify, and one export reads at most 100 pages. Requests
-to each device are paced at the rate its runtime admits them, 2 a second in
-bursts of 10, so a weekly report for a device with many sensors takes longer
-but is not dropped; pacing a request is bounded by the same 30 seconds.
+to each device are paced below the rate its runtime admits them (the runtime
+admits 2 a second in bursts of 10; the gateway sends at most 1.6 a second in
+bursts of 8, starting each device empty), so a weekly report for a device with
+many sensors takes longer, and delivery jitter or a gateway restart does not
+push a request past the runtime's limit. Pacing a request is bounded by the
+same 30 seconds.
 
 - `WARN runtime export request not sent within the wait bound at the runtime's
   admission rate`, with the `device_id` and `export_type`: more exports to one

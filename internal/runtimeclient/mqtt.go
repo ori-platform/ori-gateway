@@ -37,12 +37,15 @@ const (
 	// maxExportPages it bounds an export as a whole.
 	defaultExportWait = 30 * time.Second
 	// exportRatePerSecond and exportBurst pace export requests to each
-	// device at the rate its runtime admits them (ori-runtime
-	// ori/gateway/payload_bounds.py, INGRESS_RATES): a request beyond it is
-	// dropped unanswered under gateway-api/v2 Payload Volume, which leaves
-	// the value to the runtime, and would only wait out its timeout.
-	exportRatePerSecond = 2.0
-	exportBurst         = 10
+	// device below the rate its runtime admits them, 2 a second in bursts of
+	// 10 (ori-runtime ori/gateway/payload_bounds.py, INGRESS_RATES): a request
+	// beyond that is dropped unanswered under gateway-api/v2 Payload Volume,
+	// which leaves the value to the runtime, and would only wait out its
+	// timeout. The runtime judges arrivals, not sends, so the margin absorbs
+	// delivery jitter, and each device's bucket starts empty, so a restarted
+	// gateway never spends a burst the runtime has not yet refilled.
+	exportRatePerSecond = 1.6
+	exportBurst         = 8
 )
 
 // exportEnvelope is every member gateway-api/v2's Runtime Export Response
@@ -73,6 +76,9 @@ type MQTTClient struct {
 	optionErr           error
 	now                 func() time.Time
 	pacer               *exportPacer
+	// lifetime ends the client's own background work, the shared subscribe,
+	// when its owner stops.
+	lifetime context.Context
 
 	mu         sync.Mutex
 	pending    map[string]pendingExport
@@ -136,6 +142,16 @@ func WithExportWait(wait time.Duration) MQTTClientOption {
 	}
 }
 
+// WithLifetime ties the client's own background work to ctx: when it ends, a
+// subscribe still in flight is abandoned.
+func WithLifetime(ctx context.Context) MQTTClientOption {
+	return func(c *MQTTClient) {
+		if ctx != nil {
+			c.lifetime = ctx
+		}
+	}
+}
+
 // WithExportPacingClock replaces the clock export pacing reads and the wait it
 // sleeps on. It is intended for tests; production paces on the monotonic
 // clock.
@@ -195,6 +211,7 @@ func NewMQTTClient(b mqttBroker, opts ...MQTTClientOption) (*MQTTClient, error) 
 		exportWait:  defaultExportWait,
 		now:         time.Now,
 		pacer:       newExportPacer(),
+		lifetime:    context.Background(),
 		pending:     make(map[string]pendingExport),
 		subscribed:  make(map[string]bool),
 		subscribing: make(map[string]*subscribeAttempt),
@@ -436,7 +453,7 @@ func (c *MQTTClient) ensureResponseSubscription(ctx context.Context, deviceID st
 // subscribe makes one subscribe to topic, bounded by the export wait, and
 // records its outcome for every caller waiting on it.
 func (c *MQTTClient) subscribe(topic string, attempt *subscribeAttempt) {
-	ctx, cancel := context.WithTimeoutCause(context.Background(), c.exportWait, ErrExportTimeout)
+	ctx, cancel := context.WithTimeoutCause(c.lifetime, c.exportWait, ErrExportTimeout)
 	defer cancel()
 	err := c.broker.Subscribe(ctx, topic, c.qos, c.handleResponseMessage)
 	c.mu.Lock()
@@ -527,25 +544,36 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 
 	select {
 	case <-waitCtx.Done():
+		// A response handed over before expiry is taken, whichever case
+		// the select chose: deliver decided it was in time.
+		select {
+		case result := <-responseCh:
+			return c.acceptResponse(req, requestID, result)
+		default:
+		}
 		return timedOut()
 	case result := <-responseCh:
-		// Only a response handed over before expiry reaches here: deliver
-		// decides that in the same step.
-		if result.err != nil {
-			return exportResponse{}, result.err
-		}
-		resp := result.resp
-		if resp.RequestID != requestID {
-			return exportResponse{}, fmt.Errorf("runtimeclient: response request_id %q does not match %q", resp.RequestID, requestID)
-		}
-		if resp.DeviceID != "" && resp.DeviceID != req.DeviceID {
-			return exportResponse{}, fmt.Errorf("runtimeclient: response device_id %q does not match %q", resp.DeviceID, req.DeviceID)
-		}
-		if resp.ExportType != "" && resp.ExportType != req.ExportType {
-			return exportResponse{}, fmt.Errorf("runtimeclient: response export_type %q does not match %q", resp.ExportType, req.ExportType)
-		}
-		return resp, nil
+		return c.acceptResponse(req, requestID, result)
 	}
+}
+
+// acceptResponse checks a response deliver handed over, before its request's
+// deadline, against the request it answers.
+func (c *MQTTClient) acceptResponse(req exportRequest, requestID string, result exportResult) (exportResponse, error) {
+	if result.err != nil {
+		return exportResponse{}, result.err
+	}
+	resp := result.resp
+	if resp.RequestID != requestID {
+		return exportResponse{}, fmt.Errorf("runtimeclient: response request_id %q does not match %q", resp.RequestID, requestID)
+	}
+	if resp.DeviceID != "" && resp.DeviceID != req.DeviceID {
+		return exportResponse{}, fmt.Errorf("runtimeclient: response device_id %q does not match %q", resp.DeviceID, req.DeviceID)
+	}
+	if resp.ExportType != "" && resp.ExportType != req.ExportType {
+		return exportResponse{}, fmt.Errorf("runtimeclient: response export_type %q does not match %q", resp.ExportType, req.ExportType)
+	}
+	return resp, nil
 }
 
 func (c *MQTTClient) handleResponseMessage(topic string, payload []byte) {
@@ -1234,6 +1262,9 @@ func mapValue(m map[string]any, key string) map[string]any {
 type exportPacer struct {
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
+	// rate and burst are exportRatePerSecond and exportBurst.
+	rate  float64
+	burst float64
 
 	mu      sync.Mutex
 	buckets map[string]*paceBucket
@@ -1244,8 +1275,15 @@ type paceBucket struct {
 	last   time.Time
 }
 
+// pacingClock is the clock and wait every new pacer starts with; a test
+// stands in one a wait advances at once.
+var pacingClock = func() (func() time.Time, func(context.Context, time.Duration) error) {
+	return time.Now, sleepContext
+}
+
 func newExportPacer() *exportPacer {
-	return &exportPacer{now: time.Now, sleep: sleepContext, buckets: make(map[string]*paceBucket)}
+	now, sleep := pacingClock()
+	return &exportPacer{now: now, sleep: sleep, rate: exportRatePerSecond, burst: exportBurst, buckets: make(map[string]*paceBucket)}
 }
 
 // acquire waits, within ctx, until deviceID may be sent one more request.
@@ -1255,11 +1293,11 @@ func (p *exportPacer) acquire(ctx context.Context, deviceID string) error {
 		now := p.now()
 		bucket, ok := p.buckets[deviceID]
 		if !ok {
-			bucket = &paceBucket{tokens: exportBurst, last: now}
+			bucket = &paceBucket{last: now}
 			p.buckets[deviceID] = bucket
 		}
 		if elapsed := now.Sub(bucket.last); elapsed > 0 {
-			bucket.tokens = min(exportBurst, bucket.tokens+elapsed.Seconds()*exportRatePerSecond)
+			bucket.tokens = min(p.burst, bucket.tokens+elapsed.Seconds()*p.rate)
 		}
 		bucket.last = now
 		if bucket.tokens >= 1 {
@@ -1267,7 +1305,8 @@ func (p *exportPacer) acquire(ctx context.Context, deviceID string) error {
 			p.mu.Unlock()
 			return nil
 		}
-		wait := time.Duration((1 - bucket.tokens) / exportRatePerSecond * float64(time.Second))
+		// Rounded up and never zero, so a wait always moves the clock on.
+		wait := max(time.Duration(math.Ceil((1-bucket.tokens)/p.rate*float64(time.Second))), time.Nanosecond)
 		p.mu.Unlock()
 		if err := p.sleep(ctx, wait); err != nil {
 			return err

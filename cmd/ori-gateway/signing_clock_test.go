@@ -226,7 +226,7 @@ func TestEverySignerSharesTheGatewaysSigningClock(t *testing.T) {
 	deps.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	deps.now = func() time.Time { return frozen }
 	deps.newRuntimeClient = func(b brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
-		return runtimeclient.NewMQTTClient(b, opts...)
+		return runtimeclient.NewMQTTClient(b, append(opts, instantExportPacing())...)
 	}
 	signers := make(chan *mqttauth.SigningClock, 1)
 	hb := newFakeHeartbeat()
@@ -368,7 +368,7 @@ func TestShutdownWaitsForAPostureFetchesSigningWrite(t *testing.T) {
 			return nil, err
 		}
 		opts = append(opts, runtimeclient.WithSigningClock(clock))
-		return runtimeclient.NewMQTTClient(b, opts...)
+		return runtimeclient.NewMQTTClient(b, append(opts, instantExportPacing())...)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,9 +129,11 @@ func TestASilentRuntimeEndsTheExportAtItsBound(t *testing.T) {
 type stallingBroker struct {
 	*fakeBroker
 	stallSubscribe, stallPublish bool
+	subscribes                   atomic.Int32
 }
 
 func (s *stallingBroker) Subscribe(ctx context.Context, topic string, qos byte, handler broker.MessageHandler) error {
+	s.subscribes.Add(1)
 	if s.stallSubscribe {
 		<-ctx.Done()
 		return ctx.Err()
@@ -300,14 +303,22 @@ func TestAResponseOnAnotherDevicesTopicNeverAnswers(t *testing.T) {
 	}
 }
 
-// instantPacing gives the export pacer a clock that a wait advances at once,
-// so a test that is not about pacing issues requests at the paced rate
-// without spending real time.
-func instantPacing() MQTTClientOption {
+// instantClock is a pacing clock that a wait advances at once, so a test that
+// is not about pacing issues requests at the paced rate without spending real
+// time.
+func instantClock() (func() time.Time, func(context.Context, time.Duration) error) {
 	var mu sync.Mutex
 	at := time.Unix(1_787_000_000, 0)
-	return WithExportPacingClock(
-		func() time.Time { mu.Lock(); defer mu.Unlock(); return at },
-		func(_ context.Context, d time.Duration) error { mu.Lock(); at = at.Add(d); mu.Unlock(); return nil },
-	)
+	return func() time.Time { mu.Lock(); defer mu.Unlock(); return at },
+		func(_ context.Context, d time.Duration) error { mu.Lock(); at = at.Add(d); mu.Unlock(); return nil }
+}
+
+// instantPacing gives a client the instant pacing clock.
+func instantPacing() MQTTClientOption { return WithExportPacingClock(instantClock()) }
+
+// TestMain gives every client a test builds the instant pacing clock unless
+// the test chooses another: only the pacing tests spend paced time.
+func TestMain(m *testing.M) {
+	pacingClock = instantClock
+	os.Exit(m.Run())
 }
