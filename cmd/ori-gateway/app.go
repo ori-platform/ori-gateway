@@ -478,8 +478,11 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		if err != nil {
 			return fmt.Errorf("construct runtime export client options: %w", err)
 		}
+		// The client's own background work ends with this run.
+		clientLifetime, endClient := context.WithCancel(ctx)
+		defer endClient()
 		runtimeClientOptions = append(runtimeClientOptions, runtimeclient.WithLogger(deps.logger),
-			runtimeclient.WithSigningClock(signingClock))
+			runtimeclient.WithSigningClock(signingClock), runtimeclient.WithLifetime(clientLifetime))
 		runtimeExportClient, err = deps.newRuntimeClient(client, runtimeClientOptions...)
 		if err != nil {
 			return fmt.Errorf("construct runtime export client: %w", err)

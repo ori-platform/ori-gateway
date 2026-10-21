@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,10 +22,10 @@ import (
 const testExportWait = 100 * time.Millisecond
 
 func healthItems(deviceID, requestID string) map[string]any {
-	return map[string]any{
+	return withEnvelope(map[string]any{
 		"device_id": deviceID, "request_id": requestID, "export_type": "health", "complete": true,
 		"items": []any{map[string]any{"device_id": deviceID}},
-	}
+	})
 }
 
 func pendingCount(c *MQTTClient) int {
@@ -78,8 +80,9 @@ func TestAForgedExportResponseLeavesTheExchangePending(t *testing.T) {
 	if replayAfterForgeries != 0 || c.verifier.ReplayEntries() != 1 {
 		t.Fatalf("replay entries %d after forgeries, %d after the answer; want 0 then 1", replayAfterForgeries, c.verifier.ReplayEntries())
 	}
-	if got := strings.Count(logs.String(), "not verified; dropped"); got != 4 {
-		t.Fatalf("%d forgeries logged, want 4:\n%s", got, logs.String())
+	logged := logs.once(func(s string) bool { return strings.Count(s, "not verified; dropped") >= 4 })
+	if got := strings.Count(logged, "not verified; dropped"); got != 4 {
+		t.Fatalf("%d forgeries logged, want 4:\n%s", got, logged)
 	}
 }
 
@@ -115,8 +118,8 @@ func TestASilentRuntimeEndsTheExportAtItsBound(t *testing.T) {
 			if pendingCount(c) != 0 {
 				t.Fatal("a timed-out request kept its pending state")
 			}
-			if !strings.Contains(logs.String(), "timed out") {
-				t.Fatalf("the timeout was not logged:\n%s", logs.String())
+			if logged := logs.once(func(s string) bool { return strings.Contains(s, "timed out") }); !strings.Contains(logged, "timed out") {
+				t.Fatalf("the timeout was not logged:\n%s", logged)
 			}
 		})
 	}
@@ -127,9 +130,11 @@ func TestASilentRuntimeEndsTheExportAtItsBound(t *testing.T) {
 type stallingBroker struct {
 	*fakeBroker
 	stallSubscribe, stallPublish bool
+	subscribes                   atomic.Int32
 }
 
 func (s *stallingBroker) Subscribe(ctx context.Context, topic string, qos byte, handler broker.MessageHandler) error {
+	s.subscribes.Add(1)
 	if s.stallSubscribe {
 		<-ctx.Done()
 		return ctx.Err()
@@ -167,8 +172,8 @@ func TestAStalledSubscribeOrPublishEndsAtTheBound(t *testing.T) {
 				if !errors.Is(err, ErrExportTimeout) {
 					t.Fatalf("Health = %v, want ErrExportTimeout", err)
 				}
-				if !strings.Contains(logs.String(), "timed out") {
-					t.Fatalf("the stalled %s was not logged:\n%s", stall, logs.String())
+				if logged := logs.once(func(s string) bool { return strings.Contains(s, "timed out") }); !strings.Contains(logged, "timed out") {
+					t.Fatalf("the stalled %s was not logged:\n%s", stall, logged)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("a stalled broker held the caller past its bound")
@@ -229,7 +234,7 @@ func TestRepeatedForgeriesNeverExtendTheBound(t *testing.T) {
 // request's wait bounded the export as a whole is bounded.
 func TestAnExportRequestsABoundedNumberOfPages(t *testing.T) {
 	b := newFakeBroker()
-	c, err := NewMQTTClient(b, WithExportWait(testExportWait), WithLogger(slog.New(slog.DiscardHandler)))
+	c, err := NewMQTTClient(b, WithExportWait(testExportWait), WithLogger(slog.New(slog.DiscardHandler)), instantPacing())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,4 +302,29 @@ func TestAResponseOnAnotherDevicesTopicNeverAnswers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// instantClock is a pacing clock that a wait advances at once, so a test that
+// is not about pacing issues requests at the paced rate without spending real
+// time.
+func instantClock() (func() time.Time, func(context.Context, time.Duration) error) {
+	var mu sync.Mutex
+	at := time.Unix(1_787_000_000, 0)
+	return func() time.Time { mu.Lock(); defer mu.Unlock(); return at },
+		func(_ context.Context, d time.Duration) error { mu.Lock(); at = at.Add(d); mu.Unlock(); return nil }
+}
+
+// instantPacing gives a client the instant pacing clock.
+func instantPacing() MQTTClientOption { return WithExportPacingClock(instantClock()) }
+
+// productionPacingClock is the pacing clock production starts every pacer
+// with, kept so a test can check it.
+var productionPacingClock = pacingClock
+
+// TestMain gives every client a test builds the instant pacing clock unless
+// the test chooses another: only the pacing tests spend paced time.
+func TestMain(m *testing.M) {
+	productionPacingClock = pacingClock
+	pacingClock = instantClock
+	os.Exit(m.Run())
 }

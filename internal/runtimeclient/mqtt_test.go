@@ -65,7 +65,21 @@ func (f *fakeBroker) Publish(_ context.Context, topic string, qos byte, retain b
 	return nil
 }
 
+// withEnvelope fills in every export envelope member payload omits with the
+// value the runtime sends by default (ori-runtime ExportResponse.as_dict), so a
+// fixture names only what it tests.
+func withEnvelope(payload map[string]any) map[string]any {
+	defaults := map[string]any{"items": []any{}, "next_page_token": "", "complete": true, "error": nil}
+	for name, value := range defaults {
+		if _, ok := payload[name]; !ok {
+			payload[name] = value
+		}
+	}
+	return payload
+}
+
 func (f *fakeBroker) respond(deviceID string, requestID string, payload map[string]any) {
+	payload = withEnvelope(payload)
 	payload["request_id"] = requestID
 	if _, ok := payload["device_id"]; !ok {
 		payload["device_id"] = deviceID
@@ -127,8 +141,11 @@ func signedExportPayload(t *testing.T, payload map[string]any, secret string, no
 
 func newTestMQTTClient(t *testing.T, b *fakeBroker, ids ...string) *MQTTClient {
 	t.Helper()
+	var mu sync.Mutex
 	idx := 0
 	client, err := NewMQTTClient(b, WithRequestIDFunc(func() (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		if idx >= len(ids) {
 			return "extra-id", nil
 		}
@@ -763,6 +780,7 @@ func TestMQTTRuntimeClientSignsExportRequestAndVerifiesResponse(t *testing.T) {
 			t.Fatalf("unexpected export request: %#v", unsigned)
 		}
 		resp := map[string]any{"request_id": "health-signed", "device_id": "edge-1", "export_type": "health", "complete": true, "items": []any{map[string]any{"device_id": "edge-1", "status": "healthy"}}}
+		resp = withEnvelope(resp)
 		b.respondRaw("edge-1", "health-signed", signedExportPayload(t, resp, "current-secret", now))
 	}
 	if _, err := client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
@@ -783,6 +801,7 @@ func TestMQTTRuntimeClientAcceptsPreviousSecretForResponse(t *testing.T) {
 	}
 	b.publishHook = func(_ string, _ []byte) {
 		resp := map[string]any{"request_id": "health-prev", "device_id": "edge-1", "export_type": "health", "complete": true, "items": []any{map[string]any{"device_id": "edge-1", "status": "healthy"}}}
+		resp = withEnvelope(resp)
 		b.respondRaw("edge-1", "health-prev", signedExportPayload(t, resp, "previous-secret", now))
 	}
 	if _, err := client.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
@@ -808,6 +827,7 @@ func TestMQTTRuntimeClientDecryptsSensitiveExportResponse(t *testing.T) {
 			t.Fatal(err)
 		}
 		plain := map[string]any{"request_id": "history-secure", "device_id": "edge-1", "export_type": "sensor_history", "complete": true, "items": []any{map[string]any{"sensor_id": "current-main", "value": 4.2}}}
+		plain = withEnvelope(plain)
 		encrypted, err := encryptor.Encrypt(plain, contracts.ExportResponseMessageType, []byte("123456789012"))
 		if err != nil {
 			t.Fatal(err)
@@ -841,6 +861,7 @@ func TestMQTTRuntimeClientRejectsTamperedEncryptedExportResponse(t *testing.T) {
 			t.Fatal(err)
 		}
 		plain := map[string]any{"request_id": "history-tampered", "device_id": "edge-1", "export_type": "sensor_history", "complete": true, "items": []any{}}
+		plain = withEnvelope(plain)
 		encrypted, err := encryptor.Encrypt(plain, contracts.ExportResponseMessageType, []byte("123456789012"))
 		if err != nil {
 			t.Fatal(err)
@@ -869,6 +890,7 @@ func TestMQTTRuntimeClientRejectsPlainSensitiveExportWhenEncryptionEnabled(t *te
 	}
 	b.publishHook = func(_ string, _ []byte) {
 		plain := map[string]any{"request_id": "history-plain", "device_id": "edge-1", "export_type": "sensor_history", "complete": true, "items": []any{}}
+		plain = withEnvelope(plain)
 		b.respondRaw("edge-1", "history-plain", signedExportPayload(t, plain, "current-secret", now))
 	}
 	_, err = client.SensorHistory(context.Background(), SensorHistoryRequest{BoundedWindow: BoundedWindow{DeviceID: "edge-1", SinceMS: 1, UntilMS: 2, Limit: 10}, SensorID: "current-main"})

@@ -7,6 +7,7 @@ package heartbeat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -187,9 +188,19 @@ func (p *Publisher) publishOnce(ctx context.Context, failures *int) bool {
 
 	payload, err := p.buildPayload(ctx)
 	if err != nil {
+		// The stop closes the signing clock before it cancels the run, so a
+		// heartbeat between the two is refused by its own stop, not failing.
+		if stopping(ctx, err) {
+			return false
+		}
 		return p.recordFailure(failures, err)
 	}
 	if err := p.publish(ctx, payload); err != nil {
+		// A publish the run's own stop interrupted is not a failure: the
+		// broker wait ends with its context.
+		if stopping(ctx, err) {
+			return false
+		}
 		return p.recordFailure(failures, err)
 	}
 
@@ -198,6 +209,12 @@ func (p *Publisher) publishOnce(ctx context.Context, failures *int) bool {
 	p.mu.Unlock()
 	*failures = 0
 	return false
+}
+
+// stopping reports whether err comes from the run's own stop: its context
+// ended, or its signing clock was closed by the decision to stop.
+func stopping(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, mqttauth.ErrSigningClockClosed)
 }
 
 func (p *Publisher) recordFailure(failures *int, err error) bool {

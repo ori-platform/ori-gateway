@@ -132,3 +132,37 @@ func TestFreshnessReasonsAreNamedApart(t *testing.T) {
 		}
 	}
 }
+
+// TestAFloorWarningNeverHoldsAnotherVerification refuses an envelope below a
+// floor ahead of the stale bound behind a logger that blocks, and verifies a
+// fresh one meanwhile: the warning is logged off the replay lock, so the
+// fresh one is accepted at once.
+func TestAFloorWarningNeverHoldsAnotherVerification(t *testing.T) {
+	start := time.UnixMilli(1_787_000_000_000)
+	h := &blockingHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(h.release)
+	v, err := NewVerifier(Config{
+		SharedSecret: "site-local-secret", MaxSkew: time.Minute, ReplayTTL: time.Second,
+		Now: (&replayClock{t: start}).now, Logger: slog.New(h),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := make(chan error, 1)
+	go func() { refused <- verifyAt(v, signedHeartbeat(t, start.Add(-time.Second).UnixMilli(), "healthy")) }()
+	select {
+	case <-h.entered:
+	case <-time.After(time.Second):
+		t.Fatal("the refusal below a floor ahead of the stale bound was not logged")
+	}
+	accepted := make(chan error, 1)
+	go func() { accepted <- verifyAt(v, signedHeartbeat(t, start.UnixMilli(), "healthy")) }()
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("a fresh envelope = %v, want accepted", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a verification waited on the logger holding another's floor warning")
+	}
+}

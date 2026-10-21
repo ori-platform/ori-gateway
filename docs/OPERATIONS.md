@@ -617,7 +617,23 @@ logs, since the gateway never records which device sent a refused message.
 
 The gateway reads runtime data (site posture, weekly reports) through export
 requests over MQTT. Each request waits at most 30 seconds, from publishing it,
-for a response it can verify, and one export reads at most 100 pages.
+for a response it can verify, and one export reads at most 100 pages. Requests
+to each device are paced below the rate its runtime admits them (the runtime
+admits 2 a second in bursts of 10; the gateway sends at most 1.6 a second in
+bursts of 8, starting each device empty), so a weekly report for a device with
+many sensors takes longer, and delivery jitter or a gateway restart does not
+push a request past the runtime's limit. Pacing a request is bounded by the
+same 30 seconds.
+
+- `WARN runtime export request not sent within the wait bound at the runtime's
+  admission rate`, with the `device_id` and `export_type`: more exports to one
+  device were asked for at once than its rate drains in 30 seconds. The export
+  fails and the next refresh or report retries it.
+- An export fails with `malformed export response` when a page lacks any of
+  `request_id`, `export_type`, `device_id`, `items`, `next_page_token`,
+  `complete` and `error`: the gateway never reads a missing member as complete,
+  empty or successful. A runtime older than the export envelope, or one that
+  is misbehaving, causes it; update the runtime.
 
 - `WARN runtime export request timed out; no verified response arrived`, with
   the `device_id`, `export_type` and `request_id` (or `runtime export response
