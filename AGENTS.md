@@ -139,9 +139,10 @@ while one is still running. The decision to stop is one step
 broker callback, on both broker clients, and every later posture fetch, and
 stops the signing clock, which from then on refuses to sign and starts no
 write of its mark, so a callback still running sends no reply. It is taken
-where the stop happens: the moment the supervised runners' context ends, on
-the parent's cancellation or a runner's failure, before the runners are
-joined, as well as on every other stop path. Every supervised runner, the
+where the stop happens: when the supervised runners' context ends, on the
+parent's cancellation or a runner's failure, and in the callback that reaches
+the request failure limit, as well as on every other stop path; it always
+comes before any callback is joined or the state directory released. Every supervised runner, the
 webhook bridge, site health server and site node eviction among them, is
 cancelled with it; callbacks and fetches already admitted are joined after
 that. The state directory is released only once no write of the mark is

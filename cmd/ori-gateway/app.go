@@ -712,6 +712,10 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			failures := requestFailures
 			requestFailureMu.Unlock()
 			if failures >= defaultRequestFailureLimit {
+				// The stop is decided here, where it happens, not once the
+				// escalation is noticed; refusing never waits, so it is safe
+				// from inside an admitted callback.
+				decideStop()
 				select {
 				case requestErr <- fmt.Errorf("reasoning request failure limit reached: %w", err):
 				default:

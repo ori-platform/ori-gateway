@@ -740,6 +740,18 @@ func TestMainEscalatesRepeatedRequestHandlerFailures(t *testing.T) {
 	for range defaultRequestFailureLimit {
 		handler("ori/site-a/reasoning/request", validRequestPayload(t))
 	}
+	// The callback that reached the limit decided the stop itself, so a
+	// request arriving now is refused before the escalation is noticed.
+	fp.mu.Lock()
+	answered := len(fp.requests)
+	fp.mu.Unlock()
+	handler("ori/site-a/reasoning/request", validRequestPayload(t))
+	fp.mu.Lock()
+	after := len(fp.requests)
+	fp.mu.Unlock()
+	if after != answered {
+		t.Fatal("a reasoning request was admitted after the failure limit decided the stop")
+	}
 
 	select {
 	case err := <-done:
