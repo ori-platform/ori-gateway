@@ -577,6 +577,7 @@ Export Auth Envelope). Verified by
 `TestAResponseRefusedBelowTheFloorNeverHoldsTheCallback`,
 `TestClientLogLinesKeepTheirOrderAndAreBoundedBehindABlockedLogger`,
 `TestALoggerThatLocksItsLevelCheckNeverHoldsAnExport`,
+`TestALoggerThatEnablesOnlyErrorsIsWrittenNothing`,
 `TestASubscribeEndsWhenItsContextIsCancelled`,
 `TestWaitTokenEndsWhenItsContextIsCancelled`,
 `TestWaitTokenTakesATokenThatCompletedAsItsContextEnded`,

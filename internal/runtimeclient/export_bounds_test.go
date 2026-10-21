@@ -990,3 +990,50 @@ func TestALoggerThatLocksItsLevelCheckNeverHoldsAnExport(t *testing.T) {
 		t.Fatal("the drainer never asked the logger's level before writing")
 	}
 }
+
+// errorOnlyHandler enables only errors, holds its first level check until
+// released, and counts what it is asked and what it writes.
+type errorOnlyHandler struct {
+	entered, release chan struct{}
+	once             sync.Once
+	asked, written   atomic.Int32
+}
+
+func (h *errorOnlyHandler) Enabled(_ context.Context, level slog.Level) bool {
+	h.once.Do(func() { close(h.entered); <-h.release })
+	h.asked.Add(1)
+	return level >= slog.LevelError
+}
+
+func (h *errorOnlyHandler) Handle(context.Context, slog.Record) error {
+	h.written.Add(1)
+	return nil
+}
+
+func (h *errorOnlyHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *errorOnlyHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestALoggerThatEnablesOnlyErrorsIsWrittenNothing queues 300 warnings, more
+// than wait, behind a logger that enables only errors: none is written, nor
+// the count of those dropped, which is a warning too.
+func TestALoggerThatEnablesOnlyErrorsIsWrittenNothing(t *testing.T) {
+	h := &errorOnlyHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	log := slog.New(&queuedHandler{inner: h, notes: &noteLog{}})
+	log.Warn("line 0")
+	<-h.entered
+	for i := 1; i < 300; i++ {
+		log.Warn(fmt.Sprintf("line %d", i))
+	}
+	close(h.release)
+	// The one being checked, the 64 queued and the count line.
+	deadline := time.Now().Add(2 * time.Second)
+	for h.asked.Load() < 66 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if n := h.asked.Load(); n != 66 {
+		t.Fatalf("the logger was asked its level %d times, want 66", n)
+	}
+	if n := h.written.Load(); n != 0 {
+		t.Fatalf("%d records written to a logger that enables only errors, want none", n)
+	}
+}
