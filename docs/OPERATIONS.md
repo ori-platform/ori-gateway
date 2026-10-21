@@ -752,7 +752,9 @@ seconds for a write of the mark still outstanding. If the write is still
 outstanding after that, it logs `ERROR gateway state directory is not
 quiescent; ending the process without releasing it` and exits with status 1
 without releasing the lock, which ends with the process; restart it as usual
-once the disk answers. A start whose first write has not completed within
+once the disk answers. The exit never waits on that log line: if the log
+destination is not accepting writes, the process still ends within the 5
+seconds, and the line may be lost. A start whose first write has not completed within
 1,000 ms is refused the same way. The signing clock's own lines (the episode warning
 and recovery, the ahead warning and `signing clock is stopped; refusing to
 sign`, logged once per stop) are written in order by a background writer,

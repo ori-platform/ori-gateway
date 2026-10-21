@@ -435,3 +435,86 @@ func TestAStalledWriteHoldsTheLockUntilTheProcessEnds(t *testing.T) {
 		})
 	}
 }
+
+// errorBlockingHandler holds every Error record until released, as a log
+// destination that has stopped accepting writes would; other levels pass.
+type errorBlockingHandler struct {
+	entered chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (h *errorBlockingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *errorBlockingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelError {
+		h.once.Do(func() { close(h.entered) })
+		<-h.release
+	}
+	return nil
+}
+
+// TestABlockedLoggerNeverDelaysTheRequiredExit stalls the mark write at a stop
+// and at the start while the logger blocks every Error record: the process is
+// still ended with status 1 within the quiescence bound of the decision, so
+// a log destination that stops accepting writes cannot keep the gateway alive
+// holding its state directory (gateway-config/v2 rule 13).
+func TestABlockedLoggerNeverDelaysTheRequiredExit(t *testing.T) {
+	for _, mode := range []string{"stop", "start"} {
+		t.Run(mode, func(t *testing.T) {
+			g := newStallingGateway(t, filepath.Join(t.TempDir(), "gateway-state"), mode == "start")
+			handler := &errorBlockingHandler{entered: make(chan struct{}), release: make(chan struct{})}
+			t.Cleanup(func() { close(handler.release) })
+			g.deps.logger = slog.New(handler)
+			exited := make(chan time.Time, 1)
+			g.deps.exitProcess = func(code int) {
+				g.exited.Store(int32(code))
+				exited <- time.Now()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- runGateway(ctx, "gateway.yaml", g.deps) }()
+			var decided time.Time
+			if mode == "stop" {
+				g.stall(t, <-g.signers)
+				decided = time.Now()
+				cancel()
+			} else {
+				<-g.mark.entered
+				decided = time.Now().Add(mqttauth.MarkWriteBound)
+			}
+			select {
+			case at := <-exited:
+				if late := at.Sub(decided) - g.deps.stateQuiescenceBound; late > 150*time.Millisecond {
+					t.Fatalf("the process ended %v past the quiescence bound", late)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the process was never ended while the logger blocked")
+			}
+			if g.exited.Load() != 1 {
+				t.Fatalf("exit status %d, want 1", g.exited.Load())
+			}
+			select {
+			case <-handler.entered:
+			default:
+				t.Fatal("the abandonment's log line never reached the logger, so the test proves nothing")
+			}
+			<-done
+		})
+	}
+}
+
+func (h *errorBlockingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *errorBlockingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestTheLogGraceIsPartOfTheQuiescenceBound holds the wait for quiescence and
+// the abandonment's log grace to the bound together: stopping never runs past
+// the bound to give a log line its chance.
+func TestTheLogGraceIsPartOfTheQuiescenceBound(t *testing.T) {
+	for _, bound := range []time.Duration{200 * time.Millisecond, defaultStateQuiescenceBound} {
+		if wait, grace := quiescenceWait(bound), abandonLogGrace(bound); wait+grace != bound || grace <= 0 || wait <= 0 {
+			t.Fatalf("bound %v: wait %v and grace %v, want positive parts summing to the bound", bound, wait, grace)
+		}
+	}
+}
