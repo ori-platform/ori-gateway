@@ -6,6 +6,7 @@ package site
 import (
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -568,4 +569,31 @@ func TestAnUnobservedNodeKeepsItsRecordedExportSeverity(t *testing.T) {
 			t.Errorf("a device with no reading: %q, want degraded", n.Status)
 		}
 	}
+}
+
+// TestProjectionReadsSeverityUnderTheLock projects while export readings
+// arrive for evicted nodes: the projection copies the recorded severities
+// under the registry's lock. It guards under -race.
+func TestProjectionReadsSeverityUnderTheLock(t *testing.T) {
+	reg := NewRegistry()
+	projector := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a", "node-b"}, NodeTTLMS: 5000})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := range 500 {
+			severity := ExportSeverityCritical
+			if i%2 == 0 {
+				severity = ExportSeverityOK
+			}
+			reg.UpsertPosture([]string{"node-a", "node-b"}[i%2], SiteNodePosture{ExportSeverity: severity})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 500 {
+			projector.Project(time.UnixMilli(100_000), healthyGateway())
+		}
+	}()
+	wg.Wait()
 }

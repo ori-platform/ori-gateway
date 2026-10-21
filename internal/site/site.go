@@ -4,7 +4,6 @@
 package site
 
 import (
-	"maps"
 	"sync"
 )
 
@@ -111,7 +110,17 @@ func (r *Registry) snapshotLocked() []NodeHeartbeat {
 func (r *Registry) snapshotWithExportSeverity() ([]NodeHeartbeat, map[string]string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.snapshotLocked(), maps.Clone(r.exportSeverity)
+	// Copied under the lock with nodes, so a projection never pairs a node
+	// set with a later severity. An explicit loop, not maps.Clone, so the
+	// race detector sees the read (TestProjectionReadsSeverityUnderTheLock).
+	// Only a reading is recorded, never an empty severity.
+	severity := make(map[string]string, len(r.exportSeverity))
+	for deviceID, value := range r.exportSeverity {
+		if value != "" {
+			severity[deviceID] = value
+		}
+	}
+	return r.snapshotLocked(), severity
 }
 
 // cloneStrings copies a string slice, preserving nil. The nil/empty
