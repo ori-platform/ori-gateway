@@ -210,6 +210,8 @@ func memberRuleThroughTheGateway(t *testing.T, signed bool) {
 			}
 			ids = append(ids, reply.RequestID)
 		}
+		// Requests run concurrently, so replies may arrive in any order.
+		slices.Sort(ids)
 		return ids
 	}
 	if got := answered("ori/dev-01/reasoning/response"); strings.Join(got, ",") != "req-clean,req-unknown" {

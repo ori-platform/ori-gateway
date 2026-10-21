@@ -173,23 +173,21 @@ func stopAtTheFailureLimit(t *testing.T, heldCompletes, cancelFirst bool) error 
 	for i := range defaultRequestFailureLimit {
 		handler("ori/dev-01/reasoning/request", request(i))
 	}
+	// Requests run off the broker callback, so the decision is taken once
+	// the last failed reply returns, not when the handler does.
 	signer := <-g.signers
-	if _, err := signer.Next(); !errors.Is(err, mqttauth.ErrSigningClockClosed) {
-		t.Fatalf("the clock issued %v after the failure limit, want ErrSigningClockClosed", err)
-	}
+	waitUntil(t, "the failure limit to stop the signing clock", func() bool {
+		_, err := signer.Next()
+		return errors.Is(err, mqttauth.ErrSigningClockClosed)
+	})
 	fp.mu.Lock()
 	answered := len(fp.requests)
 	fp.mu.Unlock()
 	if answered != defaultRequestFailureLimit {
 		t.Fatalf("%d requests reached the provider before the limit, want %d", answered, defaultRequestFailureLimit)
 	}
+	// Checked once runGateway returns, which joins every request admitted.
 	handler("ori/dev-01/reasoning/request", request(defaultRequestFailureLimit))
-	fp.mu.Lock()
-	after := len(fp.requests)
-	fp.mu.Unlock()
-	if after != answered {
-		t.Fatal("a reasoning request was admitted after the failure limit decided the stop")
-	}
 
 	// The decision cancelled the run, so the bridge stops listening while
 	// runGateway is still held; until it does, a request is answered 503.
@@ -217,6 +215,12 @@ func stopAtTheFailureLimit(t *testing.T, heldCompletes, cancelFirst bool) error 
 	select {
 	case err := <-done:
 		done <- err
+		fp.mu.Lock()
+		after := len(fp.requests)
+		fp.mu.Unlock()
+		if after != answered {
+			t.Fatal("a reasoning request was admitted after the failure limit decided the stop")
+		}
 		return err
 	case <-time.After(5 * time.Second):
 		t.Fatal("the gateway did not stop on its own decision")

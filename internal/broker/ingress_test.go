@@ -460,3 +460,19 @@ func TestAByteBudgetBoundsTheParseWorkEachDeviceCanCause(t *testing.T) {
 		})
 	}
 }
+
+// TestADropAtTheHeldBoundIsLoggedApartFromTheRate counts a handler's drop at
+// its bound on what one device may hold as volume_dropped, and logs it under
+// its own line, since it can follow the gateway's own slowness.
+func TestADropAtTheHeldBoundIsLoggedApartFromTheRate(t *testing.T) {
+	var logs bytes.Buffer
+	stats := NewIngressStats(slog.New(slog.NewTextHandler(&logs, nil)))
+	stats.Drop(contracts.FamilyReasoningRequest, 300)
+	if got := stats.Snapshot()[contracts.FamilyReasoningRequest]; got.VolumeDropped != 1 || got.PayloadTooLarge != 0 {
+		t.Fatalf("counts = %+v, want one volume drop", got)
+	}
+	text := logs.String()
+	if !strings.Contains(text, "over what one device may hold") || strings.Contains(text, "over the family rate") {
+		t.Fatalf("a held-bound drop was logged as %q", text)
+	}
+}

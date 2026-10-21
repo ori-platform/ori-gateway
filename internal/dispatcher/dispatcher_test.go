@@ -409,10 +409,18 @@ func TestDispatcherConcurrentDuplicateRequestIDPublishesOnce(t *testing.T) {
 	}()
 	time.Sleep(5 * time.Millisecond)
 	close(block)
+	// The repeat is refused as already in flight; the first is answered.
+	var refused int
 	for range 2 {
-		if err := <-done; err != nil {
+		switch err := <-done; {
+		case errors.Is(err, ErrRequestInFlight):
+			refused++
+		case err != nil:
 			t.Fatal(err)
 		}
+	}
+	if refused != 1 {
+		t.Fatalf("%d requests refused as already in flight, want the repeat alone", refused)
 	}
 	if prov.callCount() != 1 || pub.callCount() != 1 {
 		t.Fatalf("provider/publish calls = %d/%d", prov.callCount(), pub.callCount())
@@ -460,5 +468,83 @@ func TestNewRejectsInvalidDependencies(t *testing.T) {
 	}
 	if _, err := New(pub, prov, Options{PublishTimeout: -1}); err == nil {
 		t.Fatal("expected negative publish timeout error")
+	}
+}
+
+// TestARequestAlreadyInFlightIsRefusedAndDeliversNothing holds a request in
+// the provider and sends its request_id again: the repeat is refused as
+// ErrRequestInFlight, reaches no provider and publishes nothing, so it is
+// neither a delivery failure nor a delivered reply (GW-6). The request in
+// flight still answers its request_id (GW-2).
+func TestARequestAlreadyInFlightIsRefusedAndDeliversNothing(t *testing.T) {
+	pub := &fakePublisher{}
+	prov := &fakeProvider{block: make(chan struct{})}
+	d := newTestDispatcher(t, pub, prov, Options{ProviderTimeoutMS: 1000})
+	first := make(chan error, 1)
+	go func() {
+		first <- d.HandleRequest(context.Background(), "ori/site-a/reasoning/request", validPayload(t, nil))
+	}()
+	for prov.callCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	err := d.HandleRequest(context.Background(), "ori/site-a/reasoning/request", validPayload(t, nil))
+	if !errors.Is(err, ErrRequestInFlight) || errors.Is(err, ErrPublishResponse) {
+		t.Fatalf("repeat = %v, want ErrRequestInFlight alone", err)
+	}
+	if prov.callCount() != 1 || pub.callCount() != 0 {
+		t.Fatalf("the repeat reached the provider or published: provider %d, published %d", prov.callCount(), pub.callCount())
+	}
+	close(prov.block)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if resp := pub.publishedResponse(t); resp.RequestID != "req-1" || pub.callCount() != 1 {
+		t.Fatalf("the request in flight answered %q in %d replies, want req-1 once", resp.RequestID, pub.callCount())
+	}
+}
+
+// TestTheSameRequestIDFromTwoDevicesIsAnsweredForEach holds one device's
+// request in the provider and sends the same request_id from another device:
+// request_id is unique only within its device, so the second is handled and
+// answered on its own device's topic while the first is still in flight.
+func TestTheSameRequestIDFromTwoDevicesIsAnsweredForEach(t *testing.T) {
+	pub := &fakePublisher{}
+	prov := &fakeProvider{block: make(chan struct{})}
+	d := newTestDispatcher(t, pub, prov, Options{ProviderTimeoutMS: 1000})
+	first := make(chan error, 1)
+	go func() {
+		first <- d.HandleRequest(context.Background(), "ori/site-a/reasoning/request", validPayload(t, nil))
+	}()
+	for prov.callCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	second := make(chan error, 1)
+	go func() {
+		second <- d.HandleRequest(context.Background(), "ori/site-b/reasoning/request",
+			validPayload(t, func(req *contracts.ReasoningRequest) { req.DeviceID = "site-b" }))
+	}()
+	for prov.callCount() < 2 {
+		select {
+		case err := <-second:
+			t.Fatalf("the other device's request returned %v before reaching the provider", err)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	close(prov.block)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	topics := map[string]int{}
+	for _, msg := range pub.messages {
+		topics[msg.topic]++
+	}
+	if topics["ori/site-a/reasoning/response"] != 1 || topics["ori/site-b/reasoning/response"] != 1 {
+		t.Fatalf("replies by topic = %v, want one for each device", topics)
 	}
 }

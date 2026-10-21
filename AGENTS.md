@@ -50,8 +50,11 @@ exit rather than silently appearing available.
 The gateway process must also surface repeated reasoning-response delivery
 failures instead of logging forever while dropping all replies. Only a reply
 it could not publish counts toward that limit (`dispatcher.ErrPublishResponse`):
-a request it refuses, malformed, unauthenticated or not fresh, neither counts
-nor resets the count, so no sender can end the gateway by sending junk. A
+a request it refuses, malformed, unauthenticated, not fresh or with a
+`request_id` already in flight for the same device
+(`dispatcher.ErrRequestInFlight`), neither
+counts nor resets the count, so no sender can end the gateway by sending junk
+or mask a delivery failure by repeating a request. A
 heartbeat that the run's own stop interrupts, or that the signing clock the
 stop has closed refuses, is not a failure, and neither is a reasoning reply
 the stop refuses, by cancelling it or closing the signing clock, so a clean
@@ -60,6 +63,10 @@ Verified by `TestHeartbeatFailureLimit`,
 `TestGatewayHeartbeatFailureReturnsError`,
 `TestMainEscalatesRepeatedRequestHandlerFailures`,
 `TestMalformedReasoningRequestsNeverStopTheGateway`,
+`TestADuplicateInFlightRequestNeitherCountsNorResetsTheFailureCount`,
+`TestARequestAlreadyInFlightIsRefusedAndDeliversNothing`,
+`TestTheSameRequestIDFromTwoDevicesIsAnsweredForEach`,
+`TestTheSameRequestIDFromTwoDevicesIsAnsweredThroughTheGateway`,
 `TestAPublishTheStopInterruptsIsNotAFailure`,
 `TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`,
 `TestAReplyTheStopRefusesIsNotADeliveryFailure`,
@@ -157,9 +164,13 @@ the broker. Long-running app tasks must be supervised through the shared
 `errgroup`-backed supervisor rather than open-coded result channels, so adding a
 new runner does not require updating every early-return drain path by hand.
 Every broker callback, on both broker clients, runs through one callback gate,
-and posture fetches started from the runtime heartbeat callback are owned the
-same way: once shutdown begins none starts, and `runGateway` does not return
-while one is still running. The decision to stop is one step
+and reasoning and enrichment requests and evidence carriages and
+acknowledgements, which run off the callback, and posture fetches started from
+the runtime heartbeat callback are owned the same way: once shutdown begins
+none starts, and `runGateway` does not return while one is still running. A
+message accepted off the callback but still waiting when the stop is decided
+is released without being handled; its PUBACK was already sent, so the broker
+does not deliver it again, and the runtime's own retry or fallback covers it. The decision to stop is one step
 (gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
 broker callback, on both broker clients, every later webhook request, which
 the bridge answers 503 without reading it, and every later posture fetch,
@@ -193,6 +204,9 @@ Verified by `TestMainStartupMissingConfig`,
 `TestSupervisedRunnersUnexpectedNilReturnIsError`,
 `TestShutdownWaitsForAPostureFetchesSigningWrite`,
 `TestShutdownJoinsEveryBrokerCallback`,
+`TestShutdownJoinsARequestRunningOffTheCallback`,
+`TestNoRequestStartsOnceTheStopIsDecided`,
+`TestAMessageWaitingWhenTheRunStopsIsReleasedUnhandled`,
 `TestAClosedPostureDebouncerStartsNothing`,
 `TestShutdownWaitsForTheGatewaysOwnExtension`, `TestAClosedClockRefusesToSign`,
 `TestAStoppingGatewayWithAStalledWriteEndsTheProcessHoldingTheLock`,
@@ -517,7 +531,17 @@ device segment), before the handler runs: a refused payload is never parsed,
 decoded, verified, routed or answered, and changes no state. Refusals are
 counted per family, projected as site health `gateway.mqtt_ingress`, and
 logged paced, with family and size class only, never content, device ID or
-topic. No setting raises or lowers a maximum or a rate. Every required reply
+topic. No setting raises or lowers a maximum or a rate. Reasoning and
+enrichment requests, outbound evidence carriages and inbound evidence
+acknowledgements are handled off the client's ordered delivery, so neither a
+provider call nor a reply or acknowledgement waiting for its PUBACK holds any
+other message. A device's carriages and acknowledgements share one queue and
+are handled one at a time, in the order they arrived, as on the client. What
+each device holds of a family is bounded as the rate is, at the family's
+burst, and a message over the bound is dropped unanswered, counted as a volume
+drop and logged apart from the rate. A pool refuses to subscribe a topic
+outside the families it serves.
+Every required reply
 the gateway produces (reasoning and enrichment error responses, the outbound
 evidence acknowledgement, the gateway heartbeat) fits the 4096-byte floor at
 the contract's bounds: an error response, whoever built it, carries an `error`
@@ -535,6 +559,18 @@ Verified by `TestEverySubscriptionHasAPayloadMaximum`,
 `TestPayloadSizeVectorCases`,
 `TestARefusedOversizePayloadChangesNothingAndIsNotAnswered`,
 `TestAnOversizePayloadCostsNoParse`, `TestAVolumeOverTheRateIsDroppedAndCounted`,
+`TestABurstOfReasoningRequestsIsAnsweredWithoutStalling`,
+`TestAHeartbeatIsNotDelayedByAReasoningCall`,
+`TestEachDeviceHasItsOwnAllowanceOfRequestsInFlight`,
+`TestABurstOfOutboundCarriagesIsAcknowledgedWithoutStalling`,
+`TestAnOrderedPoolKeepsEachDevicesArrivalOrder`,
+`TestAnOrderedPoolBoundsWhatADeviceHolds`,
+`TestABurstOfEnrichmentRequestsIsAnsweredWithoutStalling`,
+`TestCarriagesAndAcknowledgementsShareEachDevicesOrder`,
+`TestTheRunningGatewayKeepsEachDevicesEvidenceOrder`,
+`TestAPoolRefusesATopicOutsideItsFamilies`,
+`TestADropAtTheHeldBoundIsLoggedApartFromTheRate`,
+`TestAPanickingRequestIsRecoveredAndReleased`,
 `TestIngressRefusalsAreRecordedWithoutContent`,
 `TestAWildcardSubscriptionRatesEachDevice`,
 `TestAByteBudgetBoundsTheParseWorkEachDeviceCanCause`,
