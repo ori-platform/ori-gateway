@@ -370,3 +370,99 @@ func TestAReplyTheStopRefusesIsNotADeliveryFailure(t *testing.T) {
 		t.Fatal("the gateway did not stop")
 	}
 }
+
+// reasoningRequest is reasoning request i for dev-01, signed at signedAtMS
+// under the stalling gateway's envelope secret, or unsigned when sign is
+// false.
+func reasoningRequest(t *testing.T, i int, sign bool, signedAtMS int64) []byte {
+	t.Helper()
+	req := map[string]any{"request_id": fmt.Sprintf("stop-refused-%d", i), "device_id": "dev-01", "sensor_type": "current_clamp",
+		"trigger_name": "overcurrent", "prompt": "Explain anomaly.", "action_tier_hint": "C", "timeout_ms": 1000}
+	if sign {
+		auth, err := mqttauth.Sign(req, contracts.ReasoningRequestMessageType, "dev-01", req["request_id"].(string), signedAtMS, "runtime-gateway-envelope-secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		req["auth"] = auth
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// TestAReplyFailingAfterTheCallerCancelsIsNotCounted runs without
+// gateway.auth, so no signing clock is involved, with every reply failing:
+// one short of the limit, then a held request whose reply fails only after
+// the caller has cancelled the run. That failure is the run's own stop, not
+// a delivery failure, and the clean stop returns nil.
+func TestAReplyFailingAfterTheCallerCancelsIsNotCounted(t *testing.T) {
+	g := newStallingGateway(t, filepath.Join(t.TempDir(), "gateway-state"), false)
+	g.cfg.Gateway.Auth = config.GatewayAuthConfig{}
+	g.deps.loadConfig = func(string) (config.Config, error) { return g.cfg, nil }
+	fp := &cancelAwareProvider{fakeProvider: fakeProvider{healthy: true}, hold: make(chan struct{}), held: make(chan struct{})}
+	g.deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return fp, nil }
+	handled := make(chan struct{})
+	b := &joinedDisconnectBroker{fakeBroker: newFakeBroker(), joined: handled}
+	b.publishErr = errors.New("reply not delivered")
+	g.deps.newBroker = func(broker.Options) (brokerClient, error) { return b, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", g.deps) }()
+	waitUntil(t, "every subscription", func() bool { return b.handlerFor("ori/dev-01/runtime/heartbeat") != nil })
+	handler := b.handlerFor(contracts.GatewayReasoningRequestTopicFilter)
+	for i := range defaultRequestFailureLimit - 1 {
+		handler("ori/dev-01/reasoning/request", reasoningRequest(t, i, false, 0))
+	}
+	close(fp.hold)
+	go func() {
+		defer close(handled)
+		handler("ori/dev-01/reasoning/request", reasoningRequest(t, defaultRequestFailureLimit, false, 0))
+	}()
+	<-fp.held
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a clean stop with a request in flight = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gateway did not stop")
+	}
+}
+
+// TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted closes the signing
+// clock while the run's context is still live, as between the two steps of
+// a decision to stop, and sends more requests than the limit: every reply is
+// refused by the closed clock, none counts, and the gateway does not stop on
+// its own.
+func TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted(t *testing.T) {
+	g := newStallingGateway(t, filepath.Join(t.TempDir(), "gateway-state"), false)
+	g.deps.loadConfig = func(string) (config.Config, error) { return g.cfg, nil }
+	b := newFakeBroker()
+	g.deps.newBroker = func(broker.Options) (brokerClient, error) { return b, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", g.deps) }()
+	waitUntil(t, "every subscription", func() bool { return b.handlerFor("ori/dev-01/runtime/heartbeat") != nil })
+	clock := <-g.signers
+	clock.Close()
+	handler := b.handlerFor(contracts.GatewayReasoningRequestTopicFilter)
+	for i := range defaultRequestFailureLimit + 1 {
+		handler("ori/dev-01/reasoning/request", reasoningRequest(t, i, true, g.wallMS.Load()))
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("the gateway stopped on its own after replies the closed clock refused: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gateway did not stop")
+	}
+}

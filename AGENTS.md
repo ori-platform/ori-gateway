@@ -61,8 +61,10 @@ Verified by `TestHeartbeatFailureLimit`,
 `TestMainEscalatesRepeatedRequestHandlerFailures`,
 `TestMalformedReasoningRequestsNeverStopTheGateway`,
 `TestAPublishTheStopInterruptsIsNotAFailure`,
-`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`, and
-`TestAReplyTheStopRefusesIsNotADeliveryFailure`.
+`TestAHeartbeatTheStoppedClockRefusesIsNotAFailure`,
+`TestAReplyTheStopRefusesIsNotADeliveryFailure`,
+`TestAReplyFailingAfterTheCallerCancelsIsNotCounted`, and
+`TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted`.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
