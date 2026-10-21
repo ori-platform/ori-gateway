@@ -765,8 +765,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		// are handled off the evidence client's delivery. Carriages and inbound
 		// acknowledgements share one queue per device, so each device's are
 		// handled in the order they arrived, as on the client.
-		evidenceTraffic := newOrderedRequestPool(cfg.Gateway.DeviceIDs, callbacks, runCtx.Done(), ingress, deps.logger,
-			contracts.FamilyEvidenceOutbound, contracts.FamilyEvidenceInboundAck)
+		evidenceTraffic := newEvidencePool(cfg.Gateway.DeviceIDs, callbacks, runCtx.Done(), ingress, deps.logger)
 		if err := evidenceTraffic.subscribe(runCtx, evidenceBroker, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 			deviceID, parseErr := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
 			if parseErr != nil {

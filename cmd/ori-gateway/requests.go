@@ -95,6 +95,15 @@ func newOrderedRequestPool(devices []string, gate *callbackGate, stopped <-chan 
 	return p
 }
 
+// newEvidencePool is the pool for the evidence client: outbound carriages and
+// inbound acknowledgements share one ordered queue per device, so a device's
+// are handled in the order they arrived, as on the client, and each family
+// keeps its own allowance.
+func newEvidencePool(devices []string, gate *callbackGate, stopped <-chan struct{}, ingress *broker.IngressStats, logger *slog.Logger) *requestPool {
+	return newOrderedRequestPool(devices, gate, stopped, ingress, logger,
+		contracts.FamilyEvidenceOutbound, contracts.FamilyEvidenceInboundAck)
+}
+
 // subscribe subscribes topic on client with handle run through the pool. A
 // topic outside the families the pool serves is refused.
 func (p *requestPool) subscribe(ctx context.Context, client brokerClient, topic string, qos byte, handle broker.MessageHandler) error {

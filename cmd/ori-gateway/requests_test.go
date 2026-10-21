@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"slices"
@@ -618,9 +619,11 @@ func TestAMessageWaitingWhenTheRunStopsIsReleasedUnhandled(t *testing.T) {
 // before it, and each family keeps its own allowance.
 func TestCarriagesAndAcknowledgementsShareEachDevicesOrder(t *testing.T) {
 	gate := newCallbackGate()
-	pool := newOrderedRequestPool([]string{"dev-01"}, gate, nil,
-		broker.NewIngressStats(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler),
-		contracts.FamilyEvidenceOutbound, contracts.FamilyEvidenceInboundAck)
+	ingress := broker.NewIngressStats(slog.New(slog.DiscardHandler))
+	pool := newEvidencePool([]string{"dev-01"}, gate, nil, ingress, slog.New(slog.DiscardHandler))
+	if !pool.ordered {
+		t.Fatal("the evidence pool is not ordered")
+	}
 	if pool.limits[contracts.FamilyEvidenceOutbound] != broker.IngressRates[contracts.FamilyEvidenceOutbound].Burst ||
 		pool.limits[contracts.FamilyEvidenceInboundAck] != broker.IngressRates[contracts.FamilyEvidenceInboundAck].Burst {
 		t.Fatalf("allowances = %v, want each family's burst", pool.limits)
@@ -646,5 +649,128 @@ func TestCarriagesAndAcknowledgementsShareEachDevicesOrder(t *testing.T) {
 	gate.close()
 	if got := strings.Join(order, ","); got != "carriage-0,ack-0,carriage-1,ack-1" {
 		t.Fatalf("ran %s, want arrival order across both families", got)
+	}
+
+	// Each family keeps its own allowance: a device holding its full
+	// allowance of carriages still has its acknowledgements accepted.
+	gate = newCallbackGate()
+	pool = newEvidencePool([]string{"dev-01"}, gate, nil, ingress, slog.New(slog.DiscardHandler))
+	hold := make(chan struct{})
+	var acked sync.WaitGroup
+	acked.Add(1)
+	carriage = pool.handler(contracts.FamilyEvidenceOutbound, func(string, []byte) { <-hold })
+	ack = pool.handler(contracts.FamilyEvidenceInboundAck, func(string, []byte) { acked.Done() })
+	for range pool.limits[contracts.FamilyEvidenceOutbound] {
+		carriage("ori/dev-01/evidence/outbound", []byte(`{}`))
+	}
+	before := ingress.Snapshot()[contracts.FamilyEvidenceInboundAck].VolumeDropped
+	ack("ori/dev-01/evidence/inbound/ack", []byte(`{}`))
+	if got := ingress.Snapshot()[contracts.FamilyEvidenceInboundAck].VolumeDropped; got != before {
+		t.Fatalf("an acknowledgement was dropped while only the carriage allowance was full")
+	}
+	close(hold)
+	acked.Wait()
+	gate.close()
+}
+
+// orderProbe is a slog handler that, when the gateway logs its refusal of an
+// inbound evidence acknowledgement, records whether the carriage sent before
+// it had already been acknowledged.
+type orderProbe struct {
+	slog.Handler
+	acked func() bool
+	mu    *sync.Mutex
+	seen  *[]bool
+}
+
+func (h orderProbe) Handle(ctx context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "evidence inbound acknowledgement refused") {
+		h.mu.Lock()
+		*h.seen = append(*h.seen, h.acked())
+		h.mu.Unlock()
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// TestTheRunningGatewayKeepsEachDevicesEvidenceOrder sends a device's
+// carriage and then an inbound acknowledgement through the gateway's real
+// evidence subscriptions: the acknowledgement is handled only once the
+// carriage before it has been admitted and acknowledged, as the evidence
+// client delivered them.
+func TestTheRunningGatewayKeepsEachDevicesEvidenceOrder(t *testing.T) {
+	t.Setenv("GATEWAY_ENVELOPE", "runtime-gateway-envelope-secret")
+	t.Setenv("GATEWAY_CUSTODY", "gateway-custody-secret-with-at-least-32-bytes")
+	t.Setenv("EVIDENCE_ENDPOINT", "https://127.0.0.1:1/v1/evidence/artifacts")
+	t.Setenv("EVIDENCE_CLIENT", "site-gateway-a")
+	t.Setenv("EVIDENCE_SECRET", "evidence-ingest-secret-with-at-least-32-bytes")
+	cfg := validConfig()
+	cfg.Gateway.DeviceIDs = []string{"dev-01", "dev-02"}
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_ENVELOPE"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
+	cfg.Gateway.Custody = config.GatewayCustodyConfig{SecretEnv: "GATEWAY_CUSTODY"}
+	cfg.Evidence = config.EvidenceConfig{
+		Enabled: true, QueueDirectory: filepath.Join(t.TempDir(), "outbound"),
+		ReturnQueueDirectory: filepath.Join(t.TempDir(), "returned"), MaxItems: 64,
+		MaxBytes: 16 << 20, RetryIntervalS: 60, BackoffBaseS: 60, BackoffMaxS: 60, StoreProbeIntervalS: 900,
+		EndpointEnv: "EVIDENCE_ENDPOINT", ClientIDEnv: "EVIDENCE_CLIENT", SecretEnv: "EVIDENCE_SECRET",
+	}
+	mainBroker, evidenceBroker := newFakeBroker(), newFakeBroker()
+	deps := baseDeps(t, cfg, mainBroker, &fakeProvider{healthy: true}, newFakeHeartbeat())
+	deps.newBroker = func(opts broker.Options) (brokerClient, error) {
+		if opts.ClientID == defaultEvidenceClientID {
+			return evidenceBroker, nil
+		}
+		return mainBroker, nil
+	}
+	carriageAcked := func(n int) func() bool {
+		return func() bool {
+			evidenceBroker.mu.Lock()
+			defer evidenceBroker.mu.Unlock()
+			count := 0
+			for _, msg := range evidenceBroker.published {
+				if msg.topic == "ori/dev-01/evidence/outbound/ack" {
+					count++
+				}
+			}
+			return count >= n
+		}
+	}
+	var mu sync.Mutex
+	var seen []bool
+	acked := 0
+	deps.logger = slog.New(orderProbe{Handler: slog.NewTextHandler(io.Discard, nil), acked: func() bool { return carriageAcked(acked)() }, mu: &mu, seen: &seen})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	t.Cleanup(func() { cancel(); <-done })
+	waitUntil(t, "the evidence subscriptions", func() bool {
+		return evidenceBroker.handlerFor(contracts.EvidenceOutboundTopicFilter) != nil &&
+			evidenceBroker.handlerFor("ori/dev-01/evidence/inbound/ack") != nil
+	})
+	carriage := evidenceBroker.handlerFor(contracts.EvidenceOutboundTopicFilter)
+	ack := evidenceBroker.handlerFor("ori/dev-01/evidence/inbound/ack")
+
+	const rounds = 10
+	for i := range rounds {
+		mu.Lock()
+		acked = i + 1
+		mu.Unlock()
+		artifact := mustJSON(t, map[string]any{"v": 1, "device_id": "dev-01", "high_water_seq": i + 1, "signature": "ed25519:opaque"})
+		carriage("ori/dev-01/evidence/outbound", mustJSON(t, map[string]string{
+			"device_id": "dev-01", "artifact_type": "checkpoint", "artifact_b64": base64.StdEncoding.EncodeToString(artifact),
+		}))
+		ack("ori/dev-01/evidence/inbound/ack", []byte(`{}`))
+		waitUntil(t, "the acknowledgement to be handled", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(seen) == i+1
+		})
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, ok := range seen {
+		if !ok {
+			t.Fatalf("round %d: an inbound acknowledgement was handled before the carriage that arrived ahead of it", i)
+		}
 	}
 }
