@@ -188,15 +188,19 @@ func TestARefusedGateStillJoinsWhatItAdmitted(t *testing.T) {
 }
 
 // TestTheDecisionToStopRefusesEveryAdmissionInOneStep takes the decision and
-// checks each part of it: the callback gate refuses, the posture debouncer
-// refuses, and signing has stopped, before anything is joined.
+// checks each part of it: the callback gate refuses, the webhook gate
+// refuses, the posture debouncer refuses, and signing has stopped, before
+// anything is joined.
 func TestTheDecisionToStopRefusesEveryAdmissionInOneStep(t *testing.T) {
-	gate, posture := newCallbackGate(), newPostureDebouncer()
+	gate, webhook, posture := newCallbackGate(), newCallbackGate(), newPostureDebouncer()
 	stopped := false
-	decision := &stopDecision{callbacks: gate, posture: posture, stopSigning: func() { stopped = true }}
+	decision := &stopDecision{callbacks: gate, webhook: webhook, posture: posture, stopSigning: func() { stopped = true }}
 	decision.decide()
 	if gate.enter() {
 		t.Fatal("the callback gate admitted a callback after the decision to stop")
+	}
+	if _, admitted := webhook.admit(); admitted {
+		t.Fatal("the webhook gate admitted a request after the decision to stop")
 	}
 	if posture.tryStart("dev-01") {
 		t.Fatal("a posture fetch started after the decision to stop")

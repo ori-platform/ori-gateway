@@ -403,11 +403,15 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	var webhookBridge webhookBridgeRunner
 	var webhookBridgeReady atomic.Bool
 	webhookBridgeRefusals := webhookbridge.NewRefusals()
+	// Every webhook request is admitted through its own gate, which the
+	// decision to stop refuses with the broker callbacks (rule 13).
+	webhookIngress := newCallbackGate()
 	if cfg.WebhookBridge.Enabled {
 		webhookBridge, err = deps.newWebhookBridge(cfg.WebhookBridge, webhookbridge.Options{
 			Logger:   deps.logger,
 			Now:      deps.now,
 			Refusals: webhookBridgeRefusals,
+			Admit:    webhookIngress.admit,
 		})
 		if err != nil {
 			return fmt.Errorf("construct webhook bridge: %w", err)
@@ -542,12 +546,13 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	// once shutdown begins none starts, and runGateway never returns while
 	// one is still running (GW-15).
 	postureDebounce := newPostureDebouncer()
-	decision := &stopDecision{callbacks: callbacks, posture: postureDebounce, stopSigning: stopSigning}
+	decision := &stopDecision{callbacks: callbacks, webhook: webhookIngress, posture: postureDebounce, stopSigning: stopSigning}
 	decideStop := decision.decide
 	defer func() {
 		decideStop()
 		cancel()
 		callbacks.close()
+		webhookIngress.close()
 		postureDebounce.close()
 	}()
 	runners := newSupervisedRunners(runCtx)
@@ -1424,17 +1429,19 @@ func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCo
 
 // stopDecision is the decision to stop (gateway-config/v2
 // gateway.state_directory rule 13): one step that stops admitting work, every
-// broker callback and posture fetch, and stops issuing signing values, before
-// anything already admitted is joined. It may be taken more than once, and
-// concurrently.
+// broker callback, webhook request and posture fetch, and stops issuing
+// signing values, before anything already admitted is joined. It may be taken
+// more than once, and concurrently.
 type stopDecision struct {
 	callbacks   *callbackGate
+	webhook     *callbackGate
 	posture     *postureDebouncer
 	stopSigning func()
 }
 
 func (d *stopDecision) decide() {
 	d.callbacks.refuse()
+	d.webhook.refuse()
 	d.posture.refuse()
 	d.stopSigning()
 }
@@ -1470,6 +1477,14 @@ func (g *callbackGate) refuse() {
 func (g *callbackGate) close() {
 	g.refuse()
 	g.running.Wait()
+}
+
+// admit is enter for a caller that releases what it was admitted to.
+func (g *callbackGate) admit() (release func(), admitted bool) {
+	if !g.enter() {
+		return nil, false
+	}
+	return g.running.Done, true
 }
 
 // wrap returns b with every handler it subscribes run through the gate.

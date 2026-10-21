@@ -37,6 +37,10 @@ type Options struct {
 	// Refusals counts volume refusals for site health; nil gives the server
 	// its own.
 	Refusals *Refusals
+	// Admit, when set, is asked before a request is read: one it refuses is
+	// answered 503 and never read, signed or forwarded, as once the gateway
+	// has decided to stop. An admitted request calls release once answered.
+	Admit func() (release func(), admitted bool)
 }
 
 type Server struct {
@@ -55,6 +59,7 @@ type Server struct {
 	limiter          *limiter
 	refusals         *Refusals
 	refusalLog       refusalLog
+	admit            func() (release func(), admitted bool)
 }
 
 func New(cfg config.WebhookBridgeConfig, opts Options) (*Server, error) {
@@ -126,6 +131,7 @@ func New(cfg config.WebhookBridgeConfig, opts Options) (*Server, error) {
 		logger:           logger,
 		now:              now,
 		nonce:            nonce,
+		admit:            opts.Admit,
 	}, nil
 }
 
@@ -163,6 +169,14 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.admit != nil {
+		release, admitted := s.admit()
+		if !admitted {
+			http.Error(w, "stopping", http.StatusServiceUnavailable)
+			return
+		}
+		defer release()
+	}
 	if r.URL.Path != s.path {
 		http.NotFound(w, r)
 		return

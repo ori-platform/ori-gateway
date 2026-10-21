@@ -232,3 +232,55 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not stop")
 	}
 }
+
+// readCounter is a request body that counts its reads.
+type readCounter struct {
+	*strings.Reader
+	reads int
+}
+
+func (r *readCounter) Read(p []byte) (int, error) {
+	r.reads++
+	return r.Reader.Read(p)
+}
+
+// TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded refuses
+// admission, as once the gateway has decided to stop: the request is
+// answered 503, its body is never read, and nothing is signed or forwarded.
+// An admitted request is released once it is answered.
+func TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded(t *testing.T) {
+	called := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer target.Close()
+	bridge := newTestServer(t, target.URL)
+	admitting, released := false, 0
+	bridge.admit = func() (func(), bool) {
+		if !admitting {
+			return nil, false
+		}
+		return func() { released++ }, true
+	}
+	body := &readCounter{Reader: strings.NewReader("from=%2B2348000000000&text=YES")}
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/sms/africastalking", body)
+	req.RemoteAddr = "127.0.0.1:55123"
+	rr := httptest.NewRecorder()
+	bridge.ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if body.reads != 0 || called {
+		t.Fatalf("a refused request was read %d times and forwarded %v, want neither", body.reads, called)
+	}
+
+	admitting = true
+	req = httptest.NewRequest(http.MethodPost, "/webhooks/sms/africastalking", strings.NewReader("from=%2B2348000000000&text=YES"))
+	req.RemoteAddr = "127.0.0.1:55123"
+	rr = httptest.NewRecorder()
+	bridge.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !called {
+		t.Fatalf("an admitted request = %d, forwarded %v; want 200 and forwarded", rr.Code, called)
+	}
+	if released != 1 {
+		t.Fatalf("an admitted request was released %d times, want once", released)
+	}
+}
