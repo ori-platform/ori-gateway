@@ -137,8 +137,9 @@ the broker. Long-running app tasks must be supervised through the shared
 `errgroup`-backed supervisor rather than open-coded result channels, so adding a
 new runner does not require updating every early-return drain path by hand.
 Every broker callback, on both broker clients, runs through one callback gate,
-and posture fetches started from the runtime heartbeat callback are owned the
-same way: once shutdown begins none starts, and `runGateway` does not return
+and reasoning and enrichment requests and outbound evidence carriages, which
+run off the callback, and posture fetches started from the runtime heartbeat
+callback are owned the same way: once shutdown begins none starts, and `runGateway` does not return
 while one is still running. The decision to stop is one step
 (gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
 broker callback, on both broker clients, every later webhook request, which
@@ -173,6 +174,8 @@ Verified by `TestMainStartupMissingConfig`,
 `TestSupervisedRunnersUnexpectedNilReturnIsError`,
 `TestShutdownWaitsForAPostureFetchesSigningWrite`,
 `TestShutdownJoinsEveryBrokerCallback`,
+`TestShutdownJoinsARequestRunningOffTheCallback`,
+`TestNoRequestStartsOnceTheStopIsDecided`,
 `TestAClosedPostureDebouncerStartsNothing`,
 `TestShutdownWaitsForTheGatewaysOwnExtension`, `TestAClosedClockRefusesToSign`,
 `TestAStoppingGatewayWithAStalledWriteEndsTheProcessHoldingTheLock`,
@@ -480,7 +483,14 @@ device segment), before the handler runs: a refused payload is never parsed,
 decoded, verified, routed or answered, and changes no state. Refusals are
 counted per family, projected as site health `gateway.mqtt_ingress`, and
 logged paced, with family and size class only, never content, device ID or
-topic. No setting raises or lowers a maximum or a rate. Every required reply
+topic. No setting raises or lowers a maximum or a rate. Reasoning and
+enrichment requests and outbound evidence carriages are handled off the
+client's ordered delivery, so neither a provider call nor a reply or
+acknowledgement waiting for its PUBACK holds any other message; carriages are
+handled one at a time per device, in the order they arrived. What each device
+holds is bounded as the rate is, at the family's burst, and a message over the
+bound is dropped unanswered and counted as a volume drop.
+Every required reply
 the gateway produces (reasoning and enrichment error responses, the outbound
 evidence acknowledgement, the gateway heartbeat) fits the 4096-byte floor at
 the contract's bounds: an error response, whoever built it, carries an `error`
@@ -498,6 +508,13 @@ Verified by `TestEverySubscriptionHasAPayloadMaximum`,
 `TestPayloadSizeVectorCases`,
 `TestARefusedOversizePayloadChangesNothingAndIsNotAnswered`,
 `TestAnOversizePayloadCostsNoParse`, `TestAVolumeOverTheRateIsDroppedAndCounted`,
+`TestABurstOfReasoningRequestsIsAnsweredWithoutStalling`,
+`TestAHeartbeatIsNotDelayedByAReasoningCall`,
+`TestEachDeviceHasItsOwnAllowanceOfRequestsInFlight`,
+`TestABurstOfOutboundCarriagesIsAcknowledgedWithoutStalling`,
+`TestAnOrderedPoolKeepsEachDevicesArrivalOrder`,
+`TestAnOrderedPoolBoundsWhatADeviceHolds`,
+`TestAPanickingRequestIsRecoveredAndReleased`,
 `TestIngressRefusalsAreRecordedWithoutContent`,
 `TestAWildcardSubscriptionRatesEachDevice`,
 `TestAByteBudgetBoundsTheParseWorkEachDeviceCanCause`,

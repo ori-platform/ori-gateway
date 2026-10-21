@@ -713,7 +713,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	}
 	var requestFailureMu sync.Mutex
 	requestFailures := 0
-	if err := client.Subscribe(runCtx, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
+	reasoningRequests := newRequestPool(contracts.FamilyReasoningRequest, cfg.Gateway.DeviceIDs, callbacks, ingress, deps.logger)
+	if err := client.Subscribe(runCtx, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, reasoningRequests.handler(func(topic string, payload []byte) {
 		if err := reasoningDispatcher.HandleRequest(runCtx, topic, payload); err != nil {
 			deps.logger.Warn("reasoning request handling failed", "topic", topic, "error", err)
 			// Only a reply that could not be delivered counts toward the
@@ -749,7 +750,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		requestFailureMu.Lock()
 		requestFailures = 0
 		requestFailureMu.Unlock()
-	}); err != nil {
+	})); err != nil {
 		shutdownRunners()
 		return stopCause(fmt.Errorf("subscribe reasoning requests: %w", err))
 	}
@@ -759,7 +760,11 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
 			allowedDevices[deviceID] = true
 		}
-		if err := evidenceBroker.Subscribe(runCtx, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
+		// Each carriage's acknowledgement waits for its PUBACK, so carriages
+		// are handled off the evidence client's delivery, each device's in the
+		// order they arrived.
+		outboundCarriages := newOrderedRequestPool(contracts.FamilyEvidenceOutbound, cfg.Gateway.DeviceIDs, callbacks, ingress, deps.logger)
+		if err := evidenceBroker.Subscribe(runCtx, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, outboundCarriages.handler(func(topic string, payload []byte) {
 			deviceID, parseErr := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
 			if parseErr != nil {
 				deps.logger.Warn("evidence outbound transport refused")
@@ -780,7 +785,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			if err := evidenceIngress.Handle(runCtx, topic, payload); err != nil {
 				deps.logger.Warn("evidence outbound transport refused")
 			}
-		}); err != nil {
+		})); err != nil {
 			shutdownRunners()
 			return stopCause(fmt.Errorf("subscribe outbound evidence: %w", err))
 		}
@@ -853,17 +858,18 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment handler: %w", err)
 		}
+		enrichmentRequests := newRequestPool(contracts.FamilyEnrichmentRequest, cfg.Gateway.DeviceIDs, callbacks, ingress, deps.logger)
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
 			topic, err := contracts.TierCEnrichmentRequestTopic(deviceID)
 			if err != nil {
 				shutdownRunners()
 				return fmt.Errorf("tier c enrichment request topic: %w", err)
 			}
-			if err := client.Subscribe(runCtx, topic, broker.QoSReasoning, func(topic string, payload []byte) {
+			if err := client.Subscribe(runCtx, topic, broker.QoSReasoning, enrichmentRequests.handler(func(topic string, payload []byte) {
 				if err := enrichmentHandler.HandleRequest(runCtx, topic, payload); err != nil {
 					deps.logger.Warn("tier c enrichment request handling failed", "topic", topic, "error", err)
 				}
-			}); err != nil {
+			})); err != nil {
 				shutdownRunners()
 				return stopCause(fmt.Errorf("subscribe tier c enrichment requests: %w", err))
 			}

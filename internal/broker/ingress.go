@@ -134,6 +134,14 @@ func (s *IngressStats) Snapshot() map[string]IngressCount {
 	return out
 }
 
+// Drop counts and logs a message its handler dropped over the subscription's
+// own bound on requests in flight, as a volume drop: the rate at which a
+// receiver processes messages is bounded there too (gateway-api/v2 Payload
+// Volume).
+func (s *IngressStats) Drop(family string, length int) {
+	s.refuse(family, RefusalVolumeDropped, length)
+}
+
 func (s *IngressStats) refuse(family, reason string, length int) {
 	s.mu.Lock()
 	count := s.counts[family]

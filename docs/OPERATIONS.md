@@ -609,6 +609,14 @@ gateway started, one member for each family above. Abbreviated to one family:
 }
 ```
 
+`volume_dropped` also counts reasoning and enrichment requests, and outbound
+evidence carriages, dropped because their device already held its family's
+burst (20 reasoning requests, 10 enrichment requests, 160 carriages waiting
+or being handled), each logged with the family as `WARN mqtt ingress dropped
+messages over the family rate`. A dropped request is not answered; its runtime
+times out and falls back. A dropped carriage is not acknowledged; its runtime
+keeps the bytes and carries them again.
+
 A non-zero count does not degrade the gateway. A count that keeps rising names
 a runtime that is misconfigured or misbehaving; find it from the broker's own
 logs, since the gateway never records which device sent a refused message.

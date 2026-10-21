@@ -737,20 +737,14 @@ func TestMainEscalatesRepeatedRequestHandlerFailures(t *testing.T) {
 	if handler == nil {
 		t.Fatal("missing subscription handler")
 	}
-	for range defaultRequestFailureLimit {
-		handler("ori/site-a/reasoning/request", validRequestPayload(t))
-	}
-	// The callback that reached the limit decided the stop itself, so a
-	// request arriving now is refused before the escalation is noticed.
-	fp.mu.Lock()
-	answered := len(fp.requests)
-	fp.mu.Unlock()
-	handler("ori/site-a/reasoning/request", validRequestPayload(t))
-	fp.mu.Lock()
-	after := len(fp.requests)
-	fp.mu.Unlock()
-	if after != answered {
-		t.Fatal("a reasoning request was admitted after the failure limit decided the stop")
+	// Distinct requests: requests now run concurrently, and the dispatcher
+	// refuses a request_id already in flight.
+	for i := range defaultRequestFailureLimit {
+		req := contracts.ReasoningRequest{
+			RequestID: fmt.Sprintf("req-%d", i), DeviceID: "site-a", SensorType: "current_clamp",
+			TriggerName: "overcurrent", Prompt: "Explain anomaly.", ActionTierHint: contracts.ActionTierC, TimeoutMS: 1000,
+		}
+		handler("ori/site-a/reasoning/request", mustJSON(t, req))
 	}
 
 	select {
@@ -760,6 +754,15 @@ func TestMainEscalatesRepeatedRequestHandlerFailures(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("gateway did not escalate repeated request failures")
+	}
+	// runGateway joined every request it admitted before returning. That a
+	// request after the decision is refused before the escalation is noticed
+	// is TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt's.
+	fp.mu.Lock()
+	answered := len(fp.requests)
+	fp.mu.Unlock()
+	if answered != defaultRequestFailureLimit {
+		t.Fatalf("the provider saw %d requests, want %d", answered, defaultRequestFailureLimit)
 	}
 }
 

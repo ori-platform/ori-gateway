@@ -163,13 +163,17 @@ func TestEveryAcceptedEvidenceConfigRuns(t *testing.T) {
 					Outcome string `json:"outcome"`
 					Reason  string `json:"reason"`
 				}
-				evidenceBroker.mu.Lock()
-				for _, msg := range evidenceBroker.published[before:] {
-					if msg.topic == "ori/"+device+"/evidence/outbound/ack" {
-						_ = json.Unmarshal(msg.payload, &ack)
+				// Carriages are handled off the broker callback, so the
+				// acknowledgement follows the handler's return.
+				for wait := time.Now().Add(5 * time.Second); ack.Outcome == "" && time.Now().Before(wait); time.Sleep(5 * time.Millisecond) {
+					evidenceBroker.mu.Lock()
+					for _, msg := range evidenceBroker.published[before:] {
+						if msg.topic == "ori/"+device+"/evidence/outbound/ack" {
+							_ = json.Unmarshal(msg.payload, &ack)
+						}
 					}
+					evidenceBroker.mu.Unlock()
 				}
-				evidenceBroker.mu.Unlock()
 				if ack.Outcome != "queued" && (ack.Outcome != "refused" || ack.Reason != "queue_full") {
 					cancel()
 					<-done
