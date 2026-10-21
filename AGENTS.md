@@ -145,8 +145,9 @@ and reasoning and enrichment requests and evidence carriages and
 acknowledgements, which run off the callback, and posture fetches started from
 the runtime heartbeat callback are owned the same way: once shutdown begins
 none starts, and `runGateway` does not return while one is still running. A
-message accepted off the callback but still waiting when the run stops is
-released without being handled. The decision to stop is one step
+message accepted off the callback but still waiting when the stop is decided
+is released without being handled; its PUBACK was already sent, so the broker
+does not deliver it again, and the runtime's own retry or fallback covers it. The decision to stop is one step
 (gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
 broker callback, on both broker clients, every later webhook request, which
 the bridge answers 503 without reading it, and every later posture fetch,

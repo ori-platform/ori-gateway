@@ -29,7 +29,11 @@ import (
 // falls back, or keeps its bytes and carries them again. Each message is
 // admitted through the callback gate as it is accepted, so none is accepted
 // once the stop is decided and shutdown joins every one accepted (GW-15);
-// one still waiting when the run stops is released without being handled.
+// one still waiting when the stop is decided is released without being
+// handled. Its PUBACK was already sent, so the broker does not deliver it
+// again: a runtime retries an unacknowledged carriage, falls back from an
+// unanswered request, and carries a returned artifact whose acknowledgement
+// was skipped again after the restart.
 //
 // An unordered pool runs each message on its own goroutine. An ordered pool
 // runs each device's messages, of every family it serves, one at a time in
@@ -39,7 +43,6 @@ type requestPool struct {
 	ordered    bool
 	limits     map[string]int
 	gate       *callbackGate
-	stopped    <-chan struct{}
 	ingress    *broker.IngressStats
 	logger     *slog.Logger
 	configured map[string]bool
@@ -63,9 +66,8 @@ type pendingRequest struct {
 	release func()
 }
 
-// newRequestPool returns an unordered pool for families. stopped is the
-// run's end: a message still waiting then is not handled.
-func newRequestPool(devices []string, gate *callbackGate, stopped <-chan struct{}, ingress *broker.IngressStats, logger *slog.Logger, families ...string) *requestPool {
+// newRequestPool returns an unordered pool for families.
+func newRequestPool(devices []string, gate *callbackGate, ingress *broker.IngressStats, logger *slog.Logger, families ...string) *requestPool {
 	configured := make(map[string]bool, len(devices))
 	for _, deviceID := range devices {
 		configured[deviceID] = true
@@ -77,7 +79,6 @@ func newRequestPool(devices []string, gate *callbackGate, stopped <-chan struct{
 	return &requestPool{
 		limits:     limits,
 		gate:       gate,
-		stopped:    stopped,
 		ingress:    ingress,
 		logger:     logger,
 		configured: configured,
@@ -89,8 +90,8 @@ func newRequestPool(devices []string, gate *callbackGate, stopped <-chan struct{
 
 // newOrderedRequestPool is newRequestPool for families whose messages from
 // one device are handled one at a time, in arrival order across them all.
-func newOrderedRequestPool(devices []string, gate *callbackGate, stopped <-chan struct{}, ingress *broker.IngressStats, logger *slog.Logger, families ...string) *requestPool {
-	p := newRequestPool(devices, gate, stopped, ingress, logger, families...)
+func newOrderedRequestPool(devices []string, gate *callbackGate, ingress *broker.IngressStats, logger *slog.Logger, families ...string) *requestPool {
+	p := newRequestPool(devices, gate, ingress, logger, families...)
 	p.ordered = true
 	return p
 }
@@ -99,8 +100,8 @@ func newOrderedRequestPool(devices []string, gate *callbackGate, stopped <-chan 
 // inbound acknowledgements share one ordered queue per device, so a device's
 // are handled in the order they arrived, as on the client, and each family
 // keeps its own allowance.
-func newEvidencePool(devices []string, gate *callbackGate, stopped <-chan struct{}, ingress *broker.IngressStats, logger *slog.Logger) *requestPool {
-	return newOrderedRequestPool(devices, gate, stopped, ingress, logger,
+func newEvidencePool(devices []string, gate *callbackGate, ingress *broker.IngressStats, logger *slog.Logger) *requestPool {
+	return newOrderedRequestPool(devices, gate, ingress, logger,
 		contracts.FamilyEvidenceOutbound, contracts.FamilyEvidenceInboundAck)
 }
 
@@ -163,7 +164,7 @@ func (p *requestPool) drain(device string) {
 	}
 }
 
-// run handles req, unless the run has stopped, and reports whether it was
+// run handles req, unless the stop has been decided, and reports whether it was
 // the last message an ordered pool held queued for device. Releasing req's
 // admission is the last thing it does, so nothing touches the pool once the
 // gate has joined every message.
@@ -186,10 +187,8 @@ func (p *requestPool) run(device string, req pendingRequest) (last bool) {
 		p.mu.Unlock()
 		req.release()
 	}()
-	select {
-	case <-p.stopped:
+	if p.gate.refused() {
 		return false
-	default:
 	}
 	req.handle(req.topic, req.payload)
 	return false

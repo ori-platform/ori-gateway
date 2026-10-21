@@ -713,7 +713,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	}
 	var requestFailureMu sync.Mutex
 	requestFailures := 0
-	reasoningRequests := newRequestPool(cfg.Gateway.DeviceIDs, callbacks, runCtx.Done(), ingress, deps.logger, contracts.FamilyReasoningRequest)
+	reasoningRequests := newRequestPool(cfg.Gateway.DeviceIDs, callbacks, ingress, deps.logger, contracts.FamilyReasoningRequest)
 	if err := reasoningRequests.subscribe(runCtx, client, contracts.GatewayReasoningRequestTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 		if err := reasoningDispatcher.HandleRequest(runCtx, topic, payload); err != nil {
 			deps.logger.Warn("reasoning request handling failed", "topic", topic, "error", err)
@@ -765,7 +765,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		// are handled off the evidence client's delivery. Carriages and inbound
 		// acknowledgements share one queue per device, so each device's are
 		// handled in the order they arrived, as on the client.
-		evidenceTraffic := newEvidencePool(cfg.Gateway.DeviceIDs, callbacks, runCtx.Done(), ingress, deps.logger)
+		evidenceTraffic := newEvidencePool(cfg.Gateway.DeviceIDs, callbacks, ingress, deps.logger)
 		if err := evidenceTraffic.subscribe(runCtx, evidenceBroker, contracts.EvidenceOutboundTopicFilter, broker.QoSReasoning, func(topic string, payload []byte) {
 			deviceID, parseErr := contracts.DeviceIDFromEvidenceOutboundTopic(topic)
 			if parseErr != nil {
@@ -860,7 +860,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			shutdownRunners()
 			return fmt.Errorf("construct tier c enrichment handler: %w", err)
 		}
-		enrichmentRequests := newRequestPool(cfg.Gateway.DeviceIDs, callbacks, runCtx.Done(), ingress, deps.logger, contracts.FamilyEnrichmentRequest)
+		enrichmentRequests := newRequestPool(cfg.Gateway.DeviceIDs, callbacks, ingress, deps.logger, contracts.FamilyEnrichmentRequest)
 		for _, deviceID := range cfg.Gateway.DeviceIDs {
 			topic, err := contracts.TierCEnrichmentRequestTopic(deviceID)
 			if err != nil {
@@ -1507,6 +1507,14 @@ func (g *callbackGate) refuse() {
 	g.mu.Lock()
 	g.closed = true
 	g.mu.Unlock()
+}
+
+// refused reports whether the gate has stopped admitting: the decision to
+// stop has been taken.
+func (g *callbackGate) refused() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closed
 }
 
 func (g *callbackGate) close() {
