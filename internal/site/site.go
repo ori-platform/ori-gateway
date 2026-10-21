@@ -131,21 +131,24 @@ func cloneSiteNodePosture(p *SiteNodePosture) *SiteNodePosture {
 	return clone
 }
 
-// UpsertPosture updates the posture for an already-registered node, and,
-// when the posture carries one, the severity its health export read, which
-// the node keeps until a later export reading. It is a no-op if the device
-// has not yet been registered via Upsert.
+// UpsertPosture records the severity a health export read, when the posture
+// carries one, which the device keeps until a later export reading, and
+// updates the posture for an already-registered node. The severity is
+// recorded even while the device is not registered, such as a fetch that
+// returns after its node was evicted, so its next heartbeat carries it; the
+// posture itself is not. The caller passes only configured devices, whose
+// heartbeats alone reach the registry, so the record stays bounded by them.
 func (r *Registry) UpsertPosture(deviceID string, posture SiteNodePosture) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if posture.ExportSeverity != "" {
+		r.exportSeverity[deviceID] = posture.ExportSeverity
+	}
 	hb, ok := r.nodes[deviceID]
 	if !ok {
 		return
 	}
-	if posture.ExportSeverity != "" {
-		r.exportSeverity[deviceID] = posture.ExportSeverity
-		hb.ExportSeverity = posture.ExportSeverity
-	}
+	hb.ExportSeverity = r.exportSeverity[deviceID]
 	hb.Posture = &posture
 	r.nodes[deviceID] = hb
 }

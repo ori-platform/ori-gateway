@@ -280,13 +280,17 @@ reports again or is removed from `gateway.device_ids` (`docs/OPERATIONS.md`).
 The severity read from a node's health export (GW-14) only raises its status,
 critical to critical and anything but ok to degraded, and is not itself a
 projected member. The registry keeps it through every heartbeat, a failed
-fetch and eviction; only a later export reading changes it, and a node whose
+fetch and eviction, and records a reading that arrives while the node is not
+registered; only a later export reading changes it, and a node whose
 export last read critical is retained on silence like a critical heartbeat.
 Verified by `TestCriticalHeartbeatKeptThroughGetHealth`,
 `TestExportSeverityOnlyRaisesANode`,
 `TestExportSeverityOutlivesEveryHeartbeat`,
 `TestASilentNodeWhoseExportReadCriticalStaysCritical`,
 `TestACriticalExportSurvivesHeartbeatsAndAFailedFetch`,
+`TestALateExportReadingAfterEvictionIsKept`,
+`TestEvictStaleRuntimeNodesReportsASilentCriticalExport`,
+`TestARunningGatewayKeepsACriticalExportThroughAFailedFetch`,
 `TestCriticalNodeNeverFoldedBelowCritical`,
 `TestFallbackAfterEvidenceHistoryStaysCritical`,
 `TestSilentCriticalNodeStaysCriticalUntilItReportsAgain`, and

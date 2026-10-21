@@ -673,7 +673,10 @@ lowers what the node's heartbeat reported. The node keeps the severity its
 export last read through every later heartbeat, and through a failed or
 skipped export fetch, until a later export reads otherwise; the other posture
 members (`broker_hardening`, `encryption`, `alert_outbox`) are still replaced
-by each heartbeat and filled again by the next fetch.
+by each heartbeat and filled again by the next fetch. So a node whose export
+read `critical` stays `critical` while later exports fail, with only `WARN
+runtime health fetch failed for posture update` in the log, until an export
+reads otherwise or the gateway restarts.
 
 - `WARN runtime health export severity unreadable; reported unknown`, with the
   `device_id` and a `fault` naming why, such as `member_absent:uptime_s`,

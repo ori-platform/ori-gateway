@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,7 +54,16 @@ type exportRuntime struct {
 	handlers map[string]broker.MessageHandler
 	item     any
 	// fail answers the health export with a runtime error.
-	fail bool
+	fail atomic.Bool
+	// served counts the health exports answered.
+	served atomic.Int64
+}
+
+// setItem sets the item the health export carries from now on.
+func (r *exportRuntime) setItem(item any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.item = item
 }
 
 func (r *exportRuntime) Subscribe(_ context.Context, topic string, _ byte, handler broker.MessageHandler) error {
@@ -89,8 +100,11 @@ func (r *exportRuntime) Publish(_ context.Context, _ string, _ byte, _ bool, pay
 		"request_id": req.RequestID, "device_id": req.DeviceID, "export_type": req.ExportType,
 		"items": items, "next_page_token": "", "complete": true, "error": nil,
 	}
-	if req.ExportType == "health" && r.fail {
+	if req.ExportType == "health" && r.fail.Load() {
 		resp["items"], resp["error"] = []any{}, "health unavailable"
+	}
+	if req.ExportType == "health" {
+		defer r.served.Add(1)
 	}
 	if req.ExportType != "health" && r.encrypt {
 		encryptor, err := mqttauth.NewEncryptor(healthTransitionSecret)
@@ -197,12 +211,12 @@ func TestHealthTransitionReachesSiteHealthAndTheWeeklyReport(t *testing.T) {
 					t.Fatal(err)
 				}
 				if tc.Latched {
-					runtime.item = marker
+					runtime.setItem(marker)
 					if _, err := rc.Health(context.Background(), runtimeclient.HealthRequest{DeviceID: tc.RequestedDeviceID}); err != nil {
 						t.Fatal(err)
 					}
 				}
-				runtime.item = decodeVectorItem(t, tc.Item)
+				runtime.setItem(decodeVectorItem(t, tc.Item))
 
 				registry := site.NewRegistry()
 				registry.Upsert(site.NodeHeartbeat{DeviceID: tc.RequestedDeviceID, Status: site.NodeStatusHealthy, LastSeenMS: now.UnixMilli()})
@@ -306,9 +320,9 @@ func TestACriticalExportSurvivesHeartbeatsAndAFailedFetch(t *testing.T) {
 	}
 	fetch := func(item json.RawMessage, fail bool) {
 		t.Helper()
-		runtime.fail = fail
+		runtime.fail.Store(fail)
 		if item != nil {
-			runtime.item = decodeVectorItem(t, item)
+			runtime.setItem(decodeVectorItem(t, item))
 		}
 		fetchAndUpsertPosture(context.Background(), rc, registry, "dev-01", logger)
 	}
@@ -357,5 +371,166 @@ func TestSiteExportSeverityNeverReadsAnUnknownValueAsOK(t *testing.T) {
 		if got := sitePostureFromHealth(runtimeclient.HealthSnapshot{Status: status}).ExportSeverity; got != want {
 			t.Errorf("status %q: posture severity %q, want %q", status, got, want)
 		}
+	}
+}
+
+// TestEvictStaleRuntimeNodesReportsASilentCriticalExport lets a node whose
+// heartbeats were healthy, but whose health export last read critical, go
+// silent beside a node whose heartbeat was critical. Each is retained and
+// reported once with its own line, naming only the device and the times.
+func TestEvictStaleRuntimeNodesReportsASilentCriticalExport(t *testing.T) {
+	registry := site.NewRegistry()
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "export", Status: site.NodeStatusHealthy, LastSeenMS: 1000})
+	registry.UpsertPosture("export", site.SiteNodePosture{ExportSeverity: site.ExportSeverityCritical})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "beat", Status: site.NodeStatusCritical, LastSeenMS: 1000})
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, func() time.Time { return time.UnixMilli(10_000) }, logger)
+
+	lines := []string{
+		`level=ERROR msg="runtime node silent after a critical health export; kept critical until its export reads otherwise" device_id=export gateway_seen_ms=0 last_seen_ms=1000`,
+		`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=beat gateway_seen_ms=0 last_seen_ms=1000`,
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && strings.Count(logs.String(), "level=ERROR") < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	logged := logs.String()
+	for _, want := range lines {
+		if n := strings.Count(logged, want+"\n"); n != 1 {
+			t.Fatalf("log line %q appears %d times, want once:\n%s", want, n, logged)
+		}
+	}
+	if n := strings.Count(logged, "\n"); n != len(lines) {
+		t.Fatalf("%d log lines, want only the two retentions:\n%s", n, logged)
+	}
+	if len(registry.Snapshot()) != 2 {
+		t.Fatalf("both critical nodes should be retained: %#v", registry.Snapshot())
+	}
+}
+
+// TestARunningGatewayKeepsACriticalExportThroughAFailedFetch drives a running
+// gateway: signed runtime heartbeats through its heartbeat callback, each
+// starting a posture fetch through the runtime export client it builds from
+// its own options. A critical export makes the node critical; a heartbeat
+// whose fetch then fails leaves it critical; a later ok export clears it.
+func TestARunningGatewayKeepsACriticalExportThroughAFailedFetch(t *testing.T) {
+	raw, err := specvectors.Read("gateway-api/vectors/health-transition-v2.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus struct {
+		Cases []healthTransitionCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &corpus); err != nil {
+		t.Fatal(err)
+	}
+	items := map[string]json.RawMessage{}
+	for _, tc := range corpus.Cases {
+		items[tc.Name] = tc.Item
+	}
+
+	t.Setenv("GATEWAY_SECRET_CURRENT", healthTransitionSecret)
+	cfg := validConfig()
+	cfg.Gateway.Auth = config.GatewayAuthConfig{Enabled: true, SharedSecretEnv: "GATEWAY_SECRET_CURRENT"}
+	cfg.Gateway.StateDirectory = filepath.Join(t.TempDir(), "gateway-state")
+	cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: "127.0.0.1:0"}
+	fb := newFakeBroker()
+	deps := baseDeps(t, cfg, fb, &fakeProvider{healthy: true}, newFakeHeartbeat())
+	now := deps.now()
+	registry := site.NewRegistry()
+	deps.newSiteRegistry = func() *site.Registry { return registry }
+	runtime := &exportRuntime{t: t, now: now, handlers: map[string]broker.MessageHandler{}}
+	runtime.setItem(decodeVectorItem(t, items["later_critical_true"]))
+	deps.newRuntimeClient = func(_ brokerClient, opts ...runtimeclient.MQTTClientOption) (runtimeclient.Client, error) {
+		return runtimeclient.NewMQTTClient(runtime, append(opts, instantExportPacing())...)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not subscribe")
+	}
+	var handler broker.MessageHandler
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; registry %#v", what, registry.Snapshot())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitFor("the heartbeat callback", func() bool {
+		handler = fb.handlerFor("ori/dev-01/runtime/heartbeat")
+		return handler != nil
+	})
+	signedAt := now.UnixMilli()
+	beat := func() {
+		signedAt++
+		hb := contracts.RuntimeNodeHeartbeat{DeviceID: "dev-01", Status: site.NodeStatusHealthy, LastSeenMS: now.UnixMilli(), ActiveTriggers: []string{}}
+		auth, err := mqttauth.Sign(hb, contracts.RuntimeHeartbeatMessageType, "dev-01", "", signedAt, healthTransitionSecret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hb.Auth = &auth
+		handler("ori/dev-01/runtime/heartbeat", mustJSON(t, hb))
+	}
+	// beatUntilFetched sends heartbeats until one starts a fetch the runtime
+	// answers: a heartbeat while a fetch is in flight starts none.
+	beatUntilFetched := func(what string) {
+		t.Helper()
+		before := runtime.served.Load()
+		waitFor(what, func() bool {
+			beat()
+			time.Sleep(5 * time.Millisecond)
+			return runtime.served.Load() > before
+		})
+	}
+	severity := func() string {
+		snapshot := registry.Snapshot()
+		if len(snapshot) != 1 {
+			return ""
+		}
+		return snapshot[0].ExportSeverity
+	}
+	expect := func(step, want string) {
+		t.Helper()
+		h := site.NewProjector(registry, site.ProjectOptions{ExpectedDeviceIDs: []string{"dev-01"}, NodeTTLMS: 60_000}).
+			Project(now, site.GatewayView{Status: site.SiteStatusHealthy})
+		if h.Nodes[0].Status != want || h.Status != want {
+			t.Fatalf("%s: node %q site %q, want %q", step, h.Nodes[0].Status, h.Status, want)
+		}
+	}
+
+	beatUntilFetched("a critical export")
+	waitFor("the critical reading", func() bool { return severity() == site.ExportSeverityCritical })
+	expect("critical export", site.SiteStatusCritical)
+
+	runtime.fail.Store(true)
+	beatUntilFetched("a failed fetch")
+	beat()
+	expect("heartbeats and a failed fetch after the critical export", site.SiteStatusCritical)
+
+	runtime.fail.Store(false)
+	runtime.setItem(decodeVectorItem(t, items["producer_later_exact"]))
+	beatUntilFetched("a later ok export")
+	waitFor("the ok reading", func() bool { return severity() == site.ExportSeverityOK })
+	expect("a later ok export", site.SiteStatusHealthy)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runGateway returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not stop")
 	}
 }
