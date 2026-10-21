@@ -39,6 +39,9 @@ type hungMark struct {
 	entered   chan struct{}
 	once      sync.Once
 	release   chan struct{}
+	// writing counts writes still inside Persist, so a test can wait for a
+	// released write to land before its directory is removed.
+	writing atomic.Int32
 }
 
 func newHungMark(holdStart bool) *hungMark {
@@ -48,6 +51,8 @@ func newHungMark(holdStart bool) *hungMark {
 func (m *hungMark) Found() (int64, bool) { return m.inner.Found() }
 
 func (m *hungMark) Persist(mark int64) error {
+	m.writing.Add(1)
+	defer m.writing.Add(-1)
 	if m.calls.Add(1) == 1 && !m.holdStart {
 		return m.inner.Persist(mark)
 	}
@@ -88,11 +93,21 @@ func newStallingGateway(t *testing.T, dir string, holdStart bool) *stallingGatew
 		g.signers <- opts.SigningClock
 		return newFakeHeartbeat(), nil
 	}
+	// Registered after the state directory's TempDir, so it runs before its
+	// removal: a write released here lands before the directory is removed.
 	t.Cleanup(func() {
 		select {
 		case <-g.mark.release:
 		default:
 			close(g.mark.release)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for g.mark.writing.Load() > 0 {
+			if time.Now().After(deadline) {
+				t.Error("a released write of the mark never landed")
+				return
+			}
+			time.Sleep(time.Millisecond)
 		}
 	})
 	return g
