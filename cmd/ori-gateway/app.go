@@ -414,9 +414,10 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		}
 	}
 
-	// Every broker callback runs through one gate. Shutdown closes it, which
-	// refuses any later callback and waits for those running, before any
-	// state they may sign or write is released (GW-15).
+	// Every broker callback runs through one gate. The decision to stop
+	// refuses any later callback at once; shutdown then waits for those
+	// running, before any state they may sign or write is released (GW-15;
+	// gateway-config/v2 gateway.state_directory rule 13).
 	callbacks := newCallbackGate()
 
 	// One count of size and volume refusals for every broker client, projected
@@ -541,15 +542,23 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	// once shutdown begins none starts, and runGateway never returns while
 	// one is still running (GW-15).
 	postureDebounce := newPostureDebouncer()
-	defer func() {
+	// decideStop is the decision to stop: it stops admitting work, every
+	// broker callback and posture fetch, and stops issuing signing values, in
+	// one step, before anything already admitted is joined (rule 13).
+	decideStop := func() {
+		callbacks.refuse()
+		postureDebounce.refuse()
 		stopSigning()
+	}
+	defer func() {
+		decideStop()
 		cancel()
 		callbacks.close()
 		postureDebounce.close()
 	}()
 	runners := newSupervisedRunners(runCtx)
 	shutdownRunners := func() {
-		stopSigning()
+		decideStop()
 		cancel()
 		postureDebounce.close()
 		_ = runners.wait()
@@ -864,7 +873,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		shutdownRunners()
 		return disconnectBroker(client, &disconnect)
 	case err := <-runners.done():
-		stopSigning()
+		decideStop()
 		cancel()
 		postureDebounce.close()
 		if ctx.Err() != nil {
@@ -1303,12 +1312,17 @@ func (d *postureDebouncer) done(deviceID string) {
 	d.running.Done()
 }
 
-// close refuses every later fetch and waits for those running to finish. It
-// may be called more than once.
-func (d *postureDebouncer) close() {
+// refuse refuses every later fetch, without waiting for those running.
+func (d *postureDebouncer) refuse() {
 	d.mu.Lock()
 	d.closed = true
 	d.mu.Unlock()
+}
+
+// close refuses every later fetch and waits for those running to finish. It
+// may be called more than once.
+func (d *postureDebouncer) close() {
+	d.refuse()
 	d.running.Wait()
 }
 
@@ -1400,8 +1414,8 @@ func mqttIngressView(ingress *broker.IngressStats) map[string]site.MQTTIngressCo
 }
 
 // callbackGate admits broker callbacks while the gateway runs and joins them
-// at shutdown: once closed it refuses every later callback, and close returns
-// only when every callback it admitted has returned.
+// at shutdown. refuse stops admission at the decision to stop; close also
+// returns only once every callback it admitted has returned.
 type callbackGate struct {
 	mu      sync.Mutex
 	closed  bool
@@ -1420,10 +1434,15 @@ func (g *callbackGate) enter() bool {
 	return true
 }
 
-func (g *callbackGate) close() {
+// refuse refuses every later callback, without waiting for those running.
+func (g *callbackGate) refuse() {
 	g.mu.Lock()
 	g.closed = true
 	g.mu.Unlock()
+}
+
+func (g *callbackGate) close() {
+	g.refuse()
 	g.running.Wait()
 }
 

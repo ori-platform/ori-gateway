@@ -134,10 +134,14 @@ new runner does not require updating every early-return drain path by hand.
 Every broker callback, on both broker clients, runs through one callback gate,
 and posture fetches started from the runtime heartbeat callback are owned the
 same way: once shutdown begins none starts, and `runGateway` does not return
-while one is still running. Deciding to stop stops the signing clock first
-(gateway-config/v2 `gateway.state_directory` rule 13): from then on it refuses
-to sign and starts no write of its mark, so a callback still running sends no
-reply. The state directory is released only once no write of the mark is
+while one is still running. The decision to stop is one step
+(gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
+broker callback, on both broker clients, and every later posture fetch, and
+stops the signing clock, which from then on refuses to sign and starts no
+write of its mark, so a callback still running sends no reply. Every
+supervised runner, the webhook bridge and site health server among them, is
+cancelled straight after it on every stop path; callbacks and fetches already
+admitted are joined after that. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
 from the decision to stop, the process ends with status 1 without releasing it,
 and no further run begins in that process. A start refused while its first
@@ -162,8 +166,10 @@ Verified by `TestMainStartupMissingConfig`,
 `TestAStartWhoseFirstWriteStallsIsRefusedHoldingTheLock`,
 `TestAStalledWriteHoldsTheLockUntilTheProcessEnds` (a child process),
 `TestABlockedLoggerNeverDelaysTheRequiredExit`,
-`TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`, and
-`TestAStateDirectoryRefusalCreatesNoEvidenceQueue`.
+`TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`,
+`TestAStateDirectoryRefusalCreatesNoEvidenceQueue`,
+`TestNoCallbackIsAdmittedAfterTheDecisionToStop` and
+`TestARefusedGateStillJoinsWhatItAdmitted`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
