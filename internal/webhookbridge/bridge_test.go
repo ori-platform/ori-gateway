@@ -247,13 +247,16 @@ func (r *readCounter) Read(p []byte) (int, error) {
 // TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded refuses
 // admission, as once the gateway has decided to stop: the request is
 // answered 503, its body is never read, and nothing is signed or forwarded.
-// An admitted request is released once it is answered.
+// An admitted request is released once it is answered, and not before: it is
+// still held while it is being forwarded.
 func TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded(t *testing.T) {
-	called := false
-	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	called, admitting, released, releasedWhileForwarding := false, false, 0, -1
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+		releasedWhileForwarding = released
+	}))
 	defer target.Close()
 	bridge := newTestServer(t, target.URL)
-	admitting, released := false, 0
 	bridge.admit = func() (func(), bool) {
 		if !admitting {
 			return nil, false
@@ -280,7 +283,7 @@ func TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded(t *testing.T) {
 	if rr.Code != http.StatusOK || !called {
 		t.Fatalf("an admitted request = %d, forwarded %v; want 200 and forwarded", rr.Code, called)
 	}
-	if released != 1 {
-		t.Fatalf("an admitted request was released %d times, want once", released)
+	if released != 1 || releasedWhileForwarding != 0 {
+		t.Fatalf("an admitted request was released %d times, %d of them while it was forwarded; want once, after it was answered", released, releasedWhileForwarding)
 	}
 }

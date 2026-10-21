@@ -189,12 +189,14 @@ func TestARefusedGateStillJoinsWhatItAdmitted(t *testing.T) {
 
 // TestTheDecisionToStopRefusesEveryAdmissionInOneStep takes the decision and
 // checks each part of it: the callback gate refuses, the webhook gate
-// refuses, the posture debouncer refuses, and signing has stopped, before
-// anything is joined.
+// refuses, the posture debouncer refuses, signing has stopped, and the run is
+// cancelled, before anything is joined.
 func TestTheDecisionToStopRefusesEveryAdmissionInOneStep(t *testing.T) {
 	gate, webhook, posture := newCallbackGate(), newCallbackGate(), newPostureDebouncer()
 	stopped := false
-	decision := &stopDecision{callbacks: gate, webhook: webhook, posture: posture, stopSigning: func() { stopped = true }}
+	run, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	decision := &stopDecision{callbacks: gate, webhook: webhook, posture: posture, stopSigning: func() { stopped = true }, cancel: cancel}
 	decision.decide()
 	if gate.enter() {
 		t.Fatal("the callback gate admitted a callback after the decision to stop")
@@ -207,6 +209,9 @@ func TestTheDecisionToStopRefusesEveryAdmissionInOneStep(t *testing.T) {
 	}
 	if !stopped {
 		t.Fatal("the decision to stop did not stop signing")
+	}
+	if run.Err() == nil {
+		t.Fatal("the decision to stop did not cancel the run")
 	}
 	decision.decide() // taken again, harmlessly
 }

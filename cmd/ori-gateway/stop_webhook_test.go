@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,10 +27,13 @@ import (
 )
 
 // heldSubscribeBroker holds runGateway in its subscribe to one topic, so it
-// cannot yet notice anything a callback reports.
+// cannot yet notice anything a callback reports. Once released, the held
+// subscribe fails with its context's end, as the production broker's does,
+// unless completes is set, as when its acknowledgement arrives anyway.
 type heldSubscribeBroker struct {
 	*fakeBroker
 	topic            string
+	completes        bool
 	entered, release chan struct{}
 }
 
@@ -37,6 +41,9 @@ func (b *heldSubscribeBroker) Subscribe(ctx context.Context, topic string, qos b
 	if topic == b.topic {
 		close(b.entered)
 		<-b.release
+		if err := ctx.Err(); err != nil && !b.completes {
+			return err
+		}
 	}
 	return b.fakeBroker.Subscribe(ctx, topic, qos, h)
 }
@@ -46,10 +53,33 @@ func (b *heldSubscribeBroker) Subscribe(ctx context.Context, topic string, qos b
 // failure escalation, and fails the replies to authenticated reasoning
 // requests up to the limit. The callback that reaches the limit decides the
 // stop itself: the clock refuses to sign, a later reasoning request is not
-// admitted, and a webhook request through the production listener is
-// answered 503 and never signed or forwarded (gateway-config/v2
-// gateway.state_directory rule 13).
+// admitted, the run is cancelled so the webhook bridge stops listening, and
+// no webhook request after the decision is signed or forwarded
+// (gateway-config/v2 gateway.state_directory rule 13). The held subscribe
+// then fails with the cancellation, and runGateway reports the escalation.
 func TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt(t *testing.T) {
+	if err := stopAtTheFailureLimit(t, false); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
+		t.Fatalf("runGateway = %v, want the request failure escalation", err)
+	}
+}
+
+// TestTheFailureLimitIsReportedWhenStartupCompletes runs the same stop with a
+// held subscribe that completes anyway, so runGateway reaches its wait with
+// both the escalation and the ended runner group ready, many times over: it
+// always reports the escalation.
+func TestTheFailureLimitIsReportedWhenStartupCompletes(t *testing.T) {
+	for i := range 20 {
+		if err := stopAtTheFailureLimit(t, true); err == nil || !strings.Contains(err.Error(), "reasoning request failure limit reached") {
+			t.Fatalf("run %d: runGateway = %v, want the request failure escalation", i, err)
+		}
+	}
+}
+
+// stopAtTheFailureLimit runs the gateway to the request failure limit while
+// it is held in a startup subscribe, checks that the decision stopped every
+// admission, then releases the subscribe and returns what runGateway returns.
+func stopAtTheFailureLimit(t *testing.T, heldCompletes bool) error {
+	t.Helper()
 	var forwards atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		forwards.Add(1)
@@ -73,7 +103,7 @@ func TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt(t *testing.
 	}
 	fp := &fakeProvider{healthy: true}
 	g.deps.newProvider = func(config.ProviderConfig) (provider.Provider, error) { return fp, nil }
-	b := &heldSubscribeBroker{fakeBroker: newFakeBroker(), topic: "ori/dev-01/runtime/heartbeat",
+	b := &heldSubscribeBroker{fakeBroker: newFakeBroker(), topic: "ori/dev-01/runtime/heartbeat", completes: heldCompletes,
 		entered: make(chan struct{}), release: make(chan struct{})}
 	b.publishErr = errors.New("reply not delivered")
 	g.deps.newBroker = func(broker.Options) (brokerClient, error) { return b, nil }
@@ -82,8 +112,10 @@ func TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt(t *testing.
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- runGateway(ctx, "gateway.yaml", g.deps) }()
+	var once sync.Once
+	releaseHeld := func() { once.Do(func() { close(b.release) }) }
 	defer func() {
-		close(b.release)
+		releaseHeld()
 		cancel()
 		select {
 		case <-done:
@@ -145,13 +177,88 @@ func TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt(t *testing.
 		t.Fatal("a reasoning request was admitted after the failure limit decided the stop")
 	}
 
-	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader("from=%2B2348000000000&text=YES-test"))
-	if err != nil {
-		t.Fatal(err)
+	// The decision cancelled the run, so the bridge stops listening while
+	// runGateway is still held; until it does, a request is answered 503.
+	// Either way nothing is signed or forwarded.
+	waitUntil(t, "the webhook listener to close", func() bool {
+		resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader("from=%2B2348000000000&text=YES-test"))
+		if err != nil {
+			return true
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("a webhook request after the decision to stop = %d, want 503", resp.StatusCode)
+		}
+		return false
+	})
+	if n := forwards.Load(); n != 0 {
+		t.Fatalf("a webhook request after the decision to stop was forwarded %d times, want none", n)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable || forwards.Load() != 0 {
-		t.Fatalf("a webhook request after the decision to stop = %d, forwarded %d times; want 503 and none", resp.StatusCode, forwards.Load())
+	// The run ends on its own decision, without the caller cancelling it.
+	releaseHeld()
+	select {
+	case err := <-done:
+		done <- err
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gateway did not stop on its own decision")
+		return nil
+	}
+}
+
+// contextBridge is a webhook bridge runner that returns as soon as its
+// context ends, as the real one does once its server has shut down, and
+// hands its admission over to the test.
+type contextBridge struct{}
+
+func (contextBridge) Run(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestShutdownJoinsAnAdmittedWebhookRequest admits a webhook request, then
+// stops the gateway while that request is still being answered:
+// runGateway does not return until the request is released, so no admitted
+// request outlives the release of the state directory.
+func TestShutdownJoinsAnAdmittedWebhookRequest(t *testing.T) {
+	cfg := validConfig()
+	cfg.WebhookBridge.Enabled = true
+	fb := newFakeBroker()
+	deps := baseDeps(t, cfg, fb, &fakeProvider{healthy: true}, newFakeHeartbeat())
+	admits := make(chan func() (func(), bool), 1)
+	deps.newWebhookBridge = func(_ config.WebhookBridgeConfig, opts webhookbridge.Options) (webhookBridgeRunner, error) {
+		admits <- opts.Admit
+		return contextBridge{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+	select {
+	case <-fb.subscribed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gateway did not subscribe")
+	}
+	admit := <-admits
+	release, admitted := admit()
+	if !admitted {
+		t.Fatal("a webhook request was refused while the gateway runs")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		release()
+		t.Fatalf("runGateway returned %v while an admitted webhook request was still being answered", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, admitted := admit(); admitted {
+		t.Fatal("a webhook request was admitted after the decision to stop")
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runGateway did not return once the admitted request was released")
 	}
 }

@@ -136,17 +136,19 @@ and posture fetches started from the runtime heartbeat callback are owned the
 same way: once shutdown begins none starts, and `runGateway` does not return
 while one is still running. The decision to stop is one step
 (gateway-config/v2 `gateway.state_directory` rule 13): it refuses every later
-broker callback, on both broker clients, every later webhook request, which is
-answered 503 unread, and every later posture fetch, and stops the signing
-clock, which from then on refuses to sign and starts no
-write of its mark, so a callback still running sends no reply. It is taken
-where the stop happens: when the supervised runners' context ends, on the
+broker callback, on both broker clients, every later webhook request, which
+the bridge answers 503 without reading it, and every later posture fetch,
+stops the signing clock, which from then on refuses to sign and starts no
+write of its mark, so a callback still running sends no reply, and cancels
+the run. It is taken where the stop happens: when the supervised runners' context ends, on the
 parent's cancellation or a runner's failure, and in the callback that reaches
 the request failure limit, as well as on every other stop path; it always
 comes before any callback is joined or the state directory released. Every
 supervised runner, the webhook bridge, site health server and site node
-eviction among them, is cancelled once the stop is decided, before anything is
-joined; callbacks, webhook requests and fetches already admitted are joined after
+eviction among them, is cancelled by the decision itself, so none runs on
+while runGateway is still in a startup step, and a startup step that then
+fails reports the request failure escalation, not its own cancellation;
+callbacks, webhook requests and fetches already admitted are joined after
 that. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
 from the decision to stop, the process ends with status 1 without releasing it,
@@ -178,7 +180,9 @@ Verified by `TestMainStartupMissingConfig`,
 `TestARunnerFailureDecidesTheStopBeforeTheRunnersAreJoined`,
 `TestTheDecisionToStopRefusesEveryAdmissionInOneStep`,
 `TestARefusedGateStillJoinsWhatItAdmitted`,
-`TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt` and
+`TestTheFailureLimitStopsEveryAdmissionBeforeTheGatewayNoticesIt`,
+`TestTheFailureLimitIsReportedWhenStartupCompletes`,
+`TestShutdownJoinsAnAdmittedWebhookRequest` and
 `TestARequestTheGatewayNoLongerAdmitsIsNeverReadOrForwarded`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
@@ -203,7 +207,8 @@ refused at load if tighter than the runtime's own on approval replies (10 a
 minute, burst 5), and the ceiling if below it; the bridge never decides
 authority or filters by an approver list. Refusals are counted for site health (`webhook_bridge_refused`)
 and logged paced with the limit name only. Once the gateway has decided to
-stop, the bridge answers every request 503 without reading it (GW-15).
+stop, the bridge answers every request 503 without reading it, and releases
+an admitted request only once it is answered (GW-15).
 Verified by
 `TestOneSendersBurstIsRefusedWhileAnotherSenderIsForwarded`,
 `TestEverySpellingOfOneNumberIsOneSender`,
