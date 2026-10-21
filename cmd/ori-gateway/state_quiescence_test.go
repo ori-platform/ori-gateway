@@ -436,8 +436,9 @@ func TestAStalledWriteHoldsTheLockUntilTheProcessEnds(t *testing.T) {
 	}
 }
 
-// errorBlockingHandler holds every Error record until released, as a log
-// destination that has stopped accepting writes would; other levels pass.
+// errorBlockingHandler holds every Warn and Error record until released, as
+// a log destination that has stopped accepting writes would; other levels
+// pass.
 type errorBlockingHandler struct {
 	entered chan struct{}
 	once    sync.Once
@@ -447,7 +448,7 @@ type errorBlockingHandler struct {
 func (h *errorBlockingHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *errorBlockingHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Level >= slog.LevelError {
+	if r.Level >= slog.LevelWarn {
 		h.once.Do(func() { close(h.entered) })
 		<-h.release
 	}
@@ -455,7 +456,7 @@ func (h *errorBlockingHandler) Handle(ctx context.Context, r slog.Record) error 
 }
 
 // TestABlockedLoggerNeverDelaysTheRequiredExit stalls the mark write at a stop
-// and at the start while the logger blocks every Error record: the process is
+// and at the start while the logger blocks every Warn and Error record: the process is
 // still ended with status 1 within the quiescence bound of the decision, so
 // a log destination that stops accepting writes cannot keep the gateway alive
 // holding its state directory (gateway-config/v2 rule 13).
@@ -497,8 +498,8 @@ func TestABlockedLoggerNeverDelaysTheRequiredExit(t *testing.T) {
 			}
 			select {
 			case <-handler.entered:
-			default:
-				t.Fatal("the abandonment's log line never reached the logger, so the test proves nothing")
+			case <-time.After(time.Second):
+				t.Fatal("no log line reached the blocked logger, so the test proves nothing")
 			}
 			<-done
 		})
@@ -508,13 +509,67 @@ func TestABlockedLoggerNeverDelaysTheRequiredExit(t *testing.T) {
 func (h *errorBlockingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *errorBlockingHandler) WithGroup(string) slog.Handler      { return h }
 
-// TestTheLogGraceIsPartOfTheQuiescenceBound holds the wait for quiescence and
-// the abandonment's log grace to the bound together: stopping never runs past
-// the bound to give a log line its chance.
-func TestTheLogGraceIsPartOfTheQuiescenceBound(t *testing.T) {
-	for _, bound := range []time.Duration{200 * time.Millisecond, defaultStateQuiescenceBound} {
-		if wait, grace := quiescenceWait(bound), abandonLogGrace(bound); wait+grace != bound || grace <= 0 || wait <= 0 {
-			t.Fatalf("bound %v: wait %v and grace %v, want positive parts summing to the bound", bound, wait, grace)
-		}
+// warningSignal closes warned when the gateway warns that it will end the
+// process at the quiescence bound.
+type warningSignal struct {
+	warned chan struct{}
+	once   sync.Once
+}
+
+func (h *warningSignal) Enabled(context.Context, slog.Level) bool { return true }
+func (h *warningSignal) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "the process ends at the quiescence bound") {
+		h.once.Do(func() { close(h.warned) })
+	}
+	return nil
+}
+func (h *warningSignal) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *warningSignal) WithGroup(string) slog.Handler      { return h }
+
+// TestAWriteCompletingJustBeforeTheBoundReleasesTheLock holds the mark write at
+// a stop and at the start, and lets it complete once the gateway has warned
+// that it will end the process, inside the last part of the quiescence
+// bound: the process is not ended and the state directory is released, since
+// quiescence came within the bound (gateway-config/v2 rule 13).
+func TestAWriteCompletingJustBeforeTheBoundReleasesTheLock(t *testing.T) {
+	for _, mode := range []string{"stop", "start"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "gateway-state")
+			g := newStallingGateway(t, dir, mode == "start")
+			g.deps.stateQuiescenceBound = 2 * time.Second
+			signal := &warningSignal{warned: make(chan struct{})}
+			g.deps.logger = slog.New(signal)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- runGateway(ctx, "gateway.yaml", g.deps) }()
+			if mode == "stop" {
+				g.stall(t, <-g.signers)
+				cancel()
+			}
+			select {
+			case <-signal.warned:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the gateway never warned before the quiescence bound")
+			}
+			close(g.mark.release)
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("runGateway did not return once the write completed")
+			}
+			if g.exited.Load() != 0 {
+				t.Fatalf("the process was ended although the write completed within the bound (runGateway = %v)", err)
+			}
+			if _, stalled := errors.AsType[*mqttauth.StartWriteError](err); (mode == "start") != stalled {
+				t.Fatalf("runGateway = %v", err)
+			}
+			owner, acquireErr := gatewaystate.Acquire(dir)
+			if acquireErr != nil {
+				t.Fatalf("the state directory is still held after quiescence: %v", acquireErr)
+			}
+			_ = owner.Close()
+		})
 	}
 }

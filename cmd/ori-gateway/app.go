@@ -157,43 +157,57 @@ var (
 	abandonedOwners []*gatewaystate.Owner
 )
 
+// awaitQuiescence waits for idle, the end of the outstanding write of the
+// mark, until the quiescence bound has passed since started, and reports
+// whether it ended (gateway-config/v2 gateway.state_directory rule 13).
+// Shortly before the bound it warns, off this path, that the process will end
+// unless the write completes, so the line has its chance to be written
+// without ever delaying the exit.
+func awaitQuiescence(deps appDependencies, idle <-chan struct{}, started time.Time) bool {
+	bound := deps.stateQuiescenceBound
+	deadline := time.NewTimer(time.Until(started.Add(bound)))
+	defer deadline.Stop()
+	warn := time.NewTimer(time.Until(started.Add(bound - quiescenceWarningLead(bound))))
+	defer warn.Stop()
+	for {
+		select {
+		case <-idle:
+			return true
+		case <-warn.C:
+			go deps.logger.Warn("a write of the signing clock mark is still outstanding; the process ends at the quiescence bound unless it completes",
+				"bound", bound)
+		case <-deadline.C:
+			select {
+			case <-idle:
+				return true
+			default:
+				return false
+			}
+		}
+	}
+}
+
+// quiescenceWarningLead is how long before the quiescence bound the gateway
+// warns that it will end the process.
+func quiescenceWarningLead(bound time.Duration) time.Duration {
+	return min(100*time.Millisecond, bound/10)
+}
+
 // abandonStateDirectory ends the process with a non-zero status while a write
 // of the mark is still outstanding, without releasing the state directory:
 // the lock ends with the process, so no second owner can take it while that
 // write may still land (gateway-config/v2 gateway.state_directory rules 3
-// and 13). No further run begins in this process.
-// The process ends whether or not the log line is written: a logger that
-// blocks never keeps it alive past the quiescence bound.
+// and 13). No further run begins in this process. Nothing on this path waits
+// on the logger: its error line is written off it, and may be lost.
 func abandonStateDirectory(deps appDependencies, owner *gatewaystate.Owner, cause error) error {
 	abandonedMu.Lock()
 	abandonedOwners = append(abandonedOwners, owner)
 	abandonedMu.Unlock()
-	logged := make(chan struct{})
-	go func() {
-		defer close(logged)
-		deps.logger.Error("gateway state directory is not quiescent; ending the process without releasing it",
-			"error", cause, "bound", deps.stateQuiescenceBound)
-	}()
-	grace := time.NewTimer(abandonLogGrace(deps.stateQuiescenceBound))
-	defer grace.Stop()
-	select {
-	case <-logged:
-	case <-grace.C:
-	}
+	go deps.logger.Error("gateway state directory is not quiescent; ending the process without releasing it",
+		"error", cause, "bound", deps.stateQuiescenceBound)
 	deps.exitProcess(1)
 	return fmt.Errorf("gateway state directory not quiescent: %w", cause)
 }
-
-// abandonLogGrace is the part of the quiescence bound kept for the
-// abandonment's log line: the wait for quiescence ends that much sooner, so
-// the process ends within the bound whether or not the line is written.
-func abandonLogGrace(bound time.Duration) time.Duration {
-	return min(100*time.Millisecond, bound/10)
-}
-
-// quiescenceWait is how long stopping waits for an outstanding write of the
-// mark: the quiescence bound less the grace kept for the abandonment's log.
-func quiescenceWait(bound time.Duration) time.Duration { return bound - abandonLogGrace(bound) }
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	flags := flag.NewFlagSet("ori-gateway", flag.ContinueOnError)
@@ -277,7 +291,8 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		var stalled *mqttauth.StartWriteError
 		switch {
 		case errors.As(err, &stalled):
-			if !stalled.Quiesce(quiescenceWait(deps.stateQuiescenceBound)) {
+			// The bound runs from the decision to refuse.
+			if !awaitQuiescence(deps, stalled.Done(), time.Now()) {
 				return abandonStateDirectory(deps, owner, err)
 			}
 			_ = owner.Close()
@@ -294,16 +309,14 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		var stopOnce sync.Once
 		stopSigning = func() {
 			stopOnce.Do(func() {
+				decided := time.Now()
 				idle := signingClock.Stop()
 				go func() {
-					timer := time.NewTimer(quiescenceWait(deps.stateQuiescenceBound))
-					defer timer.Stop()
-					select {
-					case <-idle:
+					if awaitQuiescence(deps, idle, decided) {
 						quiescent <- nil
-					case <-timer.C:
-						quiescent <- abandonStateDirectory(deps, owner, errStateWriteOutstanding)
+						return
 					}
+					quiescent <- abandonStateDirectory(deps, owner, errStateWriteOutstanding)
 				}()
 			})
 		}

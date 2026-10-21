@@ -748,13 +748,15 @@ whose signing time is past the saved mark waits for the write, no longer than
 
 To stop, the gateway first stops signing (a request still being answered then
 gets no reply, and its runtime falls back as on any stop) and waits up to 5
-seconds for a write of the mark still outstanding. If the write is still
-outstanding after that, it logs `ERROR gateway state directory is not
-quiescent; ending the process without releasing it` and exits with status 1
-without releasing the lock, which ends with the process; restart it as usual
-once the disk answers. The exit never waits on that log line: if the log
-destination is not accepting writes, the process still ends within the 5
-seconds, and the line may be lost. A start whose first write has not completed within
+seconds for a write of the mark still outstanding. Shortly before the 5
+seconds pass it logs `WARN a write of the signing clock mark is still
+outstanding; the process ends at the quiescence bound unless it completes`.
+If the write is still outstanding when they pass, it exits with status 1
+without releasing the lock, which ends with the process, logging `ERROR
+gateway state directory is not quiescent; ending the process without
+releasing it` if there is time; restart it as usual once the disk answers.
+The exit never waits on a log line: if the log destination is not accepting
+writes, the process still ends at the 5 seconds. A start whose first write has not completed within
 1,000 ms is refused the same way. The signing clock's own lines (the episode warning
 and recovery, the ahead warning and `signing clock is stopped; refusing to
 sign`, logged once per stop) are written in order by a background writer,

@@ -1156,11 +1156,15 @@ func TestAStartWhoseFirstWriteStallsIsRefused(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a start waited on its stalled write past the write bound")
 	}
-	if startErr.Quiesce(20 * time.Millisecond) {
+	select {
+	case <-startErr.Done():
 		t.Fatal("the start's write reported ended while still held")
+	case <-time.After(20 * time.Millisecond):
 	}
 	release()
-	if !startErr.Quiesce(5 * time.Second) {
+	select {
+	case <-startErr.Done():
+	case <-time.After(5 * time.Second):
 		t.Fatal("the start's write never reported ended")
 	}
 }

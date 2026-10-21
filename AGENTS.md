@@ -137,9 +137,10 @@ reply. The state directory is released only once no write of the mark is
 outstanding; when one still is at the quiescence bound, 5 seconds measured once
 from the decision to stop, the process ends with status 1 without releasing it,
 and no further run begins in that process. A start refused while its first
-write is outstanding ends the same way. The exit never waits on its log line
-past the bound: up to 100 ms of the bound is kept for it, and a logger that
-blocks cannot keep the process alive.
+write is outstanding ends the same way. Quiescence is awaited for the whole
+bound, so a write completing just before it releases the directory; a warning
+is logged shortly before the bound, and nothing on the exit path waits on the
+logger, so a logger that blocks cannot keep the process alive.
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
@@ -157,7 +158,7 @@ Verified by `TestMainStartupMissingConfig`,
 `TestAStartWhoseFirstWriteStallsIsRefusedHoldingTheLock`,
 `TestAStalledWriteHoldsTheLockUntilTheProcessEnds` (a child process),
 `TestABlockedLoggerNeverDelaysTheRequiredExit`,
-`TestTheLogGraceIsPartOfTheQuiescenceBound`, and
+`TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`, and
 `TestAStateDirectoryRefusalCreatesNoEvidenceQueue`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.

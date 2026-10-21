@@ -71,9 +71,8 @@ func (e *StartWriteError) Error() string {
 	return "persist signing clock mark: " + errWriteOutstanding.Error()
 }
 
-// Quiesce waits up to bound for the start's write to end, and reports whether
-// it did.
-func (e *StartWriteError) Quiesce(bound time.Duration) bool { return waitWithin(e.done, bound) }
+// Done is closed once the start's write has ended.
+func (e *StartWriteError) Done() <-chan struct{} { return e.done }
 
 func waitWithin(done <-chan struct{}, bound time.Duration) bool {
 	timer := time.NewTimer(bound)
