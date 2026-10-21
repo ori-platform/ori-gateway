@@ -22,6 +22,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/listeners"
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
+	"github.com/ori-platform/ori-gateway/internal/mqttauth"
 	"github.com/ori-platform/ori-gateway/internal/provider"
 )
 
@@ -704,5 +705,136 @@ func TestHeartbeatIncludesWebhookBridgePosture(t *testing.T) {
 	}
 	if beat.WebhookBridge.BodyLimitBytes != 65536 || beat.WebhookBridge.RequestTimeoutMS != 3000 {
 		t.Fatalf("webhook bridge limits not published: %#v", beat.WebhookBridge)
+	}
+}
+
+// stalledMark is a durable mark whose writes after the start's never return
+// until the test ends, as a hung disk's would.
+type stalledMark struct {
+	started atomic.Bool
+	hung    chan struct{}
+}
+
+func (m *stalledMark) Found() (int64, bool) { return 0, false }
+
+func (m *stalledMark) Persist(int64) error {
+	if m.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	<-m.hung
+	return nil
+}
+
+// TestAStalledMarkWriteDegradesTheHeartbeatWithoutStoppingIt signs every
+// heartbeat from a durable clock whose mark writes hang after the start: the
+// heartbeat keeps publishing, no beat waits longer than the write bound plus
+// slack, it reports degraded, and the failure limit is never reached (GW-6
+// counts only failures to build or publish).
+func TestAStalledMarkWriteDegradesTheHeartbeatWithoutStoppingIt(t *testing.T) {
+	mark := &stalledMark{hung: make(chan struct{})}
+	t.Cleanup(func() { close(mark.hung) })
+	clock, err := mqttauth.NewDurableSigningClock(time.Now, mark, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var beats []contracts.Heartbeat
+	var at []time.Time
+	publish := func(_ context.Context, payload []byte) error {
+		var beat contracts.Heartbeat
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			return err
+		}
+		mu.Lock()
+		beats, at = append(beats, beat), append(at, time.Now())
+		mu.Unlock()
+		return nil
+	}
+	var fatal atomic.Bool
+	publisher, err := NewPublisher(publish, stubProvider{name: "llama_cpp", healthy: true}, SIMStatus{}, Options{
+		Interval: 50 * time.Millisecond, FailureLimit: 2,
+		Logger:       slog.New(slog.DiscardHandler),
+		Fatal:        func(int) { fatal.Store(true) },
+		SigningClock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(t.Context()) }()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if fatal.Load() {
+		t.Fatal("a stalled mark write reached the heartbeat failure limit")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(beats) < 20 {
+		t.Fatalf("%d heartbeats in 4s; a stalled mark write stopped them", len(beats))
+	}
+	for i := 1; i < len(at); i++ {
+		if gap := at[i].Sub(at[i-1]); gap > mqttauth.MarkWriteBound+500*time.Millisecond {
+			t.Fatalf("heartbeat %d waited %v after the one before", i, gap)
+		}
+	}
+	if last := beats[len(beats)-1]; last.Status != StatusDegraded {
+		t.Fatalf("the heartbeat reports %q during an episode, want degraded", last.Status)
+	}
+}
+
+// TestTheHeartbeatThatOpensAnEpisodeReportsIt jumps the wall clock past the
+// signing reservation while every write after the start's hangs: the first
+// heartbeat signed after the jump waits for the write bound, opens the
+// episode, and already reports degraded, as does every heartbeat after it.
+func TestTheHeartbeatThatOpensAnEpisodeReportsIt(t *testing.T) {
+	mark := &stalledMark{hung: make(chan struct{})}
+	t.Cleanup(func() { close(mark.hung) })
+	var offset atomic.Int64
+	now := func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	clock, err := mqttauth.NewDurableSigningClock(now, mark, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beats := make(chan contracts.Heartbeat, 64)
+	publish := func(_ context.Context, payload []byte) error {
+		var beat contracts.Heartbeat
+		if err := json.Unmarshal(payload, &beat); err != nil {
+			return err
+		}
+		beats <- beat
+		return nil
+	}
+	publisher, err := NewPublisher(publish, stubProvider{name: "llama_cpp", healthy: true}, SIMStatus{}, Options{
+		Interval: 200 * time.Millisecond, Now: now,
+		Logger: slog.New(slog.DiscardHandler), Fatal: func(int) {}, SigningClock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = publisher.Run(t.Context()) }()
+	next := func() contracts.Heartbeat {
+		t.Helper()
+		select {
+		case beat := <-beats:
+			return beat
+		case <-time.After(5 * time.Second):
+			t.Fatal("no heartbeat")
+			return contracts.Heartbeat{}
+		}
+	}
+	next()
+	offset.Store(int64(time.Minute))
+	jumped := now().UnixMilli()
+	// Drop any heartbeat already signed before the jump.
+	beat := next()
+	for beat.TimestampMS < jumped {
+		beat = next()
+	}
+	for i := range 3 {
+		if beat.Status != StatusDegraded {
+			t.Fatalf("heartbeat %d after the jump, signed at %d during an episode, reports %q", i, beat.TimestampMS, beat.Status)
+		}
+		beat = next()
 	}
 }

@@ -723,22 +723,58 @@ belongs to one gateway: a running gateway holds an exclusive lock on it
 (`.ori-gateway-state.lock`), so a second gateway started on the same directory
 refuses to start with `gateway state directory is in use by another gateway`.
 The lock is released when the gateway exits, however it exits. No file in an
-evidence queue directory is read for this clock. If the file cannot be written
-while the gateway runs, it logs `WARN signing clock could not be persisted;
-signing from the in-process clock` with the error, once each time writes start
-failing, keeps signing, and retries the write with every message it signs past
-the last saved mark, the heartbeat at least once per `heartbeat_interval_s`;
-a restart before a write succeeds can repeat a signing time issued meanwhile,
-which runtimes refuse as a replay or, after evicting it, as
-`before_replay_floor` until the gateway's clock passes their floor. A mark so
+evidence queue directory is read for this clock.
+
+Put the state directory on persistent local storage: a filesystem on the
+gateway's own host where `flock` excludes every other process, a rename is
+atomic, and a successful sync makes a file durable. NFS and other network or
+remote filesystems are not supported, and the gateway does not check this:
+there, a gateway on another host could take the lock while a write from this
+one is still outstanding and later lower its mark.
+
+A write of the mark that fails, or has not completed within 1,000 ms, opens an
+episode: the gateway logs `WARN signing clock mark could not be persisted;
+signing goes on uncovered until a write completes` with the cause, once per
+episode, reports `degraded` in its heartbeat and in site health, and keeps
+signing without waiting on the disk. One write is outstanding at a time and it
+is retried no sooner than a second after the previous one started. The episode
+ends, logged as `signing clock mark persisted again; every value issued is
+covered`, when a write completes that covers every signing time issued. A
+restart during an episode can repeat a signing time issued meanwhile, which
+runtimes refuse as a replay or, after evicting it, as `before_replay_floor`
+until the gateway's clock passes their floor. Outside an episode, a message
+whose signing time is past the saved mark waits for the write, no longer than
+1,000 ms.
+
+To stop, the gateway first stops signing (a request still being answered then
+gets no reply, and its runtime falls back as on any stop) and waits up to 5
+seconds for a write of the mark still outstanding. Shortly before the 5
+seconds pass it logs `WARN a write of the signing clock mark is still
+outstanding; the process ends at the quiescence bound unless it completes`.
+If the write is still outstanding when they pass, it exits with status 1
+without releasing the lock, which ends with the process, logging `ERROR
+gateway state directory is not quiescent; ending the process without
+releasing it` if there is time; restart it as usual once the disk answers.
+The exit never waits on a log line: if the log destination is not accepting
+writes, the process still ends at the 5 seconds. A start whose first write has not completed within
+1,000 ms is refused the same way. The signing clock's own lines (the episode warning
+and recovery, the ahead warning and `signing clock is stopped; refusing to
+sign`, logged once per stop) are written in order by a background writer,
+each stamped with the time it was decided, so a logger that blocks never
+holds up signing. Behind such a logger at most 64 of them wait; later ones
+are counted in `WARN signing clock log lines dropped behind a logger that
+blocked` with `dropped`, and lines still waiting when the process ends,
+including the status 1 exit, are lost. On a disk that has stopped answering, the
+operating system may not end the process until it does, and the gateway stays
+stuck: a second gateway on the same directory is still refused. A mark so
 large that the clock would run out (at or above 9223372036854773806) refuses the
 start as corrupt or `signing clock exhausted`; it can only be written by hand.
 
 That mark means a clock that once ran fast is not forgotten at a restart: the
 gateway keeps signing just above it. While its signing time is a second or
 more ahead of the wall clock, every message it signs waits for its mark to be
-written to disk first, so a slow disk slows every signed message until the
-wall clock catches up. When it is more than 5 minutes ahead of
+written to disk first, up to 1,000 ms, so a slow disk slows every signed
+message until the wall clock catches up or an episode opens. When it is more than 5 minutes ahead of
 the wall clock, runtimes refuse what the gateway signs as `future_timestamp`
 (the gateway looks unreachable and Tier 3 falls back), and the gateway logs
 `WARN signing clock is ahead of the wall clock by more than receivers' default skew`

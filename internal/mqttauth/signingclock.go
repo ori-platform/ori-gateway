@@ -4,6 +4,7 @@
 package mqttauth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,6 +35,15 @@ const (
 	// signingAheadWarning is how far ahead of the wall clock a signing time
 	// may run before a warning: 300,000 ms, the default receiver skew.
 	signingAheadWarning = int64(5 * 60 * 1000)
+	// MarkWriteBound is the write bound of gateway-config/v2
+	// gateway.state_directory rule 11, on the monotonic clock: a write of the
+	// mark still outstanding past it opens an episode, and no value waits for
+	// coverage longer than it in all. It bounds the disruption a stalled disk
+	// causes, not when coverage runs out, which signing time decides.
+	MarkWriteBound = time.Second
+	// markRetryPacing is how soon after the previous write started a write is
+	// retried while an episode is open: never sooner, and never per message.
+	markRetryPacing = time.Second
 )
 
 var (
@@ -43,42 +53,95 @@ var (
 	// ErrSigningClockClosed refuses a signing time after Close, which no
 	// persisted mark could cover.
 	ErrSigningClockClosed = errors.New("signing clock closed")
+	// errWriteOutstanding is why an episode opens on a write still outstanding
+	// past the write bound, or a value that waited for it.
+	errWriteOutstanding = errors.New("the write has not completed within the write bound")
 )
+
+// afterFunc runs f once d has passed on the monotonic clock, and returns a
+// function that stops it; a test stands in timers it fires itself.
+var afterFunc = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
+
+// StartWriteError refuses a start whose first write of the mark has not
+// completed within the write bound (rule 7). The write is still outstanding,
+// and the state directory must stay held until it ends (rule 13).
+type StartWriteError struct{ done <-chan struct{} }
+
+func (e *StartWriteError) Error() string {
+	return "persist signing clock mark: " + errWriteOutstanding.Error()
+}
+
+// Done is closed once the start's write has ended.
+func (e *StartWriteError) Done() <-chan struct{} { return e.done }
+
+func waitWithin(done <-chan struct{}, bound time.Duration) bool {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
 
 // SigningClock issues signed_at_ms for every envelope a process signs: the
 // latest of the wall clock, one millisecond past the last value issued and,
 // with a durable mark, one past the mark found at the start, so no two
 // envelopes are signed at one value (gateway-api/v2 Envelope Freshness and
 // Replay, Senders). One clock serves every signer it is given to. With a
-// durable mark, every value issued is at or below a persisted mark, so a
-// restart never repeats one, except while the mark cannot be written; without
-// one, values never repeat within the process only.
+// durable mark, every value issued is at or below a completed mark, so a
+// restart never repeats one, except during an episode; without one, values
+// never repeat within the process only.
 //
-// Signing never waits on the disk while a reservation lasts: the first is
-// persisted when the clock is built, at the start, and each later one is
-// extended in the background once half of it is used. Only a value past the
-// reservation, after a clock jump or a burst faster than the extension,
-// persists before it is issued. A failure to persist is logged and signing
-// goes on, retrying the write for every value past the reservation until one
-// succeeds, since refusing to sign would silence the gateway heartbeat
-// (gateway-config/v2 Limits). Every mark is at most the later of the wall
-// clock plus one reservation, read when the mark is chosen, and the value
-// being issued, or the mark found: while the clock runs a reservation or more
-// ahead, every value is persisted before it is issued.
-// Close waits for an extension in flight.
+// The mark is written as gateway-config/v2 gateway.state_directory rule 11
+// states. At most one write is outstanding, and no write runs under the lock
+// that issues values. A value the completed mark covers is issued without
+// waiting, and the next reservation is written in the background once half of
+// it is used. A value past it, after a clock jump or a burst faster than the
+// extension, waits for a write to cover it, for no longer than MarkWriteBound
+// in all and never past the moment an episode opens. An episode opens when a
+// write fails, is still outstanding past MarkWriteBound, or a value has waited
+// that long: it is warned about once, Degraded reports it, and until a write
+// that covers every value issued completes, no value waits on the disk and the
+// write is retried, paced from the previous write's start. Refusing to sign
+// would silence the gateway heartbeat (gateway-config/v2 Limits). Every mark is
+// at most the latest of the wall clock plus one reservation, read when the
+// mark is chosen, the value being issued, the mark found and the highest mark
+// written before, and never lower than a mark written before, whatever that
+// write's outcome.
 type SigningClock struct {
 	now     func() time.Time
 	durable DurableMark
 	log     *slog.Logger
+	after   func(time.Duration, func()) func() bool
 
-	mu       sync.Mutex
-	last     int64
-	reserved int64
-	warned   bool
-	ahead    bool
-	closed   bool
-	// extension is closed when the extension in flight, if any, ends.
-	extension chan struct{}
+	mu   sync.Mutex
+	last int64
+	// covered is the highest mark whose write completed in this run, or the
+	// mark found.
+	covered int64
+	// written is the highest mark this run has written, whatever the outcome.
+	written int64
+	ahead   bool
+	closed  bool
+	episode bool
+	// write is closed when the outstanding write ends; nil when none is.
+	write        chan struct{}
+	writeStarted time.Time
+	// retry stops the paced retry pending, if any.
+	retry func() bool
+	// changed is closed and replaced whenever coverage, the episode or the
+	// outstanding write changes, waking every value waiting for coverage.
+	changed chan struct{}
+	// notes are log records decided under mu, stamped and kept in that
+	// order; one drainer at a time writes them off every lock, so a logger
+	// that blocks holds up no caller and records never pass one another.
+	notes    []slog.Record
+	draining bool
+	dropped  int
+	// refused is set once the refusal of a stopped clock has been logged.
+	refused bool
 }
 
 // NewSigningClock returns an in-process clock over now: its values never
@@ -90,14 +153,16 @@ func NewSigningClock(now func() time.Time, log *slog.Logger) *SigningClock {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &SigningClock{now: now, log: log}
+	return &SigningClock{now: now, log: log, after: afterFunc, changed: make(chan struct{})}
 }
 
 // NewDurableSigningClock returns a clock over now whose values are covered by
 // marks persisted through durable. Before returning it persists the first
 // mark, the later of the mark found and the wall clock plus one reservation,
 // which proves the directory writable. A write that fails, or a first value
-// that would reach the ceiling, refuses the start.
+// that would reach the ceiling, refuses the start, and so does a write that
+// has not completed within MarkWriteBound, with a *StartWriteError: episodes
+// never apply to the start's write.
 func NewDurableSigningClock(now func() time.Time, durable DurableMark, log *slog.Logger) (*SigningClock, error) {
 	c := NewSigningClock(now, log)
 	c.durable = durable
@@ -106,7 +171,7 @@ func NewDurableSigningClock(now func() time.Time, durable DurableMark, log *slog
 	start := wall + signingReservation
 	if found, ok := durable.Found(); ok {
 		c.last = found
-		c.reserved = found
+		c.covered = found
 		first = max(first, found+1)
 		start = max(start, found)
 	}
@@ -114,10 +179,30 @@ func NewDurableSigningClock(now func() time.Time, durable DurableMark, log *slog
 		return nil, fmt.Errorf("%w: its first value would reach the ceiling", ErrSigningClockExhausted)
 	}
 	start = min(start, SigningCeiling-1)
-	if err := durable.Persist(start); err != nil {
+	c.written = start
+	c.writeStarted = time.Now()
+	done := make(chan struct{})
+	var err error
+	go func() {
+		defer close(done)
+		err = durable.Persist(start)
+	}()
+	expired := make(chan struct{})
+	stop := c.after(MarkWriteBound, func() { close(expired) })
+	defer stop()
+	select {
+	case <-done:
+	case <-expired:
+		select {
+		case <-done:
+		default:
+			return nil, &StartWriteError{done: done}
+		}
+	}
+	if err != nil {
 		return nil, fmt.Errorf("persist signing clock mark: %w", err)
 	}
-	c.reserved = max(c.reserved, start)
+	c.covered = max(c.covered, start)
 	return c, nil
 }
 
@@ -127,12 +212,11 @@ func reservationFor(wall, at int64) int64 {
 	return min(max(wall+signingReservation, at), SigningCeiling-1)
 }
 
-// warnPersistLocked warns once each time writes of the mark start failing.
-func (c *SigningClock) warnPersistLocked(err error) {
-	if !c.warned {
-		c.warned = true
-		c.log.Warn("signing clock could not be persisted; signing from the in-process clock", "error", err)
-	}
+// valueWait is one value waiting for coverage; its timer opens an episode
+// once it has waited MarkWriteBound.
+type valueWait struct {
+	done bool
+	stop func() bool
 }
 
 // Next returns the next signing time. It refuses one at or above the ceiling,
@@ -140,6 +224,13 @@ func (c *SigningClock) warnPersistLocked(err error) {
 func (c *SigningClock) Next() (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var wait *valueWait
+	defer func() {
+		if wait != nil {
+			wait.done = true
+			wait.stop()
+		}
+	}()
 	for {
 		wall := c.now().UnixMilli()
 		at := max(wall, c.last+1)
@@ -149,38 +240,45 @@ func (c *SigningClock) Next() (int64, error) {
 		if c.durable != nil {
 			switch {
 			case c.closed:
-				// No write outlives the clock's owner, and no value is issued
-				// that no mark could cover.
-				c.log.Error("signing clock used after it was closed; refusing to sign")
+				// Once the stop is decided no value is issued and no write
+				// starts, so the state directory can reach quiescence.
+				if !c.refused {
+					c.refused = true
+					c.noteLocked(slog.LevelInfo, "signing clock is stopped; refusing to sign")
+				}
 				return 0, ErrSigningClockClosed
-			case at > c.reserved && c.extension != nil:
-				// An extension is writing: wait for it, so its mark is never
-				// written after a value it does not cover is issued.
-				done := c.extension
+			case at > c.covered && !c.episode:
+				// Past the coverage: wait for a write to cover it, for no
+				// longer than the write bound in all.
+				if c.write == nil {
+					c.startWriteLocked(reservationFor(wall, at))
+				}
+				if wait == nil {
+					w := &valueWait{}
+					w.stop = c.after(MarkWriteBound, func() {
+						c.mu.Lock()
+						defer c.mu.Unlock()
+						if !w.done {
+							c.openEpisodeLocked(errWriteOutstanding)
+						}
+					})
+					wait = w
+				}
+				changed := c.changed
 				c.mu.Unlock()
-				<-done
+				<-changed
 				c.mu.Lock()
 				continue
-			case at > c.reserved:
-				// Past the reservation: persist before issuing.
-				mark := reservationFor(wall, at)
-				if err := c.durable.Persist(mark); err != nil {
-					c.warnPersistLocked(err)
-				} else {
-					c.reserved = max(c.reserved, mark)
-					c.warned = false
-				}
-			case c.reserved-at < signingReservation/2 && c.extension == nil && reservationFor(wall, at) > c.reserved:
+			case !c.episode && c.write == nil && c.covered-at < signingReservation/2 && reservationFor(wall, at) > c.covered:
 				// Only an extension that would move the mark forward is
 				// started: after a step back, the coverage already persisted
 				// is used up first.
-				c.extension = make(chan struct{})
-				go c.extend(c.extension)
+				c.startWriteLocked(reservationFor(wall, at))
 			}
 		}
 		switch ahead := at-wall > signingAheadWarning; {
 		case ahead && !c.ahead:
-			c.log.Warn("signing clock is ahead of the wall clock by more than receivers' default skew; they refuse what is signed until the wall clock catches up",
+			c.noteLocked(slog.LevelWarn, "signing clock is ahead of the wall clock by more than receivers' default skew; they refuse what is signed until the wall clock catches up",
 				"signed_at_ms", at, "wall_ms", wall)
 			c.ahead = true
 		case !ahead:
@@ -191,33 +289,166 @@ func (c *SigningClock) Next() (int64, error) {
 	}
 }
 
-// extend persists the next reservation off the signing path. Its mark is
-// taken from the wall clock, never from the last reservation.
-func (c *SigningClock) extend(done chan struct{}) {
-	defer close(done)
-	c.mu.Lock()
-	mark := reservationFor(c.now().UnixMilli(), c.last)
-	c.mu.Unlock()
-	err := c.durable.Persist(mark)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.extension = nil
-	if err != nil {
-		c.warnPersistLocked(err)
-		return
-	}
-	c.reserved = max(c.reserved, mark)
-	c.warned = false
+// startWriteLocked starts the one outstanding write of the mark, never lower
+// than a mark written before.
+func (c *SigningClock) startWriteLocked(mark int64) {
+	mark = max(mark, c.written)
+	c.written = mark
+	done := make(chan struct{})
+	c.write = done
+	c.writeStarted = time.Now()
+	stop := c.after(MarkWriteBound, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.write == done {
+			c.openEpisodeLocked(errWriteOutstanding)
+		}
+	})
+	go c.persist(mark, done, stop)
 }
 
-// Close stops every further durable write, background or not, and waits for
-// an extension in flight, so no write to the durable mark outlives its owner.
-func (c *SigningClock) Close() {
+// persist writes mark off every lock that issues values, and takes its
+// outcome once.
+func (c *SigningClock) persist(mark int64, done chan struct{}, stopBound func() bool) {
+	err := c.durable.Persist(mark)
+	stopBound()
 	c.mu.Lock()
-	c.closed = true
-	done := c.extension
-	c.mu.Unlock()
-	if done != nil {
-		<-done
+	defer c.mu.Unlock()
+	c.write = nil
+	close(done)
+	if err != nil {
+		c.openEpisodeLocked(err)
+	} else {
+		c.covered = max(c.covered, mark)
+		// Judged under the lock that issues values, so no value is issued
+		// between the comparison and the episode's end.
+		if c.episode && c.covered >= c.last {
+			c.episode = false
+			c.noteLocked(slog.LevelInfo, "signing clock mark persisted again; every value issued is covered")
+		}
 	}
+	if c.episode {
+		c.scheduleRetryLocked()
+	}
+	c.broadcastLocked()
+}
+
+// openEpisodeLocked opens an episode, if none is open, with its cause.
+func (c *SigningClock) openEpisodeLocked(cause error) {
+	if c.episode {
+		return
+	}
+	c.episode = true
+	c.noteLocked(slog.LevelWarn, "signing clock mark could not be persisted; signing goes on uncovered until a write completes", "error", cause)
+	c.scheduleRetryLocked()
+	c.broadcastLocked()
+}
+
+// scheduleRetryLocked schedules the next write of an episode, no sooner than
+// markRetryPacing after the previous write started, unless a write is
+// outstanding or one is already scheduled.
+func (c *SigningClock) scheduleRetryLocked() {
+	if c.retry != nil || c.closed || c.write != nil {
+		return
+	}
+	c.retry = c.after(max(markRetryPacing-time.Since(c.writeStarted), 0), c.retryWrite)
+}
+
+func (c *SigningClock) retryWrite() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retry = nil
+	if c.closed || !c.episode || c.write != nil {
+		return
+	}
+	c.startWriteLocked(reservationFor(c.now().UnixMilli(), c.last))
+}
+
+// maxNotes bounds the log records queued behind a logger that blocks; later
+// ones are counted, and the count is logged after the records queued before
+// them.
+const maxNotes = 64
+
+// noteLocked queues a log record stamped now, in the order decided under mu,
+// and starts the drainer if none is running.
+func (c *SigningClock) noteLocked(level slog.Level, msg string, args ...any) {
+	if len(c.notes) >= maxNotes {
+		c.dropped++
+		return
+	}
+	record := slog.NewRecord(time.Now(), level, msg, 0)
+	record.Add(args...)
+	c.notes = append(c.notes, record)
+	if !c.draining {
+		c.draining = true
+		go c.drain()
+	}
+}
+
+// drain writes the queued records in order, each with the time it was
+// decided, until none is left.
+func (c *SigningClock) drain() {
+	ctx := context.Background()
+	handler := c.log.Handler()
+	for {
+		c.mu.Lock()
+		notes, dropped := c.notes, c.dropped
+		c.notes, c.dropped = nil, 0
+		if len(notes) == 0 && dropped == 0 {
+			c.draining = false
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
+		for _, record := range notes {
+			if handler.Enabled(ctx, record.Level) {
+				_ = handler.Handle(ctx, record)
+			}
+		}
+		if dropped > 0 {
+			c.log.Warn("signing clock log lines dropped behind a logger that blocked", "dropped", dropped)
+		}
+	}
+}
+
+func (c *SigningClock) broadcastLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+// Degraded reports whether an episode is open: values may be issued that no
+// completed mark covers. It never waits on a write.
+func (c *SigningClock) Degraded() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.episode
+}
+
+// Close stops issuing values and starting writes, and waits for the
+// outstanding write, if any, without a bound.
+func (c *SigningClock) Close() { <-c.Stop() }
+
+// CloseWithin stops issuing values and starting writes, waits up to bound for
+// the outstanding write, if any, and reports whether none is outstanding.
+func (c *SigningClock) CloseWithin(bound time.Duration) bool { return waitWithin(c.Stop(), bound) }
+
+// Stop stops issuing values and starting writes, the paced retry included,
+// and returns a channel closed once no write of the mark is outstanding
+// (gateway-config/v2 gateway.state_directory rule 13). Until it is closed,
+// the state directory must stay held.
+func (c *SigningClock) Stop() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	if c.retry != nil {
+		c.retry()
+		c.retry = nil
+	}
+	c.broadcastLocked()
+	if c.write != nil {
+		return c.write
+	}
+	idle := make(chan struct{})
+	close(idle)
+	return idle
 }

@@ -443,9 +443,10 @@ func (p *heldProvider) EnrichTierC(ctx context.Context, req contracts.TierCEnric
 
 // TestShutdownJoinsEveryBrokerCallback holds a signed reasoning request, then
 // an enrichment request, inside its provider and stops the gateway:
-// runGateway does not return until the callback has signed its reply, with
-// the clock moved past its reservation so that reply writes the durable mark,
-// and the mark never changes after runGateway has returned.
+// runGateway does not return until the callback has finished. The stop is
+// decided first, so the callback cannot sign its reply, even with the clock
+// moved past its reservation: no reply is published, and the mark never
+// changes after runGateway has returned (gateway-config/v2 rule 13).
 func TestShutdownJoinsEveryBrokerCallback(t *testing.T) {
 	for _, family := range []string{"reasoning", "enrichment"} {
 		t.Run(family, func(t *testing.T) {
@@ -520,6 +521,13 @@ func TestShutdownJoinsEveryBrokerCallback(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("runGateway did not return once the callback finished")
 			}
+			fb.mu.Lock()
+			for _, msg := range fb.published {
+				if strings.HasSuffix(msg.topic, "/response") {
+					t.Errorf("a reply was published on %s after the stop was decided", msg.topic)
+				}
+			}
+			fb.mu.Unlock()
 			mark := filepath.Join(cfg.Gateway.StateDirectory, ".ori-signed-at-messages")
 			before, err := os.ReadFile(mark)
 			if err != nil {

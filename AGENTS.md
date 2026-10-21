@@ -130,9 +130,17 @@ new runner does not require updating every early-return drain path by hand.
 Every broker callback, on both broker clients, runs through one callback gate,
 and posture fetches started from the runtime heartbeat callback are owned the
 same way: once shutdown begins none starts, and `runGateway` does not return
-while one is still running, since any of them may sign from the durable signing
-clock. The signing clock is closed after them, and a closed clock never writes
-its durable mark and refuses to sign.
+while one is still running. Deciding to stop stops the signing clock first
+(gateway-config/v2 `gateway.state_directory` rule 13): from then on it refuses
+to sign and starts no write of its mark, so a callback still running sends no
+reply. The state directory is released only once no write of the mark is
+outstanding; when one still is at the quiescence bound, 5 seconds measured once
+from the decision to stop, the process ends with status 1 without releasing it,
+and no further run begins in that process. A start refused while its first
+write is outstanding ends the same way. Quiescence is awaited for the whole
+bound, so a write completing just before it releases the directory; a warning
+is logged shortly before the bound, and nothing on the exit path waits on the
+logger, so a logger that blocks cannot keep the process alive.
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
@@ -144,8 +152,14 @@ Verified by `TestMainStartupMissingConfig`,
 `TestShutdownWaitsForAPostureFetchesSigningWrite`,
 `TestShutdownJoinsEveryBrokerCallback`,
 `TestAClosedPostureDebouncerStartsNothing`,
-`TestShutdownWaitsForTheGatewaysOwnExtension`, and
-`TestAClosedClockRefusesToSign`.
+`TestShutdownWaitsForTheGatewaysOwnExtension`, `TestAClosedClockRefusesToSign`,
+`TestAStoppingGatewayWithAStalledWriteEndsTheProcessHoldingTheLock`,
+`TestAStoppingGatewayThatReachesQuiescenceReleasesTheLock`,
+`TestAStartWhoseFirstWriteStallsIsRefusedHoldingTheLock`,
+`TestAStalledWriteHoldsTheLockUntilTheProcessEnds` (a child process),
+`TestABlockedLoggerNeverDelaysTheRequiredExit`,
+`TestAWriteCompletingJustBeforeTheBoundReleasesTheLock`, and
+`TestAStateDirectoryRefusalCreatesNoEvidenceQueue`.
 
 16. `GW-16` Public SMS provider ingress must be signed before it reaches runtime.
 Providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
@@ -553,22 +567,35 @@ the contract's decimal grammar, or at or above the ceiling
 (`mqttauth.SigningCeiling`, 2^63 − 1 − 2,001) refuses the start. Each value is
 the latest of the wall clock, one past the last value issued and one past the
 mark found. Before issuing anything the start persists the later of the mark
-found and the wall clock plus 1,000 ms, and refuses if that write fails; every
-later mark is the later of the wall clock plus 1,000 ms and the value being
-issued, never measured from an earlier mark, so restarts accumulate no lead.
-Marks are extended in the background, so signing never waits on the disk
-within a reservation, and only an extension that would move the mark forward
-starts, so after a step back the coverage already persisted is used up first; a value past it is persisted before it is issued, after
-any extension in flight, and no persisted mark falls. A start whose first
-value would reach the ceiling is refused, and `Next` refuses a value at it
-(`ErrSigningClockExhausted`) or after `Close` (`ErrSigningClockClosed`). A
-write that fails while running is logged with its cause, once each time writes
-start failing, and retried for every value past the reservation until one
-succeeds, and signing goes on meanwhile, the limit gateway-config/v2 accepts.
+found and the wall clock plus 1,000 ms, and refuses if that write fails or has
+not completed within 1,000 ms; every later mark is the later of the wall clock
+plus 1,000 ms and the value being issued, never measured from an earlier mark,
+so restarts accumulate no lead. Marks are extended in the background, so
+signing never waits on the disk within a reservation, and only an extension
+that would move the mark forward starts, so after a step back the coverage
+already persisted is used up first. A write completes only once its staged
+file is synced, renamed over the mark and the directory synced; the covered
+value is the highest completed mark. At most one write is outstanding, no
+write runs under the lock that issues values, and no mark is lower than one
+written before, whatever that write's outcome. A value past the covered value
+waits for a write, no longer than `mqttauth.MarkWriteBound` (1,000 ms,
+monotonic) in all and never past the moment an episode opens. An episode opens
+when a write fails, is outstanding past the bound, or a value has waited that
+long: it is warned about once, the heartbeat and site health report `degraded`
+without waiting on the write, no value waits on the disk, and the write is
+retried no sooner than 1,000 ms after the previous one started, never per
+message. It closes, under the issuing lock, only on a completion covering the
+last value issued. An episode is not a GW-6 heartbeat failure. The clock's log records are decided
+under its lock, stamped then, and written in that order by one drainer off
+every lock, so no caller waits on the logger; at most 64 wait behind a
+logger that blocks, later ones are counted, and the refusal after a stop is
+logged once. A start whose
+first value would reach the ceiling is refused, and `Next` refuses a value at
+it (`ErrSigningClockExhausted`) or once stopped (`ErrSigningClockClosed`).
 Rule 9's upper bound is judged against the wall clock read when a mark is
-chosen; while the value issued is a reservation or more ahead of it, every
-value is persisted before it is issued. A signing time first more than 300,000 ms ahead of
-the wall clock is logged as a warning. Verified by
+chosen. The state directory must be on persistent local storage
+(gateway-config/v2 rule 14), which the gateway does not check. A signing time
+first more than 300,000 ms ahead of the wall clock is logged as a warning. Verified by
 `TestReplayVectorCases`, `TestAKeyIsKeptUntilItsEnvelopeIsStale`,
 `TestADroppedKeyRaisesTheFloor`, `TestAStartFloorRefusesWhatWasSignedBefore`,
 `TestFreshnessReasonsAreNamedApart`, `TestSignersNeverRepeatASignedAt`,
@@ -577,9 +604,24 @@ the wall clock is logged as a warning. Verified by
 `TestTheStartWritesTheMarkItFound`, `TestAStartThatCannotWriteIsRefused`,
 `TestTheClockNeverReachesTheCeiling`,
 `TestAWriteNeverLandsBelowAValueAlreadyIssued`,
-`TestEveryMarkStaysWithinItsBounds`, `TestAFailedWriteIsRetriedByTheNextValue`,
+`TestEveryMarkStaysWithinItsBounds`, `TestAFailedWriteIsRetriedOnItsPace`,
 `TestEachFailureEpisodeIsWarnedAboutAgain`,
-`TestAnExtensionThatSucceedsEndsAFailureEpisode`,
+`TestAnExtensionThatFailsOpensAnEpisode`,
+`TestAStalledWriteOpensAnEpisodeAtTheWriteBound`,
+`TestAValueWaitsOnlyTheRemainingDeadlineOfTheOutstandingWrite`,
+`TestAValueThatWaitedTheWriteBoundOpensAnEpisode`,
+`TestRetriesArePacedFromThePreviousWritesStart`, `TestALateFailureThenRecovery`,
+`TestAMarkNeverLowersOneAlreadyWritten`, `TestAStartWhoseFirstWriteStallsIsRefused`,
+`TestCloseWithinReportsAWriteStillOutstanding`,
+`TestParallelSignersAcrossAStalledReservation`,
+`TestAStalledMarkWriteDegradesTheHeartbeatWithoutStoppingIt`,
+`TestSiteHealthReportsAnEpisodeWithoutWaitingOnTheWrite`,
+`TestTheHeartbeatThatOpensAnEpisodeReportsIt`,
+`TestAStopDuringAnEpisodeStartsNoWrite`, `TestAWriteFailingAfterStopArmsNoRetry`,
+`TestALoggerThatBlocksNeverHoldsUpSigning`,
+`TestLogLinesKeepTheOrderTheyWereDecidedIn`,
+`TestLogLinesBehindABlockedLoggerAreBounded`,
+`TestTheClocksRecordsHonourTheLoggersLevel`,
 `TestTheAheadWarningIsAtThreeHundredThousandMilliseconds`,
 `TestNoMarkReachesTheCeilingNearIt`,
 `TestAJumpPastTheReservationReservesAhead`,
