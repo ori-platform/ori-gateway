@@ -1032,6 +1032,9 @@ func TestALoggerThatEnablesOnlyErrorsIsWrittenNothing(t *testing.T) {
 	for !idle() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+	if !idle() {
+		t.Fatal("the drainer was still writing after two seconds")
+	}
 	// The one being checked, the 64 queued and the count line.
 	if n := h.asked.Load(); n != 66 {
 		t.Fatalf("the logger was asked its level %d times, want 66", n)
