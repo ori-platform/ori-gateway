@@ -114,8 +114,8 @@ func TestARefusedExportPlaintextChangesNothing(t *testing.T) {
 			if replayAfterBad != 0 || pendingAfterBad != 1 {
 				t.Fatalf("after the refused plaintext: %d replay entries, %d pending and unanswered; want 0 and 1", replayAfterBad, pendingAfterBad)
 			}
-			if !strings.Contains(logs.String(), "reason="+reason) {
-				t.Fatalf("refusal not logged with %s:\n%s", reason, logs.String())
+			if logged := logs.once(func(s string) bool { return strings.Contains(s, "reason="+reason) }); !strings.Contains(logged, "reason="+reason) {
+				t.Fatalf("refusal not logged with %s:\n%s", reason, logged)
 			}
 		})
 	}
@@ -154,4 +154,16 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// once returns what has been logged as soon as it satisfies done, or what has
+// been logged after a second: the client logs off the caller's path.
+func (b *lockedBuffer) once(done func(string) bool) string {
+	deadline := time.Now().Add(time.Second)
+	for {
+		if logged := b.String(); done(logged) || time.Now().After(deadline) {
+			return logged
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

@@ -80,8 +80,9 @@ func TestAForgedExportResponseLeavesTheExchangePending(t *testing.T) {
 	if replayAfterForgeries != 0 || c.verifier.ReplayEntries() != 1 {
 		t.Fatalf("replay entries %d after forgeries, %d after the answer; want 0 then 1", replayAfterForgeries, c.verifier.ReplayEntries())
 	}
-	if got := strings.Count(logs.String(), "not verified; dropped"); got != 4 {
-		t.Fatalf("%d forgeries logged, want 4:\n%s", got, logs.String())
+	logged := logs.once(func(s string) bool { return strings.Count(s, "not verified; dropped") >= 4 })
+	if got := strings.Count(logged, "not verified; dropped"); got != 4 {
+		t.Fatalf("%d forgeries logged, want 4:\n%s", got, logged)
 	}
 }
 
@@ -117,8 +118,8 @@ func TestASilentRuntimeEndsTheExportAtItsBound(t *testing.T) {
 			if pendingCount(c) != 0 {
 				t.Fatal("a timed-out request kept its pending state")
 			}
-			if !strings.Contains(logs.String(), "timed out") {
-				t.Fatalf("the timeout was not logged:\n%s", logs.String())
+			if logged := logs.once(func(s string) bool { return strings.Contains(s, "timed out") }); !strings.Contains(logged, "timed out") {
+				t.Fatalf("the timeout was not logged:\n%s", logged)
 			}
 		})
 	}
@@ -171,8 +172,8 @@ func TestAStalledSubscribeOrPublishEndsAtTheBound(t *testing.T) {
 				if !errors.Is(err, ErrExportTimeout) {
 					t.Fatalf("Health = %v, want ErrExportTimeout", err)
 				}
-				if !strings.Contains(logs.String(), "timed out") {
-					t.Fatalf("the stalled %s was not logged:\n%s", stall, logs.String())
+				if logged := logs.once(func(s string) bool { return strings.Contains(s, "timed out") }); !strings.Contains(logged, "timed out") {
+					t.Fatalf("the stalled %s was not logged:\n%s", stall, logged)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("a stalled broker held the caller past its bound")

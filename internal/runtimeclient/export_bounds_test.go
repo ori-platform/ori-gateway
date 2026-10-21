@@ -634,3 +634,154 @@ func TestEndingTheLifetimeAbandonsAStalledSubscribe(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// failingPublishBroker answers every publish at once with a signed response,
+// then reports the publish failed: after its wait expires, as a broker whose
+// acknowledgement never came, or at once, as one whose connection dropped.
+type failingPublishBroker struct {
+	*inTimePublishBroker
+	afterTheWait bool
+}
+
+func (b *failingPublishBroker) Publish(ctx context.Context, _ string, _ byte, _ bool, payload []byte) error {
+	var req exportRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		b.t.Error(err)
+		return err
+	}
+	b.respondRaw(req.DeviceID, req.RequestID, signedExportPayload(b.t, healthItems(req.DeviceID, req.RequestID), "current-secret", b.now))
+	if b.afterTheWait {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return errors.New("broker: publish: connection lost")
+}
+
+// TestAResponseHandedOverInTimeSurvivesAFailedPublish delivers a verified
+// response before the deadline, then fails the publish that carried its
+// request, by timing out or with another error: the export completes, since
+// the runtime answered in time and its replay key is recorded.
+func TestAResponseHandedOverInTimeSurvivesAFailedPublish(t *testing.T) {
+	for _, afterTheWait := range []bool{true, false} {
+		t.Run(fmt.Sprintf("after the wait %v", afterTheWait), func(t *testing.T) {
+			now := time.UnixMilli(1787000003000)
+			b := &failingPublishBroker{inTimePublishBroker: &inTimePublishBroker{fakeBroker: newFakeBroker(), t: t, now: now}, afterTheWait: afterTheWait}
+			c, err := NewMQTTClient(b, WithMessageAuth("current-secret", "", func() time.Time { return now }),
+				WithLogger(slog.New(slog.DiscardHandler)), WithExportWait(30*time.Millisecond))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"}); err != nil {
+				t.Fatalf("Health = %v, want the response handed over in time", err)
+			}
+			if n := c.verifier.ReplayEntries(); n != 1 {
+				t.Fatalf("%d replay keys recorded, want the one answer's", n)
+			}
+		})
+	}
+}
+
+// blockingHandler is a logger that blocks every record until released.
+type blockingHandler struct {
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func newBlockingHandler() *blockingHandler {
+	return &blockingHandler{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (h *blockingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *blockingHandler) Handle(context.Context, slog.Record) error {
+	h.once.Do(func() { close(h.entered) })
+	<-h.release
+	return nil
+}
+
+func (h *blockingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *blockingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestATimeoutNeverWaitsOnTheLogger ends an export at its bound while pacing,
+// subscribing and waiting for a response, behind a logger that blocks: each
+// returns at its bound, and the record reaches the logger once it is
+// released. A response refused in the broker callback returns at once too.
+func TestATimeoutNeverWaitsOnTheLogger(t *testing.T) {
+	const wait = 20 * time.Millisecond
+	for _, phase := range []string{"pacing", "subscribe", "response"} {
+		t.Run(phase, func(t *testing.T) {
+			h := newBlockingHandler()
+			b := &stallingBroker{fakeBroker: newFakeBroker(), stallSubscribe: phase == "subscribe"}
+			opts := []MQTTClientOption{WithLogger(slog.New(h)), WithExportWait(wait)}
+			if phase == "pacing" {
+				opts = append(opts, WithExportPacingClock(productionPacingClock()))
+			}
+			c, err := NewMQTTClient(b, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := c.Health(context.Background(), HealthRequest{DeviceID: "edge-1"})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrExportTimeout) {
+					t.Fatalf("Health = %v, want ErrExportTimeout", err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				close(h.release)
+				t.Fatalf("the export was held past its %v bound by a logger that blocks", wait)
+			}
+			if n := pendingCount(c); n != 0 {
+				t.Fatalf("%d exports still pending behind the logger, want none", n)
+			}
+			select {
+			case <-h.entered:
+			case <-time.After(time.Second):
+				t.Fatal("the timeout was never logged")
+			}
+			close(h.release)
+		})
+	}
+	t.Run("refused response", func(t *testing.T) {
+		h := newBlockingHandler()
+		defer close(h.release)
+		now := time.UnixMilli(1787000003000)
+		b := newFakeBroker()
+		c, err := NewMQTTClient(b, WithMessageAuth("current-secret", "", func() time.Time { return now }),
+			WithLogger(slog.New(h)), WithExportWait(time.Second), WithRequestIDFunc(func() (string, error) { return "held-1", nil }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		forged := make(chan struct{})
+		b.publishHook = func(_ string, payload []byte) {
+			var req exportRequest
+			if err := json.Unmarshal(payload, &req); err != nil {
+				t.Error(err)
+				return
+			}
+			go func() {
+				defer close(forged)
+				for range 3 {
+					b.respondRaw(req.DeviceID, req.RequestID, signedExportPayload(t, healthItems(req.DeviceID, req.RequestID), "forged-secret", now))
+				}
+			}()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		go func() { _, _ = c.Health(ctx, HealthRequest{DeviceID: "edge-1"}) }()
+		select {
+		case <-forged:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("the broker callback was held by a logger that blocks")
+		}
+		select {
+		case <-h.entered:
+		case <-time.After(time.Second):
+			t.Fatal("the refused responses were never logged")
+		}
+		cancel()
+	})
+}

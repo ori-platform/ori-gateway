@@ -319,31 +319,36 @@ func (c *Client) resubscribeAll() {
 	}
 }
 
+// waitToken waits for token within ctx, ending the wait as soon as ctx ends,
+// cancelled or past its deadline. A context without a deadline waits 30
+// seconds at most. A token that completed is taken even when ctx ended at the
+// same moment.
 func waitToken(ctx context.Context, token mqtt.Token) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(30 * time.Second)
+	var bound <-chan time.Time
+	if _, ok := ctx.Deadline(); !ok {
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		bound = timer.C
 	}
-	timeout := time.Until(deadline)
-	if timeout <= 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return context.DeadlineExceeded
+	select {
+	case <-token.Done():
+		return token.Error()
+	case <-ctx.Done():
+	case <-bound:
 	}
-
-	// Paho WaitTimeout returns true when the token completed before the timeout.
-	if !token.WaitTimeout(timeout) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return context.DeadlineExceeded
+	select {
+	case <-token.Done():
+		return token.Error()
+	default:
 	}
-	return token.Error()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return context.DeadlineExceeded
 }
 
 func validateQoS(qos byte) error {

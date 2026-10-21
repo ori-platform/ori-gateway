@@ -724,3 +724,118 @@ func gatedSubscription(t *testing.T, c *Client, topic string, handler MessageHan
 	}
 	return subscription{qos: QoSReasoning, handler: handler, gate: gate}
 }
+
+func TestWaitTokenEndsWhenItsContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	token := newSlowToken()
+	defer close(token.release)
+	errs := make(chan error, 1)
+	go func() { errs <- waitToken(ctx, token) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errs:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitToken kept waiting after its context was cancelled")
+	}
+}
+
+// readMQTTPacket reads one MQTT control packet: its type byte and body.
+func readMQTTPacket(conn net.Conn) (byte, []byte, error) {
+	var b [1]byte
+	if _, err := io.ReadFull(conn, b[:]); err != nil {
+		return 0, nil, err
+	}
+	kind, n, scale := b[0], 0, 1
+	for {
+		if _, err := io.ReadFull(conn, b[:]); err != nil {
+			return 0, nil, err
+		}
+		n += int(b[0]&127) * scale
+		if b[0]&128 == 0 {
+			break
+		}
+		scale *= 128
+	}
+	body := make([]byte, n)
+	_, err := io.ReadFull(conn, body)
+	return kind, body, err
+}
+
+// TestASubscribeEndsWhenItsContextIsCancelled subscribes through a local MQTT
+// peer that accepts the connection but never acknowledges the subscribe, and
+// cancels the subscribe's context, which has no deadline of its own: the
+// subscribe returns at once and leaves no subscription recorded.
+func TestASubscribeEndsWhenItsContextIsCancelled(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	subscribing := make(chan struct{})
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := readMQTTPacket(conn); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte{0x20, 2, 0, 0}); err != nil {
+			return
+		}
+		for {
+			kind, _, err := readMQTTPacket(conn)
+			if err != nil {
+				return
+			}
+			if kind>>4 == 8 {
+				close(subscribing)
+				_, _ = io.Copy(io.Discard, conn)
+				return
+			}
+		}
+	}()
+	c := testClient(t, "tcp://"+ln.Addr().String(), "sub-cancel", Options{Devices: []string{"device-a"}})
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelConnect()
+	if err := c.Connect(connectCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = c.Disconnect(context.Background())
+		<-peerDone
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, 1)
+	go func() {
+		errs <- c.Subscribe(ctx, "ori/device-a/runtime/heartbeat", QoSHeartbeat, func(string, []byte) {})
+	}()
+	select {
+	case <-subscribing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the subscribe never reached the peer")
+	}
+	cancel()
+	select {
+	case err := <-errs:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Subscribe: got %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the subscribe kept waiting for an acknowledgement after its context was cancelled")
+	}
+	c.mu.Lock()
+	_, recorded := c.subscriptions["ori/device-a/runtime/heartbeat"]
+	c.mu.Unlock()
+	if recorded {
+		t.Fatal("a cancelled subscribe left its subscription recorded")
+	}
+}

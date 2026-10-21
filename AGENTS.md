@@ -531,7 +531,14 @@ requests (the runtime admits 2 a second, bursts of 10, ori-runtime
 the runtime; the gateway sends at most 1.6 a second, bursts of 8, each device
 starting empty), because the runtime judges arrivals, not sends; pacing is
 bounded like the wait. A response handed over in time completes its request
-whichever the wait sees first. An export page missing any
+whichever the wait sees first, and even when the publish that carried the
+request then reports failure. Every broker wait, the subscribe and publish
+acknowledgements included, ends as soon as its context does, so ending the
+run ends a shared subscribe at the transport. The client's log records are
+written off every caller's path, in order, by one drainer, at most 64 behind
+a logger that blocks and later ones counted, so no logger holds an export past
+its bound, delays the release of its pending state, or holds the broker
+callback that delivers responses. An export page missing any
 envelope member (`request_id`, `export_type`, `device_id`, `items`,
 `next_page_token`, `complete`, `error`) fails the export as malformed and is
 never read as complete, empty or successful. The page count of one export is
@@ -556,7 +563,11 @@ Export Auth Envelope). Verified by
 `TestPacingNeverSpinsOnAnInexactRate`,
 `TestAResponseHandedOverInTimeCompletesTheExport`,
 `TestEndingTheLifetimeAbandonsAStalledSubscribe`,
-`TestTheRuntimeExportClientEndsWithTheRun` and
+`TestTheRuntimeExportClientEndsWithTheRun`,
+`TestAResponseHandedOverInTimeSurvivesAFailedPublish`,
+`TestATimeoutNeverWaitsOnTheLogger`,
+`TestASubscribeEndsWhenItsContextIsCancelled`,
+`TestWaitTokenEndsWhenItsContextIsCancelled` and
 `TestAWeeklyReportForManySensorsStaysWithinTheRuntimeExportRate`.
 
 24. `GW-24` Envelope freshness and replay follow gateway-api/v2.

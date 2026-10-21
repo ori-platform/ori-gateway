@@ -86,6 +86,8 @@ type MQTTClient struct {
 	// subscribing holds the subscribe in flight for each topic: every export
 	// to that device waits on it, each within its own remaining wait.
 	subscribing map[string]*subscribeAttempt
+	// notes writes the client's log records off every caller's path.
+	notes noteLog
 }
 
 // subscribeAttempt is one subscribe to a response topic; done is closed once
@@ -383,7 +385,7 @@ func (c *MQTTClient) exportAll(ctx context.Context, base exportRequest) ([]map[s
 	cancel()
 	if err != nil {
 		if expired {
-			c.log.Warn("runtime export response subscription timed out",
+			c.warn("runtime export response subscription timed out",
 				"device_id", base.DeviceID, "export_type", base.ExportType, "wait", c.exportWait)
 			return nil, fmt.Errorf("%w: subscribing for %s after %s", ErrExportTimeout, base.ExportType, c.exportWait)
 		}
@@ -491,7 +493,7 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 	cancelPace()
 	if err != nil {
 		if paceExpired {
-			c.log.Warn("runtime export request not sent within the wait bound at the runtime's admission rate",
+			c.warn("runtime export request not sent within the wait bound at the runtime's admission rate",
 				"device_id", req.DeviceID, "export_type", req.ExportType, "wait", c.exportWait)
 			return exportResponse{}, fmt.Errorf("%w: pacing %s after %s", ErrExportTimeout, req.ExportType, c.exportWait)
 		}
@@ -531,11 +533,19 @@ func (c *MQTTClient) requestPage(ctx context.Context, req exportRequest) (export
 		if !errors.Is(context.Cause(waitCtx), ErrExportTimeout) {
 			return exportResponse{}, ctx.Err()
 		}
-		c.log.Warn("runtime export request timed out; no verified response arrived",
+		c.warn("runtime export request timed out; no verified response arrived",
 			"device_id", req.DeviceID, "export_type", req.ExportType, "request_id", requestID, "wait", c.exportWait)
 		return exportResponse{}, fmt.Errorf("%w: %s after %s", ErrExportTimeout, req.ExportType, c.exportWait)
 	}
 	if err := c.broker.Publish(waitCtx, topic, c.qos, false, payload); err != nil {
+		// A response handed over in time completes the request even when the
+		// publish then reports failure, a timeout included: the runtime has
+		// answered, and its replay key is already recorded.
+		select {
+		case result := <-responseCh:
+			return c.acceptResponse(req, requestID, result)
+		default:
+		}
 		if waitCtx.Err() != nil {
 			return timedOut()
 		}
@@ -623,10 +633,13 @@ func (c *MQTTClient) handleResponseMessage(topic string, payload []byte) {
 	// keeps waiting: a broker client cannot end an exchange by publishing on
 	// its response topic (gateway-api/v2 Export Auth Envelope).
 	if err != nil && !decided {
-		c.log.Warn("runtime export response not verified; dropped",
+		c.warn("runtime export response not verified; dropped",
 			"device_id", pending.req.DeviceID, "export_type", pending.req.ExportType)
 	}
 }
+
+// warn logs a warning without waiting on the logger.
+func (c *MQTTClient) warn(msg string, args ...any) { c.notes.warn(c.log, msg, args...) }
 
 // refusedByMemberRule reports, and logs with its reason only, a response whose
 // decrypted plaintext the Payload Member Rule refuses. Such a response changes
@@ -634,7 +647,7 @@ func (c *MQTTClient) handleResponseMessage(topic string, payload []byte) {
 func (c *MQTTClient) refusedByMemberRule(err error) bool {
 	refused, ok := errors.AsType[*contracts.MemberRuleError](err)
 	if ok {
-		c.log.Warn("runtime export response refused under the payload member rule", "reason", refused.Reason)
+		c.warn("runtime export response refused under the payload member rule", "reason", refused.Reason)
 	}
 	return ok
 }
