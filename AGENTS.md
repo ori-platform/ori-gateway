@@ -863,7 +863,11 @@ supply chain integrity here has direct impact on device actuation decisions.
 8. `go mod verify` must run before any build or test step. This verifies the
    integrity of the module cache against `go.sum` checksums.
 
-9. `CGO_ENABLED=0` must be set in CI. The gateway has no CGO dependency.
+9. `CGO_ENABLED=0` must be set in every CI job. The gateway has no CGO
+   dependency. The one exception is the `race` job in `ci.yml`. The race
+   detector needs cgo, so that job sets `CGO_ENABLED=1`, runs only
+   `go test -race`, and builds, installs and uploads nothing.
+   `scripts/check_workflows.py` enforces this per job.
 
 10. `go.sum` must be committed and kept up to date. Never bypass sum verification.
 

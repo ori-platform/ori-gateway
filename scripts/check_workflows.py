@@ -18,6 +18,14 @@ REMOTE_EXEC_RE = re.compile(
     r"(?:curl|wget)\b[^\n]*(?:\|\s*(?:bash|sh|python\d*)|&&\s*(?:bash|sh|python\d*)\b)",
     re.IGNORECASE,
 )
+JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
+CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*[:=]\s*[\"']?([^\"'\s]*)")
+GO_JOB_RE = re.compile(r"setup-go|\bgo\s+(?:test|build|vet|run|install|generate)\b")
+# The race detector needs cgo, so one job, which only runs tests, may enable it.
+RACE_JOB = "race"
+RACE_JOB_FORBIDDEN_RE = re.compile(
+    r"\bgo\s+(?:build|install|run|generate)\b|actions/upload-artifact|goreleaser"
+)
 
 
 def _workflow_files() -> list[Path]:
@@ -54,6 +62,44 @@ def _check_pre_commit_config(failures: list[str]) -> None:
             )
 
 
+def _jobs(text: str) -> list[tuple[str, str]]:
+    """Split a workflow's jobs block into (job id, job text) pairs."""
+    start = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    if not start:
+        return []
+    body = text[start.end() :]
+    headers = list(JOB_HEADER_RE.finditer(body))
+    return [
+        (h.group(1), body[h.start() : headers[i + 1].start() if i + 1 < len(headers) else len(body)])
+        for i, h in enumerate(headers)
+    ]
+
+
+def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
+    """Every Go job sets CGO_ENABLED=0, except the test-only race job, which sets 1."""
+    top = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    if CGO_SETTING_RE.search(text[: top.start()] if top else text):
+        failures.append(f"{path}: set CGO_ENABLED per job, not for the whole workflow")
+    for job, body in _jobs(text):
+        # Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
+        values = [
+            v for v in CGO_SETTING_RE.findall(body)
+            if v not in {"$CGO_ENABLED", "${CGO_ENABLED}"}
+        ]
+        if job == RACE_JOB:
+            if "go test -race" not in body:
+                failures.append(f"{path}: job {job} must run go test -race")
+            if values != ["1"]:
+                failures.append(f"{path}: job {job} must set CGO_ENABLED to 1 exactly once")
+            if RACE_JOB_FORBIDDEN_RE.search(body):
+                failures.append(f"{path}: job {job} may only run tests")
+            continue
+        if not GO_JOB_RE.search(body) and not values:
+            continue
+        if not values or any(v != "0" for v in values):
+            failures.append(f"{path}: job {job} must set CGO_ENABLED to 0")
+
+
 def main() -> int:
     failures: list[str] = []
     for path in _workflow_files():
@@ -77,6 +123,7 @@ def main() -> int:
             )
         if "permissions:" not in text:
             failures.append(f"{path}: missing explicit workflow permissions")
+        _check_cgo(path, text, failures)
     _check_pre_commit_config(failures)
     if failures:
         print("Supply-chain guard failed:", file=sys.stderr)
