@@ -73,7 +73,7 @@ func (a *deviceAuthority) RoundTrip(req *http.Request) (*http.Response, error) {
 	return vectorHTTPResponse(status, "json", &outcome, reason, status != http.StatusUnauthorized, false, "", digest, nil, nil), nil
 }
 
-func deviceWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, logs *syncBuffer, retry time.Duration) *DeliveryWorker {
+func deviceWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, logs *syncBuffer, retry time.Duration, clocks ...*manualClock) *DeliveryWorker {
 	t.Helper()
 	channel, err := NewHTTPChannel(HTTPChannelOptions{
 		Endpoint: fakeAuthorityURL, ClientID: "site-a-gateway",
@@ -86,9 +86,13 @@ func deviceWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, lo
 	if logs != nil {
 		handler = slog.NewJSONHandler(logs, nil)
 	}
-	worker, err := NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, DeliveryWorkerOptions{
+	opts := DeliveryWorkerOptions{
 		RetryInterval: retry, MaxBackoff: 8 * retry, BlockedReminderInterval: time.Hour, Logger: slog.New(handler),
-	})
+	}
+	for _, c := range clocks {
+		opts.clock = c.clock()
+	}
+	worker, err := NewDeliveryWorker(q, channel, &fakeAuthoritySink{}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,6 +490,41 @@ func (c *steppedClock) clock() clock {
 	}
 }
 
+// manualClock moves, wall and monotonic together, only when the test advances
+// it. A back-off measured on it cannot elapse while a slow machine stops,
+// reopens or restarts a worker, so an attempt the test sees before advancing
+// it past the deadline is early, however long the machine took.
+type manualClock struct {
+	mu sync.Mutex
+	at time.Duration
+}
+
+// manualEpoch is a whole millisecond, as a persisted deadline is.
+var manualEpoch = time.UnixMilli(1_787_000_000_000)
+
+func (c *manualClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at += d
+}
+
+func (c *manualClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return manualEpoch.Add(c.at)
+}
+
+func (c *manualClock) clock() clock {
+	return clock{
+		wall: c.now,
+		mono: func() time.Duration {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return c.at
+		},
+	}
+}
+
 // boundedWorker backs off from 100ms to a 200ms bound, well under a
 // Retry-After of a second or more.
 func boundedWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, clocks ...*steppedClock) *DeliveryWorker {
@@ -868,36 +907,42 @@ func TestBackoffSurvivesARestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The back-off is the delivery interval: long enough that stopping,
-	// reopening and restarting fall well inside it on any machine.
-	worker := deviceWorker(t, q, authority, nil, time.Second)
+	// Both processes read one clock that moves only when the test advances
+	// it, so stopping, reopening and restarting take no time on it.
+	clk := &manualClock{}
+	worker := deviceWorker(t, q, authority, nil, time.Second, clk)
 	running := startWorker(t, worker)
 	waitFor(t, "the back-off", func() bool { _, ok := q.BackoffFor(entry.ID); return ok })
 	running.stop()
 	record, _ := q.BackoffFor(entry.ID)
-	if record.Attempts != 1 || time.UnixMilli(record.NotBeforeMS).Before(time.Now()) {
+	notBefore := time.UnixMilli(record.NotBeforeMS)
+	if record.Attempts != 1 || !notBefore.After(clk.now()) {
 		t.Fatalf("persisted back-off = %#v", record)
 	}
 
 	reopened := openTestQueueAt(t, dir, 100, 1<<24)
-	next := deviceWorker(t, reopened, authority, nil, time.Second)
+	next := deviceWorker(t, reopened, authority, nil, time.Second, clk)
 	if e, ok := laneState(next, "dev-a"); !ok || e.State != DeviceBackingOff {
 		t.Fatalf("restart forgot the back-off: %#v", e)
 	}
 	startWorker(t, next)
 	next.NotifyDevice("dev-a")
-	// Observe before the persisted back-off elapses: an attempt then is the
-	// restart resending early.
-	notBefore := time.UnixMilli(record.NotBeforeMS)
-	time.Sleep(min(100*time.Millisecond, time.Until(notBefore)-50*time.Millisecond))
-	if time.Now().After(notBefore) {
-		t.Fatal("setup outlasted the persisted back-off, so the restart was not observed before it")
-	}
+	// The clock has not moved, so any attempt is the restart resending early.
+	time.Sleep(100 * time.Millisecond)
 	if authority.count("dev-a") != 1 {
 		t.Fatalf("restart resent before the back-off elapsed: %d attempts", authority.count("dev-a"))
 	}
+	// A millisecond short of the persisted deadline still forbids it.
+	clk.advance(notBefore.Sub(clk.now()) - time.Millisecond)
+	next.NotifyDevice("dev-a")
+	time.Sleep(50 * time.Millisecond)
+	if authority.count("dev-a") != 1 {
+		t.Fatalf("restart resent a millisecond before the back-off elapsed: %d attempts", authority.count("dev-a"))
+	}
 	authority.refuse("dev-a", nil)
-	waitFor(t, "the retry after the back-off", func() bool { return reopened.Len() == 0 })
+	clk.advance(time.Millisecond)
+	next.NotifyDevice("dev-a")
+	waitFor(t, "the retry at the persisted deadline", func() bool { return reopened.Len() == 0 })
 	if _, err := os.Stat(filepath.Join(dir, backoffFilePrefix+entry.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("retirement left the back-off record: %v", err)
 	}

@@ -333,14 +333,18 @@ func TestRefusalPolicyVectorCases(t *testing.T) {
 			if tc.Staged != nil && !*tc.Staged {
 				sink.err = errors.New("the authority artifact could not be staged")
 			}
+			// No back-off can elapse on a clock that never moves, so an attempt
+			// beyond the expected ones is a retry the outcome forbids, however
+			// slow the machine.
+			clk := &manualClock{}
 			worker, err := NewDeliveryWorker(q, channel, sink, DeliveryWorkerOptions{
 				RetryInterval: time.Second, BlockedReminderInterval: time.Hour,
-				Logger: slog.New(slog.NewJSONHandler(logs, nil)),
+				Logger: slog.New(slog.NewJSONHandler(logs, nil)), clock: clk.clock(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			started := time.Now()
+			started := clk.now()
 			running := startWorker(t, worker)
 			if tc.Expected.Class == "retire" {
 				retired := waitUntil(func() bool { return q.Len() == 0 })

@@ -23,6 +23,14 @@ import (
 
 func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
 	t.Helper()
+	_, brokerURL, stop = startTestBrokerServer(t)
+	return brokerURL, stop
+}
+
+// startTestBrokerServer is startTestBroker, also returning the server so a
+// test can wait on what the broker itself observes.
+func startTestBrokerServer(t *testing.T) (srv *mqttsrv.Server, brokerURL string, stop func()) {
+	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -33,7 +41,7 @@ func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
 		t.Fatal(err)
 	}
 
-	srv := mqttsrv.New(&mqttsrv.Options{
+	srv = mqttsrv.New(&mqttsrv.Options{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err := srv.AddHook(new(auth.AllowHook), nil); err != nil {
@@ -50,7 +58,7 @@ func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
 		t.Fatal(err)
 	}
 
-	return "tcp://" + addr, func() {
+	return srv, "tcp://" + addr, func() {
 		// Paho's Disconnect returns before the embedded broker has necessarily
 		// completed its client-removal path. Mochi's Close may otherwise take a
 		// nested Clients read lock while that removal is waiting for the write
@@ -133,7 +141,7 @@ func TestConnectAndPublish(t *testing.T) {
 }
 
 func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *testing.T) {
-	brokerURL, stop := startTestBroker(t)
+	srv, brokerURL, stop := startTestBrokerServer(t)
 	defer stop()
 	ctx := context.Background()
 	sub := testClient(t, brokerURL, "persistent-evidence-sub", Options{PersistentSession: true})
@@ -149,6 +157,16 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 	}
 	if err := sub.Disconnect(ctx); err != nil {
 		t.Fatal(err)
+	}
+	// Disconnect returns before the broker has removed the client. Publish
+	// only once the broker has, so the message is queued for a disconnected
+	// session and not written to a connection that is closing.
+	deadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&srv.Info.ClientsConnected) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the broker never observed the subscriber disconnect")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if err := pub.Connect(ctx); err != nil {
 		t.Fatal(err)
@@ -166,7 +184,7 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 		if string(got) != `{"artifact":"authority"}` {
 			t.Fatalf("queued payload = %q", got)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("persistent evidence session lost QoS 1 message")
 	}
 }

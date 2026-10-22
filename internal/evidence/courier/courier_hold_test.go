@@ -364,19 +364,25 @@ func TestIntervalStallLogsOnceThenOnTheReminderInterval(t *testing.T) {
 	}
 	channel := &fakeEvidenceChannel{err: errors.New("dial tcp authority.invalid:443: refused")}
 	logs := &syncBuffer{}
+	const reminder = 30 * time.Millisecond
 	worker, err := NewDeliveryWorker(q, channel, nil, DeliveryWorkerOptions{
-		RetryInterval: time.Millisecond, BlockedReminderInterval: 30 * time.Millisecond,
+		RetryInterval: time.Millisecond, BlockedReminderInterval: reminder,
 		Logger: slog.New(slog.NewJSONHandler(logs, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	started := time.Now()
 	running := startWorker(t, worker)
-	time.Sleep(100 * time.Millisecond)
+	waitFor(t, "two reminders", func() bool { return len(logs.records(t, stallReminderMessage)) >= 2 })
 	running.stop()
+	elapsed := time.Since(started)
+	// The entry is logged no earlier than the start, and each reminder at
+	// least a reminder interval after the line before it, so the run's own
+	// length bounds how many there can be, however slow the machine.
 	entries, reminders := len(logs.records(t, stallMessage)), len(logs.records(t, stallReminderMessage))
-	if entries != 1 || reminders < 1 || reminders > 4 {
-		t.Fatalf("entry lines %d, reminders %d over ~100 attempts: want 1 and a few", entries, reminders)
+	if entries != 1 || time.Duration(reminders)*reminder > elapsed {
+		t.Fatalf("entry lines %d, reminders %d in %v: want 1, and at most one per %v", entries, reminders, elapsed, reminder)
 	}
 	if strings.Contains(logs.String(), "authority.invalid") {
 		t.Fatal("transport error text reached the log")

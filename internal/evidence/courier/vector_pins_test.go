@@ -66,9 +66,9 @@ func checkPinsExist(t *testing.T, pins map[string]vectorPin, names []string) {
 
 // waitUntil reports whether cond held within the harness's wait, without
 // failing: a behaviour that never arrives is a deviation to report, not a
-// harness fault.
+// harness fault. Its bound is waitFor's.
 func waitUntil(cond func() bool) bool {
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(eventBound)
 	for !cond() {
 		if time.Now().After(deadline) {
 			return false
