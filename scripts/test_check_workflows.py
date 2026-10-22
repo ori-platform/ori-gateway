@@ -280,6 +280,15 @@ class CheckWorkflowsTest(unittest.TestCase):
                 text = race().replace("      - run: go mod verify\n", f"      - run: go mod verify\n        {extra}\n")
                 self.assertRefused(workflow(text), "steps may set only")
 
+    def test_a_race_step_that_neither_runs_nor_uses_or_does_both_is_refused(self) -> None:
+        for step in (
+            "      - {}\n",
+            "      - name: nothing\n",
+            f"      - uses: actions/checkout@{SHA}\n        run: go build ./...\n",
+        ):
+            with self.subTest(step):
+                self.assertRefused(workflow(race() + step), "either run a command or use an action")
+
     def test_a_race_job_that_uses_another_action_is_refused(self) -> None:
         for action in ("actions/upload-artifact@", "actions/cache/save@", "./local-action", "docker://alpine"):
             with self.subTest(action):

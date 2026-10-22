@@ -181,6 +181,8 @@ def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> No
     for step in steps:
         if extra := sorted(set(step) - RACE_STEP_KEYS):
             failures.append(f"{path}: job {name} steps may set only {sorted(RACE_STEP_KEYS)}, not {extra}")
+        if ("run" in step) == ("uses" in step):
+            failures.append(f"{path}: job {name} steps must each either run a command or use an action")
         if "run" in step:
             runs.append(step["run"])
         if "uses" in step:
