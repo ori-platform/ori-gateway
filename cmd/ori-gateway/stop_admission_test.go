@@ -27,6 +27,8 @@ import (
 // return once cancelled, holding the stop between its decision and the join.
 type stopHeldRunner struct{ stopping, release chan struct{} }
 
+func (h *stopHeldRunner) Publishing() bool { return true }
+
 func (h *stopHeldRunner) Run(ctx context.Context) error {
 	<-ctx.Done()
 	close(h.stopping)
@@ -289,3 +291,5 @@ func TestARunnerFailureDecidesTheStopBeforeTheRunnersAreJoined(t *testing.T) {
 type heartbeatRunnerFunc func(context.Context) error
 
 func (f heartbeatRunnerFunc) Run(ctx context.Context) error { return f(ctx) }
+
+func (f heartbeatRunnerFunc) Publishing() bool { return true }

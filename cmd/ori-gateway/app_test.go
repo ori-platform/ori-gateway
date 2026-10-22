@@ -272,7 +272,11 @@ type fakeHeartbeat struct {
 	err                  error
 	returnNil            bool
 	returnNilAfterCancel bool
+	// stopped makes Publishing report that heartbeats have stopped.
+	stopped atomic.Bool
 }
+
+func (h *fakeHeartbeat) Publishing() bool { return !h.stopped.Load() }
 
 type fakeWebhookBridge struct {
 	started   chan struct{}

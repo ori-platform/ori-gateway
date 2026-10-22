@@ -758,6 +758,21 @@ it eases, without using up the operator's own allowance. The
 bridge decides only volume; which senders may approve a proposal is the
 runtime's decision.
 
+## Log lines dropped behind a log destination that blocks
+
+The gateway never waits on its log destination. If stderr, a pipe or journald
+stops accepting writes, the gateway keeps running, and its heartbeat and
+reasoning escalations still end the process (GW-6). Its log records queue, at
+most 64 each for the gateway, the heartbeat and the MQTT client. Later ones are
+counted, and once the destination accepts writes again a `WARN … log lines
+dropped behind a logger that blocked` line reports how many with `dropped`.
+A process ending on a heartbeat failure gives its last line about a second to
+be written.
+
+While the gateway's own heartbeat is not going out (before the first one,
+after a failed attempt, or with none for three intervals), `GET /health`
+reports the gateway `degraded`.
+
 ## Signed messages refused as stale, future or below the replay floor
 
 With `gateway.auth.enabled`, every signed MQTT message the gateway receives

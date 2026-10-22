@@ -72,6 +72,24 @@ Verified by `TestHeartbeatFailureLimit`,
 `TestAReplyTheStopRefusesIsNotADeliveryFailure`,
 `TestAReplyFailingAfterTheCallerCancelsIsNotCounted`, and
 `TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted`.
+Neither escalation waits on the log destination. The gateway's logger, the
+heartbeat publisher's and the broker client's write their records off every
+caller's path through `internal/asynclog`: in order, by one drainer, at most
+64 waiting behind a logger that blocks, later ones counted. A heartbeat whose
+every log line would block still reaches its failure limit and exits, after
+giving its last line a bounded chance (`asynclog.ExitFlushBound`) to be
+written. The request escalation still ends the run. `runCLI` writes its final
+line within the same bound and exits whether or not it was taken. Site
+health reports the gateway `degraded` while its heartbeat is not going out:
+before the first one, after a failed attempt, or with none for three
+intervals. Verified by `TestALoggerThatBlocksNeverKeepsTheHeartbeatFromItsExit`,
+`TestTheExitLineIsWrittenBeforeTheHeartbeatExits`,
+`TestPublishingFollowsTheLatestAttempt`,
+`TestTheRequestEscalationEndsTheGatewayBehindALoggerThatBlocks`,
+`TestRunCLIExitsBehindAStderrThatBlocks`,
+`TestSiteHealthIsDegradedOnceHeartbeatsStop`,
+`TestALoggerThatBlocksNeverHoldsTheClientsDelivery` and the
+`internal/asynclog` tests.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or

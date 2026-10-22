@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ori-platform/ori-gateway/internal/asynclog"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 )
 
@@ -97,6 +98,7 @@ type IngressCount struct {
 type IngressStats struct {
 	mu       sync.Mutex
 	log      *slog.Logger
+	logs     *asynclog.Queue
 	now      func() time.Time
 	counts   map[string]*IngressCount
 	unlogged map[ingressLogKey]*ingressPending
@@ -119,8 +121,12 @@ func NewIngressStats(logger *slog.Logger) *IngressStats {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// Refusals are logged from the client's message wrapper, on paho's
+	// routing goroutine, so the records are written off it.
+	queued, logs := asynclog.New(logger.Handler(), "mqtt ingress log lines dropped behind a logger that blocked")
 	return &IngressStats{
-		log:      logger,
+		log:      queued,
+		logs:     logs,
 		now:      time.Now,
 		counts:   make(map[string]*IngressCount),
 		unlogged: make(map[ingressLogKey]*ingressPending),
