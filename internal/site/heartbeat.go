@@ -99,7 +99,6 @@ func (h *RuntimeHeartbeatHandler) Handle(topic string, payload []byte) error {
 		DeviceID:           beat.DeviceID,
 		Status:             beat.Status,
 		LastSeenMS:         beat.LastSeenMS,
-		GatewaySeen:        h.now().UnixMilli(),
 		ActiveTriggers:     append([]string(nil), beat.ActiveTriggers...),
 		DegradationReasons: degradationReasons,
 		Evidence:           evidence,

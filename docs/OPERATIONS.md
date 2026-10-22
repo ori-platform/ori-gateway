@@ -513,10 +513,13 @@ and the site status stays `critical`. The gateway log carries one `ERROR`,
 reports again`, with the `device_id`, `gateway_seen_ms` and `last_seen_ms`, the
 first time the eviction loop finds the node silent, whether or not
 `site_health` is enabled. Silent means the gateway has accepted no heartbeat
-from the node for three heartbeat intervals, measured on the gateway's own
-clock from when it received the last one; the node's `last_seen_ms` plays no
-part, so a node whose clock is ahead or behind is not reported silent while it
-is still reporting.
+from the node for three heartbeat intervals, measured from when it received the
+last one on a monotonic clock. The node's `last_seen_ms` plays no part, so a
+node whose clock is ahead or behind is not reported silent while it is still
+reporting. A step in the gateway's own wall clock, such as an NTP sync after
+boot on a device with no real-time clock, neither makes a reporting node look
+silent nor hides a silence. `gateway_seen_ms` is the same receipt on the wall
+clock, for display only.
 
 A node whose health export last read `critical` is retained the same way,
 whatever its heartbeats said, and the log line is `runtime node silent after a
@@ -527,6 +530,17 @@ otherwise does.
 A node that goes silent after a `healthy` or `degraded` heartbeat, with no
 `critical` export, is dropped from the registry after three heartbeat
 intervals and shows as unobserved and `degraded`, as before.
+
+Every node's eviction and `gateway_observed` follow the same rule: receipt age
+on the gateway's monotonic clock. Its `stale` flag in `GET /health` is set when
+the node's report has not moved for three heartbeat intervals on that clock:
+no heartbeat arrived, or none whose `last_seen_ms` passed the previous
+heartbeat's. A live runtime's `last_seen_ms` advances on every heartbeat, so a
+node whose runtime is stuck behind a live publisher, or whose clock has
+stalled, shows `stale` and `degraded` but stays observed. A node whose clock
+is merely ahead of or behind the gateway's is not stale; with `gateway.auth`
+on, one more than five minutes off is refused at its signature instead.
+`last_seen_ms` is shown as the node reported it.
 
 The retention has no time limit, because any time limit would be critical
 decaying through silence. It is bounded instead by the configured devices:

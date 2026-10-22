@@ -14,19 +14,29 @@ import (
 )
 
 func TestRuntimeHeartbeatHandlerUpdatesRegistry(t *testing.T) {
-	reg := NewRegistry()
 	now := time.UnixMilli(1234567895000)
+	clock := newFakeReceiptClock(now.UnixMilli())
+	reg := clock.registry()
 	handler, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := runtimeHeartbeatPayload(t, contracts.RuntimeNodeHeartbeat{
+	var members map[string]any
+	if err := json.Unmarshal(runtimeHeartbeatPayload(t, contracts.RuntimeNodeHeartbeat{
 		DeviceID:       "dev-01",
 		Status:         NodeStatusHealthy,
 		LastSeenMS:     1234567890000,
-		GatewaySeenMS:  999,
 		ActiveTriggers: []string{"high_current"},
-	})
+	}), &members); err != nil {
+		t.Fatal(err)
+	}
+	// A producer-supplied gateway_seen_ms is admitted and never read: the
+	// gateway stamps its own receipt.
+	members["gateway_seen_ms"] = 999
+	payload, err := json.Marshal(members)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if err := handler.Handle("ori/dev-01/runtime/heartbeat", payload); err != nil {
 		t.Fatal(err)

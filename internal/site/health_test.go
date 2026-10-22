@@ -56,20 +56,24 @@ func TestProjectSiteHealthAllNodesHealthy(t *testing.T) {
 }
 
 func TestProjectSiteHealthStaleNode(t *testing.T) {
-	reg := NewRegistry()
 	const (
 		nowMS = int64(10000)
 		ttlMS = int64(1000)
 	)
-
+	clock := newFakeReceiptClock(nowMS - ttlMS - 1)
+	reg := clock.registry()
+	// node-stale was last received past the TTL, so a last_seen_ms claiming
+	// it is current freshens nothing; node-fresh was received within it.
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-stale", Status: NodeStatusHealthy, LastSeenMS: nowMS})
+	clock.moveTo(nowMS - 500)
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-fresh", Status: NodeStatusHealthy, LastSeenMS: nowMS - 500})
-	reg.Upsert(NodeHeartbeat{DeviceID: "node-stale", Status: NodeStatusHealthy, LastSeenMS: nowMS - ttlMS - 1})
+	clock.moveTo(nowMS)
 
 	p := NewProjector(reg, ProjectOptions{
 		ExpectedDeviceIDs: []string{"node-fresh", "node-stale"},
 		NodeTTLMS:         ttlMS,
 	})
-	h := p.Project(time.UnixMilli(nowMS), healthyGateway())
+	h := p.Project(clock.Wall(), healthyGateway())
 
 	if h.Status != SiteStatusDegraded {
 		t.Errorf("expected degraded, got %q", h.Status)
@@ -90,19 +94,21 @@ func TestProjectSiteHealthStaleNode(t *testing.T) {
 }
 
 func TestProjectSiteHealthStaleAtTTLBoundary(t *testing.T) {
-	reg := NewRegistry()
 	const (
 		nowMS = int64(10000)
 		ttlMS = int64(1000)
 	)
-	// Exactly at boundary: nowMS - ttlMS — should NOT be stale (mirrors EvictStale).
+	// Received exactly the TTL ago: not stale, as EvictStale keeps it.
+	clock := newFakeReceiptClock(nowMS - ttlMS)
+	reg := clock.registry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-boundary", Status: NodeStatusHealthy, LastSeenMS: nowMS - ttlMS})
+	clock.moveTo(nowMS)
 
 	p := NewProjector(reg, ProjectOptions{
 		ExpectedDeviceIDs: []string{"node-boundary"},
 		NodeTTLMS:         ttlMS,
 	})
-	h := p.Project(time.UnixMilli(nowMS), healthyGateway())
+	h := p.Project(clock.Wall(), healthyGateway())
 
 	if h.Status != SiteStatusHealthy {
 		t.Errorf("node at TTL boundary should not be stale, got site status %q", h.Status)
@@ -299,23 +305,95 @@ func TestProjectSiteHealthNoSecretsOrURLsInJSON(t *testing.T) {
 	}
 }
 
-func TestProjectSiteHealthFutureDatedNodeIsStale(t *testing.T) {
-	reg := NewRegistry()
-	const nowMS = int64(5000)
-	// future-dated: LastSeenMS > nowMS
-	reg.Upsert(NodeHeartbeat{DeviceID: "node-future", Status: NodeStatusHealthy, LastSeenMS: nowMS + 1000})
-
-	p := NewProjector(reg, ProjectOptions{
-		ExpectedDeviceIDs: []string{"node-future"},
-		NodeTTLMS:         60000,
-	})
-	h := p.Project(time.UnixMilli(nowMS), healthyGateway())
-
-	if h.Status != SiteStatusDegraded {
-		t.Errorf("future-dated node should degrade site, got %q", h.Status)
+// A node's clock never decides staleness (#126): a node reporting with its
+// clock ahead of the gateway's, or 200 s behind it, is not stale while its
+// report advances, and silence past the TTL is stale whatever last_seen_ms
+// claims.
+func TestProjectSiteHealthAnOffsetNodeClockIsNotStale(t *testing.T) {
+	const (
+		nowMS = int64(1_800_000_000_000)
+		ttlMS = int64(60000)
+	)
+	for name, offset := range map[string]int64{"2 s ahead": 2000, "200 s behind": -200_000} {
+		t.Run(name, func(t *testing.T) {
+			clock := newFakeReceiptClock(nowMS)
+			reg := clock.registry()
+			p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: ttlMS})
+			for range 5 {
+				lastSeen := clock.Wall().UnixMilli() + offset
+				reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: lastSeen})
+				clock.advance(30 * time.Second)
+				n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]
+				if n.Stale || !n.GatewayObserved || n.LastSeenMS != lastSeen {
+					t.Fatalf("a reporting node: %+v, want not stale, observed, last_seen_ms as reported", n)
+				}
+			}
+			clock.advance(time.Duration(ttlMS) * time.Millisecond)
+			if n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]; !n.Stale {
+				t.Fatalf("a node silent past the TTL is not stale: %+v", n)
+			}
+		})
 	}
-	if !h.Nodes[0].Stale {
-		t.Error("future-dated node should be marked stale")
+}
+
+// A runtime clock stepped back once moves again with its next heartbeat: a
+// report advances when last_seen_ms passes the previous heartbeat's, not the
+// highest ever seen.
+func TestProjectSiteHealthASteppedBackNodeClockAdvancesAgain(t *testing.T) {
+	const ttlMS = int64(5000)
+	clock := newFakeReceiptClock(10_000)
+	reg := clock.registry()
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: ttlMS})
+	lastSeen := int64(1_000_000)
+	for _, step := range []int64{1000, 1000, -3_600_000, 1000, 1000, 1000, 1000, 1000, 1000, 1000} {
+		lastSeen += step
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: lastSeen})
+		clock.advance(time.Second)
+		if n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]; n.Stale {
+			t.Fatalf("a node whose clock was stepped back once reads stale while it advances again: %+v", n)
+		}
+	}
+}
+
+// A publisher that keeps sending while the node's own last_seen_ms stops
+// advancing, a stuck main loop behind a live heartbeat, goes stale once its
+// report is older than the TTL, though the gateway keeps receiving it.
+func TestProjectSiteHealthAStuckReportGoesStaleWhileReceived(t *testing.T) {
+	const ttlMS = int64(5000)
+	clock := newFakeReceiptClock(10_000)
+	reg := clock.registry()
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: ttlMS})
+	for range 10 {
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 10_000})
+		clock.advance(time.Second)
+	}
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 10_000})
+	n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]
+	if !n.Stale || !n.GatewayObserved || n.Status != SiteStatusDegraded {
+		t.Fatalf("a stuck report received every second: %+v, want stale, observed and degraded", n)
+	}
+	if evicted := reg.EvictStale(time.Duration(ttlMS) * time.Millisecond); len(evicted) != 0 {
+		t.Fatalf("a node the gateway is still receiving was evicted: %v", evicted)
+	}
+}
+
+// Staleness runs on the monotonic receipt clock (#128): a forward wall step
+// makes no reporting node stale, and a backward one hides no silence.
+func TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens(t *testing.T) {
+	const ttlMS = int64(5000)
+	clock := newFakeReceiptClock(10_000)
+	reg := clock.registry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 10_000})
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: ttlMS})
+
+	clock.stepWall(time.Hour)
+	if h := p.Project(clock.Wall(), healthyGateway()); h.Nodes[0].Stale {
+		t.Fatal("a forward wall step made a reporting node stale")
+	}
+	clock.stepWall(-2 * time.Hour)
+	clock.advance(time.Duration(ttlMS+1) * time.Millisecond)
+	if h := p.Project(clock.Wall(), healthyGateway()); !h.Nodes[0].Stale {
+		t.Fatal("a backward wall step hid a silence")
 	}
 }
 
@@ -460,10 +538,12 @@ func TestExportSeverityOnlyRaisesANode(t *testing.T) {
 // reading changes it.
 func TestExportSeverityOutlivesEveryHeartbeat(t *testing.T) {
 	nowMS := int64(10000)
-	reg := NewRegistry()
+	clock := newFakeReceiptClock(nowMS)
+	reg := clock.registry()
 	project := func(at int64) SiteHealth {
+		clock.moveTo(at)
 		return NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
-			Project(time.UnixMilli(at), healthyGateway())
+			Project(clock.Wall(), healthyGateway())
 	}
 	expect := func(step string, at int64, want string) {
 		t.Helper()
@@ -472,7 +552,8 @@ func TestExportSeverityOutlivesEveryHeartbeat(t *testing.T) {
 		}
 	}
 	beat := func(at int64) {
-		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: at, GatewaySeen: at})
+		clock.moveTo(at)
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: at})
 	}
 	beat(nowMS)
 	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityCritical})
@@ -486,7 +567,8 @@ func TestExportSeverityOutlivesEveryHeartbeat(t *testing.T) {
 	expect("a later ok export", nowMS+2, SiteStatusHealthy)
 
 	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityUnknown})
-	if evicted := reg.EvictStale(nowMS+100_000, 5000); len(evicted) != 1 {
+	clock.moveTo(nowMS + 100_000)
+	if evicted := reg.EvictStale(5 * time.Second); len(evicted) != 1 {
 		t.Fatalf("a silent node whose export read unknown should be evicted, got %v", evicted)
 	}
 	beat(nowMS + 100_001)
@@ -500,18 +582,21 @@ func TestExportSeverityOutlivesEveryHeartbeat(t *testing.T) {
 // heartbeats were healthy but whose export read critical go silent: it is
 // retained, reported once, and projected stale and critical.
 func TestASilentNodeWhoseExportReadCriticalStaysCritical(t *testing.T) {
-	reg := NewRegistry()
-	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000, GatewaySeen: 1000})
+	clock := newFakeReceiptClock(1000)
+	reg := clock.registry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000})
 	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityCritical})
-	evicted, retained := reg.EvictStaleRetainingCritical(100_000, 5000)
+	clock.moveTo(100_000)
+	evicted, retained := reg.EvictStaleRetainingCritical(5 * time.Second)
 	if len(evicted) != 0 || len(retained) != 1 {
 		t.Fatalf("evicted %v retained %v, want the node retained", evicted, retained)
 	}
-	if _, again := reg.EvictStaleRetainingCritical(200_000, 5000); len(again) != 0 {
+	clock.moveTo(200_000)
+	if _, again := reg.EvictStaleRetainingCritical(5 * time.Second); len(again) != 0 {
 		t.Fatalf("a silence is reported once, got %v", again)
 	}
 	h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
-		Project(time.UnixMilli(200_000), healthyGateway())
+		Project(clock.Wall(), healthyGateway())
 	if n := h.Nodes[0]; n.Status != SiteStatusCritical || !n.Stale || h.Status != SiteStatusCritical {
 		t.Fatalf("silent node %+v, site %q; want stale and critical", n, h.Status)
 	}
@@ -522,19 +607,22 @@ func TestASilentNodeWhoseExportReadCriticalStaysCritical(t *testing.T) {
 // node is not registered, as a fetch that outlives its node's eviction does:
 // the node's next heartbeat carries critical.
 func TestALateExportReadingAfterEvictionIsKept(t *testing.T) {
-	reg := NewRegistry()
-	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000, GatewaySeen: 1000})
+	clock := newFakeReceiptClock(1000)
+	reg := clock.registry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000})
 	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityOK})
-	if evicted := reg.EvictStale(100_000, 5000); len(evicted) != 1 {
+	clock.moveTo(100_000)
+	if evicted := reg.EvictStale(5 * time.Second); len(evicted) != 1 {
 		t.Fatalf("expected the node evicted, got %v", evicted)
 	}
 	reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: ExportSeverityCritical})
 	if snapshot := reg.Snapshot(); len(snapshot) != 0 {
 		t.Fatalf("a posture for an unregistered node registered it: %v", snapshot)
 	}
-	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 100_001, GatewaySeen: 100_001})
+	clock.moveTo(100_001)
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 100_001})
 	h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
-		Project(time.UnixMilli(100_001), healthyGateway())
+		Project(clock.Wall(), healthyGateway())
 	if h.Nodes[0].Status != SiteStatusCritical || h.Status != SiteStatusCritical {
 		t.Fatalf("node %q site %q after a late critical reading, want critical", h.Nodes[0].Status, h.Status)
 	}
@@ -554,14 +642,17 @@ func TestAnUnobservedNodeKeepsItsRecordedExportSeverity(t *testing.T) {
 		ExportSeverityDegraded: SiteStatusDegraded,
 		ExportSeverityOK:       SiteStatusDegraded,
 	} {
-		reg := NewRegistry()
-		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000, GatewaySeen: 1000})
-		if evicted := reg.EvictStale(100_000, 5000); len(evicted) != 1 {
+		clock := newFakeReceiptClock(1000)
+		reg := clock.registry()
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 1000})
+		clock.moveTo(100_000)
+		if evicted := reg.EvictStale(5 * time.Second); len(evicted) != 1 {
 			t.Fatalf("expected the node evicted, got %v", evicted)
 		}
 		reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: severity})
+		clock.moveTo(100_001)
 		h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a", "node-b"}, NodeTTLMS: 5000}).
-			Project(time.UnixMilli(100_001), healthyGateway())
+			Project(clock.Wall(), healthyGateway())
 		if n := h.Nodes[0]; n.Status != want || n.GatewayObserved || !n.Stale || h.Status != want {
 			t.Errorf("late %s reading: node %+v site %q, want %q, unobserved and stale", severity, n, h.Status, want)
 		}

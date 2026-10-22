@@ -954,7 +954,7 @@ func TestMainRuntimeHeartbeatUpdatesInjectedRegistry(t *testing.T) {
 	fb := newFakeBroker()
 	fp := &fakeProvider{healthy: true}
 	hb := newFakeHeartbeat()
-	registry := site.NewRegistry()
+	registry, _ := newTestReceiptRegistry(1_700_000_000_000)
 	deps := baseDeps(t, validConfig(), fb, fp, hb)
 	deps.newSiteRegistry = func() *site.Registry { return registry }
 	ctx, cancel := context.WithCancel(context.Background())
@@ -985,7 +985,6 @@ func TestMainRuntimeHeartbeatUpdatesInjectedRegistry(t *testing.T) {
 		DeviceID:       "dev-01",
 		Status:         site.NodeStatusHealthy,
 		LastSeenMS:     1234567890000,
-		GatewaySeenMS:  0,
 		ActiveTriggers: []string{"grid_low"},
 	})
 	if err != nil {
@@ -1055,7 +1054,6 @@ func TestMainRuntimeHeartbeatVerifiesSignedPayloadWhenGatewayAuthEnabled(t *test
 		DeviceID:       "dev-01",
 		Status:         site.NodeStatusHealthy,
 		LastSeenMS:     signedAt,
-		GatewaySeenMS:  0,
 		ActiveTriggers: []string{},
 	}
 	auth, err := mqttauth.Sign(beat, contracts.RuntimeHeartbeatMessageType, "dev-01", "", signedAt, "site-local-secret")
@@ -1097,26 +1095,46 @@ func TestMainRuntimeHeartbeatVerifiesSignedPayloadWhenGatewayAuthEnabled(t *test
 	}
 }
 
-func TestEvictStaleRuntimeNodesRemovesStaleAndFutureDatedNodes(t *testing.T) {
-	registry := site.NewRegistry()
-	registry.Upsert(site.NodeHeartbeat{DeviceID: "stale", Status: site.NodeStatusHealthy, LastSeenMS: 1000})
-	registry.Upsert(site.NodeHeartbeat{DeviceID: "future", Status: site.NodeStatusHealthy, LastSeenMS: 100_000})
-	registry.Upsert(site.NodeHeartbeat{DeviceID: "fresh", Status: site.NodeStatusHealthy, LastSeenMS: 9999})
-	now := time.UnixMilli(10_000)
-	ctx := t.Context()
+// testReceiptClock is a site registry receipt clock a test moves: advance
+// moves its wall and monotonic readings together.
+type testReceiptClock struct {
+	wallMS atomic.Int64
+	mono   atomic.Int64
+}
 
-	go evictStaleRuntimeNodes(ctx, registry, time.Millisecond, func() time.Time {
-		return now
-	}, slog.Default())
-	deadline := time.Now().Add(time.Second)
+func newTestReceiptRegistry(wallMS int64) (*site.Registry, *testReceiptClock) {
+	c := &testReceiptClock{}
+	c.wallMS.Store(wallMS)
+	return site.NewRegistryWithClock(
+		func() time.Time { return time.UnixMilli(c.wallMS.Load()) },
+		func() time.Duration { return time.Duration(c.mono.Load()) },
+	), c
+}
+
+func (c *testReceiptClock) advance(d time.Duration) {
+	c.wallMS.Add(d.Milliseconds())
+	c.mono.Add(int64(d))
+}
+
+// The eviction loop evicts a node the gateway has not heard from past the
+// TTL, and keeps nodes still reporting whatever their clocks say.
+func TestEvictStaleRuntimeNodesRemovesNodesSilentOnReceipt(t *testing.T) {
+	registry, clock := newTestReceiptRegistry(10_000)
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "stale", Status: site.NodeStatusHealthy, LastSeenMS: 10_000})
+	clock.advance(time.Second)
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "future", Status: site.NodeStatusHealthy, LastSeenMS: 100_000})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "fresh", Status: site.NodeStatusHealthy, LastSeenMS: 1})
+
+	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, slog.Default())
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := registry.Snapshot()
-		if len(snapshot) == 1 && snapshot[0].DeviceID == "fresh" {
+		if len(snapshot) == 2 && snapshot[0].DeviceID != "stale" && snapshot[1].DeviceID != "stale" {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("stale runtime nodes were not evicted: %#v", registry.Snapshot())
+	t.Fatalf("the silent node was not evicted, or a reporting one was: %#v", registry.Snapshot())
 }
 
 // syncBuffer is a log sink safe to read while a goroutine writes to it.
@@ -1138,16 +1156,14 @@ func (b *syncBuffer) String() string {
 }
 
 func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
-	registry := site.NewRegistry()
+	registry, clock := newTestReceiptRegistry(2000)
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "critical", Status: site.NodeStatusCritical, LastSeenMS: 1000})
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "degraded", Status: site.NodeStatusDegraded, LastSeenMS: 1000})
-	now := time.UnixMilli(10_000)
+	clock.advance(time.Second)
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 
-	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, func() time.Time {
-		return now
-	}, logger)
+	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, logger)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := registry.Snapshot()
@@ -1158,7 +1174,7 @@ func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
 				t.Fatalf("silent critical node reported %d times, want once:\n%s", n, logs.String())
 			}
 			for _, want := range []string{
-				`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=critical gateway_seen_ms=0 last_seen_ms=1000`,
+				`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=critical gateway_seen_ms=2000 last_seen_ms=1000`,
 				`level=WARN msg="runtime node heartbeat stale" device_id=degraded last_seen_ms=1000`,
 			} {
 				if n := strings.Count(logs.String(), want+"\n"); n != 1 {
@@ -1174,24 +1190,20 @@ func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
 
 func TestEvictStaleRuntimeNodesJudgesCriticalSilenceOnGatewayReceipt(t *testing.T) {
 	const arrivalMS = int64(1_000_000)
-	registry := site.NewRegistry()
-	registry.Upsert(site.NodeHeartbeat{DeviceID: "ahead", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS + 2000, GatewaySeen: arrivalMS})
-	registry.Upsert(site.NodeHeartbeat{DeviceID: "behind", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS - 200_000, GatewaySeen: arrivalMS})
-	var nowMS atomic.Int64
-	nowMS.Store(arrivalMS)
+	registry, clock := newTestReceiptRegistry(arrivalMS)
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "ahead", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS + 2000})
+	registry.Upsert(site.NodeHeartbeat{DeviceID: "behind", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS - 200_000})
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	const interval = 5 * time.Millisecond // TTL is three intervals: 15 ms.
 
-	go evictStaleRuntimeNodes(t.Context(), registry, interval, func() time.Time {
-		return time.UnixMilli(nowMS.Load())
-	}, logger)
+	go evictStaleRuntimeNodes(t.Context(), registry, interval, logger)
 	time.Sleep(20 * interval)
 	if strings.Contains(logs.String(), "silent after a critical heartbeat") {
 		t.Fatalf("a critical node still reporting was logged silent within the TTL of its arrival:\n%s", logs.String())
 	}
 
-	nowMS.Store(arrivalMS + 16)
+	clock.advance(16 * time.Millisecond)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && strings.Count(logs.String(), "silent after a critical heartbeat") < 2 {
 		time.Sleep(10 * time.Millisecond)

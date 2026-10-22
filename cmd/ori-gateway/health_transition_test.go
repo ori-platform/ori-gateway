@@ -399,17 +399,18 @@ func TestSiteExportSeverityNeverReadsAnUnknownValueAsOK(t *testing.T) {
 // silent beside a node whose heartbeat was critical. Each is retained and
 // reported once with its own line, naming only the device and the times.
 func TestEvictStaleRuntimeNodesReportsASilentCriticalExport(t *testing.T) {
-	registry := site.NewRegistry()
+	registry, clock := newTestReceiptRegistry(2000)
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "export", Status: site.NodeStatusHealthy, LastSeenMS: 1000})
 	registry.UpsertPosture("export", site.SiteNodePosture{ExportSeverity: site.ExportSeverityCritical})
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "beat", Status: site.NodeStatusCritical, LastSeenMS: 1000})
+	clock.advance(time.Second)
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, func() time.Time { return time.UnixMilli(10_000) }, logger)
+	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, logger)
 
 	lines := []string{
-		`level=ERROR msg="runtime node silent after a critical health export; kept critical until its export reads otherwise" device_id=export gateway_seen_ms=0 last_seen_ms=1000`,
-		`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=beat gateway_seen_ms=0 last_seen_ms=1000`,
+		`level=ERROR msg="runtime node silent after a critical health export; kept critical until its export reads otherwise" device_id=export gateway_seen_ms=2000 last_seen_ms=1000`,
+		`level=ERROR msg="runtime node silent after a critical heartbeat; kept critical until it reports again" device_id=beat gateway_seen_ms=2000 last_seen_ms=1000`,
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && strings.Count(logs.String(), "level=ERROR") < 2 {

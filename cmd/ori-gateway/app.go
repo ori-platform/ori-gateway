@@ -672,7 +672,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	// Supervised like every long-running task, so it stops with the others
 	// and never outlives runGateway (GW-15).
 	runners.start("site node eviction", func(ctx context.Context) error {
-		evictStaleRuntimeNodes(ctx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.now, deps.logger)
+		evictStaleRuntimeNodes(ctx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.logger)
 		<-ctx.Done()
 		return ctx.Err()
 	})
@@ -1029,7 +1029,6 @@ func evictStaleRuntimeNodes(
 	ctx context.Context,
 	registry *site.Registry,
 	interval time.Duration,
-	now func() time.Time,
 	logger *slog.Logger,
 ) {
 	if registry == nil {
@@ -1038,13 +1037,11 @@ func evictStaleRuntimeNodes(
 	if interval <= 0 {
 		interval = time.Duration(config.DefaultHeartbeatIntervalS) * time.Second
 	}
-	if now == nil {
-		now = time.Now
-	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	ttlMS := (3 * interval).Milliseconds()
+	// Receipt age is measured on the registry's own monotonic clock.
+	ttl := 3 * interval
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1052,7 +1049,7 @@ func evictStaleRuntimeNodes(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			evicted, retained := registry.EvictStaleRetainingCritical(now().UnixMilli(), ttlMS)
+			evicted, retained := registry.EvictStaleRetainingCritical(ttl)
 			for _, node := range evicted {
 				logger.Warn("runtime node heartbeat stale", "device_id", node.DeviceID, "last_seen_ms", node.LastSeenMS)
 			}

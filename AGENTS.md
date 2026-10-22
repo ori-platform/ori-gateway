@@ -297,6 +297,26 @@ projected member. The registry keeps it through every heartbeat, a failed
 fetch and eviction, and records a reading that arrives while the node is not
 registered; only a later export reading changes it, and a node whose
 export last read critical is retained on silence like a critical heartbeat.
+Whether a node is still reporting is decided by the gateway's receipt of its
+heartbeats alone, measured on a monotonic clock the registry owns: silence,
+eviction and `gateway_observed`. A node's `stale` flag is set when its report
+has not moved for the TTL on the same clock: no heartbeat arrived, or none
+whose `last_seen_ms` exceeded the previous heartbeat's (a live runtime's
+advances on every heartbeat). No wall clock is read, so neither an offset node
+clock nor a step of the gateway's own wall clock makes a node stale or fresh.
+`last_seen_ms` is shown as reported. `gateway_seen_ms` is the wall-clock
+receipt, for display only. A producer-supplied `gateway_seen_ms` is admitted
+and never read.
+Verified by `TestAReportingNodeIsNeverEvictedWhateverItsClockSays`,
+`TestASilentNodeIsEvictedAtTheTTLFromItsLastReceipt`,
+`TestAWallClockStepNeitherSilencesNorHidesANode`,
+`TestProjectSiteHealthAnOffsetNodeClockIsNotStale`,
+`TestProjectSiteHealthAStuckReportGoesStaleWhileReceived`,
+`TestProjectSiteHealthASteppedBackNodeClockAdvancesAgain`,
+`TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens`,
+`TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth`,
+`TestAWallClockStepNeitherSilencesNorHidesANodeThroughGetHealth` and
+`TestRuntimeHeartbeatHandlerUpdatesRegistry`.
 An expected node the registry does not hold is degraded, and critical when
 its recorded export severity is critical.
 Verified by `TestCriticalHeartbeatKeptThroughGetHealth`,
@@ -325,7 +345,7 @@ Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestProjectSiteHealthDisabledWebhookBridgeIsInert`,
 `TestProjectSiteHealthActiveTriggerCountNotStrings`,
 `TestProjectSiteHealthNoSecretsOrURLsInJSON`,
-`TestProjectSiteHealthFutureDatedNodeIsStale`,
+`TestProjectSiteHealthAnOffsetNodeClockIsNotStale`,
 `TestProjectSiteHealthNodePosturePassedThrough`,
 `TestProjectSiteHealthNodeWithNoPostureOmitsField`,
 `TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput`,
