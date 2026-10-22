@@ -245,7 +245,7 @@ func getHealthWithGateway(t *testing.T, reg *Registry, devices []string, now tim
 // and a site with one critical and one degraded node reports critical.
 func TestCriticalHeartbeatKeptThroughGetHealth(t *testing.T) {
 	now := time.UnixMilli(1234567890000)
-	reg := freshRegistry()
+	reg := NewRegistry()
 	h, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
@@ -558,18 +558,12 @@ func TestSilentCriticalJudgedOnGatewayReceiptNotProducerClock(t *testing.T) {
 }
 
 // #126 through the real entry points: a healthy node reporting every half TTL
-// with its clock 200 s behind or 2 s ahead is never evicted and never
-// unobserved in GET /health; its report reads stale only when its own clock
-// makes it older than the TTL, never fresher. Once it stops it is evicted at
-// the TTL from its last receipt.
+// with its clock 200 s behind or 2 s ahead is never evicted, never unobserved
+// and never stale in GET /health: its clock's offset is not a fault. Once it
+// stops it is evicted at the TTL from its last receipt.
 func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.T) {
 	for _, skew := range []time.Duration{-200 * time.Second, 2 * time.Second} {
 		t.Run(skew.String(), func(t *testing.T) {
-			wantStale := skew < -silenceTTL
-			wantStatus := SiteStatusHealthy
-			if wantStale {
-				wantStatus = SiteStatusDegraded
-			}
 			s := newSilenceHarness(t)
 			for range 10 {
 				payload := heartbeatMap(NodeStatusHealthy, s.clock.Wall().Add(skew).UnixMilli())
@@ -579,8 +573,8 @@ func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.
 				if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
 					t.Fatalf("a reporting node was evicted: %v", evicted)
 				}
-				if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale != wantStale || n.Status != wantStatus {
-					t.Fatalf("a reporting node: %+v, want observed, stale=%v, %s", n, wantStale, wantStatus)
+				if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale || n.Status != SiteStatusHealthy {
+					t.Fatalf("a reporting node was judged by its clock: %+v", n)
 				}
 			}
 			if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
@@ -596,22 +590,30 @@ func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.
 	}
 }
 
-// #128 through the real entry points: a forward step of the gateway's wall
-// clock between heartbeats silences no reporting node and makes none stale,
-// and a backward step hides no silence.
+// #128 through the real entry points: steps of the gateway's wall clock, with
+// the node keeping its own correct clock, make no reporting node silent or
+// stale, and a backward step hides no silence.
 func TestAWallClockStepNeitherSilencesNorHidesANodeThroughGetHealth(t *testing.T) {
 	s := newSilenceHarness(t)
-	for range 4 {
-		s.beat(NodeStatusHealthy, nil)
-		s.clock.stepWall(time.Hour)
-		if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
-			t.Fatalf("a forward wall step evicted a reporting node: %v", evicted)
-		}
-		if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale || n.Status != SiteStatusHealthy {
-			t.Fatalf("a forward wall step changed a reporting node: %+v", n)
+	nodeMS := s.clock.Wall().UnixMilli()
+	beat := func() {
+		t.Helper()
+		if err := s.h.Handle(testTopic, mustJSON(t, heartbeatMap(NodeStatusHealthy, nodeMS))); err != nil {
+			t.Fatal(err)
 		}
 	}
-	s.beat(NodeStatusHealthy, nil)
+	for _, step := range []time.Duration{time.Hour, 6 * time.Second, -4 * time.Minute, time.Hour} {
+		beat()
+		s.clock.stepWall(step)
+		if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
+			t.Fatalf("a %v wall step evicted a reporting node: %v", step, evicted)
+		}
+		nodeMS += (silenceTTL / 2).Milliseconds()
+		if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale || n.Status != SiteStatusHealthy {
+			t.Fatalf("a %v wall step changed a reporting node: %+v", step, n)
+		}
+	}
+	beat()
 	s.clock.stepWall(-2 * time.Hour)
 	if evicted, _ := s.silence(silenceTTL + time.Millisecond); len(evicted) != 1 {
 		t.Fatalf("a backward wall step hid a silence: evicted %v", evicted)

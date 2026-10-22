@@ -299,18 +299,20 @@ registered; only a later export reading changes it, and a node whose
 export last read critical is retained on silence like a critical heartbeat.
 Whether a node is still reporting is decided by the gateway's receipt of its
 heartbeats alone, measured on a monotonic clock the registry owns: silence,
-eviction and `gateway_observed`. A node's `stale` flag takes the greater of the
-receipt age and the node's own report age: how old its `last_seen_ms` was on
-the gateway's wall clock at receipt, plus the monotonic time since. A node's
-clock can make its report older, never fresher, and a later wall-clock step
-changes nothing. `last_seen_ms` is shown as reported. `gateway_seen_ms` is the
-wall-clock receipt, for display only. A producer-supplied `gateway_seen_ms` is
-admitted and never read.
+eviction and `gateway_observed`. A node's `stale` flag is set when its report
+has not moved for the TTL on the same clock: no heartbeat arrived, or none
+whose `last_seen_ms` exceeded the previous heartbeat's (a live runtime's
+advances on every heartbeat). No wall clock is read, so neither an offset node
+clock nor a step of the gateway's own wall clock makes a node stale or fresh.
+`last_seen_ms` is shown as reported. `gateway_seen_ms` is the wall-clock
+receipt, for display only. A producer-supplied `gateway_seen_ms` is admitted
+and never read.
 Verified by `TestAReportingNodeIsNeverEvictedWhateverItsClockSays`,
 `TestASilentNodeIsEvictedAtTheTTLFromItsLastReceipt`,
 `TestAWallClockStepNeitherSilencesNorHidesANode`,
-`TestProjectSiteHealthANodeClockMakesAReportOlderNeverFresher`,
+`TestProjectSiteHealthAnOffsetNodeClockIsNotStale`,
 `TestProjectSiteHealthAStuckReportGoesStaleWhileReceived`,
+`TestProjectSiteHealthASteppedBackNodeClockAdvancesAgain`,
 `TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens`,
 `TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth`,
 `TestAWallClockStepNeitherSilencesNorHidesANodeThroughGetHealth` and
@@ -343,7 +345,7 @@ Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestProjectSiteHealthDisabledWebhookBridgeIsInert`,
 `TestProjectSiteHealthActiveTriggerCountNotStrings`,
 `TestProjectSiteHealthNoSecretsOrURLsInJSON`,
-`TestProjectSiteHealthANodeClockMakesAReportOlderNeverFresher`,
+`TestProjectSiteHealthAnOffsetNodeClockIsNotStale`,
 `TestProjectSiteHealthNodePosturePassedThrough`,
 `TestProjectSiteHealthNodeWithNoPostureOmitsField`,
 `TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput`,

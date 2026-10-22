@@ -31,6 +31,11 @@ type NodeHeartbeat struct {
 	// receivedMono is the same receipt on the registry's monotonic clock.
 	// Liveness, silence and eviction are measured on it alone.
 	receivedMono time.Duration
+	// advancedMono is the receipt, on the same clock, of the latest heartbeat
+	// whose last_seen_ms was greater than the previous heartbeat's: when the
+	// node's report last moved. A live runtime's last_seen_ms advances on
+	// every heartbeat, so a report that stops moving is stale.
+	advancedMono time.Duration
 }
 
 // receiptClock reads the wall clock and a monotonic clock separately. A
@@ -96,6 +101,13 @@ func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
 	defer r.mu.Unlock()
 	heartbeat.GatewaySeen = r.clock.wall().UnixMilli()
 	heartbeat.receivedMono = r.clock.mono()
+	heartbeat.advancedMono = heartbeat.receivedMono
+	// A report moves when last_seen_ms passes the previous heartbeat's, not
+	// the highest ever seen: a runtime clock stepped back once moves again
+	// with its next heartbeat.
+	if previous, ok := r.nodes[heartbeat.DeviceID]; ok && heartbeat.LastSeenMS <= previous.LastSeenMS {
+		heartbeat.advancedMono = previous.advancedMono
+	}
 	if heartbeat.Evidence != nil {
 		track, ok := r.evidence[heartbeat.DeviceID]
 		if !ok {
@@ -277,14 +289,11 @@ func receiptStale(heartbeat NodeHeartbeat, now, ttl time.Duration) bool {
 	return now-heartbeat.receivedMono > ttl
 }
 
-// reportStale reports whether the node's last report is older than ttl at
-// monotonic time now, taking the greater of the receiver's and the producer's
-// intervals: the time since the gateway received it, and that plus how old
-// the node's own last_seen_ms already was on the gateway's wall clock when it
-// arrived. A producer can make its report look older, never fresher, and the
-// gateway's wall clock is read only at receipt, so a later step in it changes
-// nothing. A node exactly at the TTL boundary is not stale.
+// reportStale reports whether the node's report has not moved for longer than
+// ttl at monotonic time now: no heartbeat arrived, or none whose last_seen_ms
+// advanced. It reads only the monotonic clock, so no wall-clock step on the
+// gateway or the node's clock offset makes a report stale or fresh. A node
+// exactly at the TTL boundary is not stale.
 func reportStale(heartbeat NodeHeartbeat, now, ttl time.Duration) bool {
-	ageAtReceipt := time.Duration(max(heartbeat.GatewaySeen-heartbeat.LastSeenMS, 0)) * time.Millisecond
-	return now-heartbeat.receivedMono > ttl-ageAtReceipt
+	return now-heartbeat.advancedMono > ttl
 }

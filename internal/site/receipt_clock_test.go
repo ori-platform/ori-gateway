@@ -54,10 +54,3 @@ func (c *fakeReceiptClock) stepWall(d time.Duration) {
 func (c *fakeReceiptClock) registry() *Registry {
 	return NewRegistryWithClock(c.Wall, c.Mono)
 }
-
-// freshRegistry receives every heartbeat at the start of the wall clock, so no
-// report reads older than its node's own last_seen_ms says: for tests that are
-// not about a report's age.
-func freshRegistry() *Registry {
-	return newFakeReceiptClock(0).registry()
-}

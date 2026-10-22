@@ -20,7 +20,7 @@ func healthyGateway() GatewayView {
 }
 
 func TestProjectSiteHealthAllNodesHealthy(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	nowMS := int64(10000)
 	ttlMS := int64(5000)
 
@@ -119,7 +119,7 @@ func TestProjectSiteHealthStaleAtTTLBoundary(t *testing.T) {
 }
 
 func TestProjectSiteHealthMissingNode(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-present", Status: NodeStatusHealthy, LastSeenMS: 9900})
 
 	p := NewProjector(reg, ProjectOptions{
@@ -151,7 +151,7 @@ func TestProjectSiteHealthMissingNode(t *testing.T) {
 }
 
 func TestProjectSiteHealthGatewayDegradedStatus(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
 
 	p := NewProjector(reg, ProjectOptions{
@@ -169,7 +169,7 @@ func TestProjectSiteHealthGatewayDegradedStatus(t *testing.T) {
 }
 
 func TestProjectSiteHealthEvidenceDeliveryFailureDegradesSite(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	p := NewProjector(reg, ProjectOptions{})
 	gw := healthyGateway()
 	gw.EvidenceDelivery = &GatewayEvidenceDeliveryView{
@@ -191,7 +191,7 @@ func TestProjectSiteHealthEvidenceDeliveryFailureDegradesSite(t *testing.T) {
 }
 
 func TestProjectSiteHealthNodeDegradedStatus(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusDegraded, LastSeenMS: 9900})
 
 	p := NewProjector(reg, ProjectOptions{
@@ -212,7 +212,7 @@ func TestProjectSiteHealthNodeDegradedStatus(t *testing.T) {
 }
 
 func TestProjectSiteHealthDisabledWebhookBridgeIsInert(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
 
 	p := NewProjector(reg, ProjectOptions{
@@ -233,7 +233,7 @@ func TestProjectSiteHealthDisabledWebhookBridgeIsInert(t *testing.T) {
 }
 
 func TestProjectSiteHealthActiveTriggerCountNotStrings(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{
 		DeviceID:       "node-a",
 		Status:         NodeStatusHealthy,
@@ -262,7 +262,7 @@ func TestProjectSiteHealthActiveTriggerCountNotStrings(t *testing.T) {
 }
 
 func TestProjectSiteHealthNoSecretsOrURLsInJSON(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{
 		DeviceID:       "node-a",
 		Status:         NodeStatusHealthy,
@@ -305,37 +305,53 @@ func TestProjectSiteHealthNoSecretsOrURLsInJSON(t *testing.T) {
 	}
 }
 
-// A node's clock makes its report older, never fresher (#126): a node
-// reporting with its clock ahead of the gateway's is not stale, one 200 s
-// behind is stale but still observed, and silence past the TTL is stale
-// whatever last_seen_ms claims.
-func TestProjectSiteHealthANodeClockMakesAReportOlderNeverFresher(t *testing.T) {
+// A node's clock never decides staleness (#126): a node reporting with its
+// clock ahead of the gateway's, or 200 s behind it, is not stale while its
+// report advances, and silence past the TTL is stale whatever last_seen_ms
+// claims.
+func TestProjectSiteHealthAnOffsetNodeClockIsNotStale(t *testing.T) {
 	const (
 		nowMS = int64(1_800_000_000_000)
 		ttlMS = int64(60000)
 	)
-	for name, tc := range map[string]struct {
-		lastSeen  int64
-		wantStale bool
-	}{
-		"2 s ahead":    {nowMS + 2000, false},
-		"200 s behind": {nowMS - 200_000, true},
-	} {
+	for name, offset := range map[string]int64{"2 s ahead": 2000, "200 s behind": -200_000} {
 		t.Run(name, func(t *testing.T) {
 			clock := newFakeReceiptClock(nowMS)
 			reg := clock.registry()
-			reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: tc.lastSeen})
 			p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: ttlMS})
-
-			n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]
-			if n.Stale != tc.wantStale || !n.GatewayObserved || n.LastSeenMS != tc.lastSeen {
-				t.Fatalf("a reporting node: %+v, want stale=%v, observed, last_seen_ms as reported", n, tc.wantStale)
+			for range 5 {
+				lastSeen := clock.Wall().UnixMilli() + offset
+				reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: lastSeen})
+				clock.advance(30 * time.Second)
+				n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]
+				if n.Stale || !n.GatewayObserved || n.LastSeenMS != lastSeen {
+					t.Fatalf("a reporting node: %+v, want not stale, observed, last_seen_ms as reported", n)
+				}
 			}
-			clock.advance(time.Duration(ttlMS+1) * time.Millisecond)
+			clock.advance(time.Duration(ttlMS) * time.Millisecond)
 			if n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]; !n.Stale {
 				t.Fatalf("a node silent past the TTL is not stale: %+v", n)
 			}
 		})
+	}
+}
+
+// A runtime clock stepped back once moves again with its next heartbeat: a
+// report advances when last_seen_ms passes the previous heartbeat's, not the
+// highest ever seen.
+func TestProjectSiteHealthASteppedBackNodeClockAdvancesAgain(t *testing.T) {
+	const ttlMS = int64(5000)
+	clock := newFakeReceiptClock(10_000)
+	reg := clock.registry()
+	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: ttlMS})
+	lastSeen := int64(1_000_000)
+	for _, step := range []int64{1000, 1000, -3_600_000, 1000, 1000, 1000, 1000, 1000, 1000, 1000} {
+		lastSeen += step
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: lastSeen})
+		clock.advance(time.Second)
+		if n := p.Project(clock.Wall(), healthyGateway()).Nodes[0]; n.Stale {
+			t.Fatalf("a node whose clock was stepped back once reads stale while it advances again: %+v", n)
+		}
 	}
 }
 
@@ -382,7 +398,7 @@ func TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens(t *testing.T) {
 }
 
 func TestProjectSiteHealthNoExpectedNodes(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 
 	p := NewProjector(reg, ProjectOptions{
 		ExpectedDeviceIDs: []string{},
@@ -399,7 +415,7 @@ func TestProjectSiteHealthNoExpectedNodes(t *testing.T) {
 }
 
 func TestProjectSiteHealthNodePosturePassedThrough(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
 	reg.UpsertPosture("node-a", SiteNodePosture{
 		BrokerHardening: &SiteNodeBrokerPosture{Available: true, RequiresACLHardening: true},
@@ -428,7 +444,7 @@ func TestProjectSiteHealthNodePosturePassedThrough(t *testing.T) {
 }
 
 func TestProjectSiteHealthNodeWithNoPostureOmitsField(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
 
 	p := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000})
@@ -451,7 +467,7 @@ func TestProjectSiteHealthNodeWithNoPostureOmitsField(t *testing.T) {
 }
 
 func TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: NodeStatusHealthy, LastSeenMS: 9900})
 	reg.UpsertPosture("node-a", SiteNodePosture{
 		BrokerHardening: &SiteNodeBrokerPosture{Available: true},
@@ -474,7 +490,7 @@ func TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput(t *testing.T) {
 }
 
 func TestSiteHealthViewerInterface(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	// Projector must satisfy the Viewer interface.
 	var _ Viewer = NewProjector(reg, ProjectOptions{})
 }
@@ -501,7 +517,7 @@ func TestExportSeverityOnlyRaisesANode(t *testing.T) {
 	}
 	for heartbeat, bySeverity := range want {
 		for severity, status := range bySeverity {
-			reg := freshRegistry()
+			reg := NewRegistry()
 			reg.Upsert(NodeHeartbeat{DeviceID: "node-a", Status: heartbeat, LastSeenMS: nowMS - 100})
 			reg.UpsertPosture("node-a", SiteNodePosture{ExportSeverity: severity})
 			h := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a"}, NodeTTLMS: 5000}).
@@ -650,7 +666,7 @@ func TestAnUnobservedNodeKeepsItsRecordedExportSeverity(t *testing.T) {
 // arrive for evicted nodes: the projection copies the recorded severities
 // under the registry's lock. It guards under -race.
 func TestProjectionReadsSeverityUnderTheLock(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	projector := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{"node-a", "node-b"}, NodeTTLMS: 5000})
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

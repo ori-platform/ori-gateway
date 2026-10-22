@@ -58,7 +58,7 @@ func TestRuntimeHeartbeatHandlerUpdatesRegistry(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatHandlerRejectsTopicPayloadDeviceMismatch(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	handler, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestRuntimeHeartbeatHandlerRejectsTopicPayloadDeviceMismatch(t *testing.T) 
 }
 
 func TestRuntimeHeartbeatHandlerRejectsInvalidStatus(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	handler, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestRuntimeHeartbeatHandlerRejectsInvalidStatus(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatHandlerVerifiesSignedHeartbeat(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	now := time.UnixMilli(1234567890000)
 	verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "site-local-secret", Now: func() time.Time { return now }})
 	if err != nil {
@@ -133,7 +133,7 @@ func TestRuntimeHeartbeatHandlerVerifiesSignedHeartbeat(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatHandlerRejectsUnsignedWhenAuthEnabled(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "site-local-secret"})
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestRuntimeHeartbeatHandlerRejectsUnsignedWhenAuthEnabled(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatHandlerRejectsReplayedHeartbeat(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	now := time.UnixMilli(1234567890000)
 	verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: "site-local-secret", Now: func() time.Time { return now }})
 	if err != nil {
@@ -197,7 +197,7 @@ func runtimeHeartbeatPayload(t *testing.T, beat contracts.RuntimeNodeHeartbeat) 
 }
 
 func TestRuntimeHeartbeatHandlerRejectsFarFutureLastSeen(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	now := time.UnixMilli(1234567890000)
 	handler, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return now }})
 	if err != nil {
@@ -220,7 +220,7 @@ func TestRuntimeHeartbeatHandlerRejectsFarFutureLastSeen(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatHandlerIgnoresUnknownFields(t *testing.T) {
-	reg := freshRegistry()
+	reg := NewRegistry()
 	handler, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{})
 	if err != nil {
 		t.Fatal(err)
