@@ -176,9 +176,30 @@ class CheckWorkflowsTest(unittest.TestCase):
         for ref in ("feature-x", "v4", "a" * 39):
             with self.subTest(ref):
                 text = job().replace(f"actions/setup-go@{SHA}", f"actions/setup-go@{ref}")
-                self.assertRefused(workflow(text), "not pinned to a full commit SHA")
+                self.assertRefused(workflow(text), "not an action pinned to a full commit SHA")
                 race_text = race().replace(f"actions/checkout@{SHA}", f"actions/checkout@{ref}")
                 self.assertRefused(workflow(race_text), "may only use")
+
+    def test_a_local_action_is_refused(self) -> None:
+        # Its own steps, and any cgo setting they declare, are outside the guard.
+        self.assertRefused(workflow(job() + "      - uses: ./.github/actions/build\n"), "not an action pinned")
+
+    def test_an_explicit_tag_is_refused(self) -> None:
+        for value in ('!!omap [CGO_ENABLED: "1"]', '!!str "0"'):
+            with self.subTest(value):
+                text = job() + f"      - run: go build ./...\n        env: {value}\n"
+                self.assertRefused(workflow(text), "explicit YAML tags")
+
+    def test_a_setting_of_another_type_is_refused_with_its_reason(self) -> None:
+        text = job() + "      - run: go build ./...\n        env:\n          CGO_ENABLED: {a: b}\n"
+        self.assertRefused(workflow(text), "job test must set CGO_ENABLED")
+        listed = race().replace("      - run: go mod verify\n", "      - run: go mod verify\n      - run: [go build ./...]\n")
+        self.assertRefused(workflow(listed), "may only run")
+
+    def test_a_setting_spelled_in_another_case_is_refused(self) -> None:
+        for step in ('      - run: go build ./...\n        env:\n          cgo_enabled: "1"\n', "      - run: cgo_enabled=1 go build ./...\n"):
+            with self.subTest(step):
+                self.assertRefused(workflow(job() + step), "job test must set CGO_ENABLED")
 
     def test_a_race_job_on_another_runner_is_refused(self) -> None:
         self.assertRefused(workflow(race().replace("runs-on: ubuntu-latest", "runs-on: self-hosted")), "must run on ubuntu-latest")

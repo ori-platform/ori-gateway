@@ -877,8 +877,9 @@ supply chain integrity here has direct impact on device actuation decisions.
    `scripts/check_workflows.py` checks these declared settings per job. It
    reads each workflow as YAML with PyYAML, from the hash-locked CI
    requirements. It refuses what it cannot parse, and what GitHub could read
-   differently: duplicate keys and `<<` merge keys. It also refuses a job that
-   calls a reusable workflow. It cannot read what a shell command does at run
+   differently: duplicate keys, `<<` merge keys and explicit tags. It also
+   refuses a job that calls a reusable workflow and a step that uses a local
+   action, since their steps are outside it. It cannot read what a shell command does at run
    time; a script that writes `CGO_ENABLED` to `$GITHUB_ENV`, for example, is
    left to review.
 

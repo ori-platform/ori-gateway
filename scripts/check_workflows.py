@@ -20,7 +20,7 @@ REMOTE_EXEC_RE = re.compile(
     r"(?:curl|wget)\b[^\n]*(?:\|\s*(?:bash|sh|python\d*)|&&\s*(?:bash|sh|python\d*)\b)",
     re.IGNORECASE,
 )
-CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*=\s*[\"']?([^\"'\s;&|]*)")
+CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*=\s*[\"']?([^\"'\s;&|]*)", re.IGNORECASE)
 # Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
 CGO_PASS_THROUGH = {"$CGO_ENABLED", "${CGO_ENABLED}"}
 # The race detector needs cgo, so one job in ci.yml, which only runs tests,
@@ -63,7 +63,7 @@ def _cgo_settings(value: object):
     """Every value CGO_ENABLED is declared with anywhere in value: as a key, or as an assignment in a string."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if key == "CGO_ENABLED":
+            if str(key).upper() == "CGO_ENABLED":
                 yield item
             yield from _cgo_settings(item)
     elif isinstance(value, list):
@@ -115,6 +115,11 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
     refused rather than read past.
     """
     try:
+        # An explicit tag (!!omap, !!pairs, ...) builds values this guard does
+        # not walk, and GitHub may read it differently: refuse every one.
+        if any(isinstance(token, yaml.TagToken) for token in yaml.scan(text)):
+            failures.append(f"{path}: explicit YAML tags are not allowed")
+            return
         workflow = yaml.load(text, Loader=_StrictLoader)
     except yaml.YAMLError as err:
         failures.append(f"{path}: cannot parse as YAML: {err}")
@@ -138,8 +143,9 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
             continue
         for step in job.get("steps") or []:
             action = step.get("uses") if isinstance(step, dict) else None
-            if action is not None and not (str(action).startswith("./") or PINNED_ACTION_RE.match(str(action))):
-                failures.append(f"{path}: job {name} uses {action}, not pinned to a full commit SHA")
+            # A local action's own steps are outside this guard, so none is used.
+            if action is not None and not PINNED_ACTION_RE.match(str(action)):
+                failures.append(f"{path}: job {name} uses {action}, not an action pinned to a full commit SHA")
         if path.name == RACE_WORKFLOW and name == RACE_JOB:
             _check_race_job(path, name, job, failures)
         else:
@@ -152,7 +158,7 @@ def _check_cgo_off(path: Path, name: str, job: dict, failures: list[str]) -> Non
     if (
         not isinstance(env, dict)
         or env.get("CGO_ENABLED") != "0"
-        or any(v != "0" and v not in CGO_PASS_THROUGH for v in settings)
+        or any(not isinstance(v, str) or (v != "0" and v not in CGO_PASS_THROUGH) for v in settings)
     ):
         failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env, and nowhere to anything else")
 
@@ -184,7 +190,7 @@ def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> No
                 failures.append(f"{path}: job {name} passes {action} inputs outside {sorted(allowed)}")
         elif "with" in step:
             failures.append(f"{path}: job {name} has inputs on a step that uses no action")
-    if "go test -race ./..." not in runs or any(r not in RACE_JOB_RUNS for r in runs):
+    if "go test -race ./..." not in runs or any(not isinstance(r, str) or r not in RACE_JOB_RUNS for r in runs):
         failures.append(f"{path}: job {name} may only run {sorted(RACE_JOB_RUNS)}")
 
 
