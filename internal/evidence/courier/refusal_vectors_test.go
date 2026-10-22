@@ -628,9 +628,12 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 			// machine outran an observation that must land before a
 			// back-off elapses; nothing was observed, so it is played again.
 			play := func() (observed string, inconclusive bool) {
-				// stepBound is the wait of the step being played: short only
-				// for the step a pin expects to deviate.
-				stepBound := eventBound
+				// absenceBound is how long the step being played waits for a
+				// hold or an archive, the expectations a pin observes absent:
+				// short only for the step a pin expects to deviate. Every
+				// other wait is for an event that must arrive, and keeps
+				// eventBound.
+				absenceBound := eventBound
 				dir := filepath.Join(t.TempDir(), "queue")
 				authority := newVectorAuthority()
 				channel, err := NewHTTPChannel(HTTPChannelOptions{
@@ -693,7 +696,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					// observed; an artifact that leaves its lane anyway has left
 					// custody, which is reported as its own deviation.
 					waitArchived := func(label string) string {
-						released := waitUntilWithin(stepBound, func() bool {
+						released := waitUntilWithin(absenceBound, func() bool {
 							_, listed := laneEntry(worker, key)
 							return q.LenLane(key) == 0 && !listed
 						})
@@ -775,10 +778,10 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 							worker.NotifyDevice(key.Device)
 						}
 						release()
-						if !waitUntilWithin(stepBound, func() bool { return authority.attempts(key) == before+1 }) {
+						if !waitUntil(func() bool { return authority.attempts(key) == before+1 }) {
 							return fmt.Sprintf("%s: %d attempts, want one", label, authority.attempts(key)-before)
 						}
-						if otherWaits && !waitUntilWithin(stepBound, func() bool { return authority.attempts(other) == otherBefore+1 }) {
+						if otherWaits && !waitUntil(func() bool { return authority.attempts(other) == otherBefore+1 }) {
 							return fmt.Sprintf("%s: the other lane was retried %d times on the handoff, want once", label, authority.attempts(other)-otherBefore)
 						}
 					case "handoff":
@@ -809,7 +812,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					}
 					switch step.Expect {
 					case "retained":
-						if !waitUntilWithin(stepBound, func() bool { _, ok := laneEntry(worker, key); return ok }) {
+						if !waitUntil(func() bool { _, ok := laneEntry(worker, key); return ok }) {
 							return label + ": no outcome recorded"
 						}
 						entry, _ := laneEntry(worker, key)
@@ -817,12 +820,12 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 							return fmt.Sprintf("%s: not retained, state %s", label, entry.State)
 						}
 					case "held":
-						if !waitUntilWithin(stepBound, func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
+						if !waitUntilWithin(absenceBound, func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
 							e, _ := laneEntry(worker, key)
 							return fmt.Sprintf("%s: not held, state %s", label, e.State)
 						}
 					case "retired":
-						if !waitUntilWithin(stepBound, func() bool { return q.LenLane(key) == 0 }) {
+						if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
 							return label + ": not retired"
 						}
 					case "no_attempt":
@@ -890,7 +893,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 							return fmt.Sprintf("%s: same bytes %v, fresh envelope %v", label, sameBytes, fresh)
 						}
 						if step.Response != nil && step.Response.Status == http.StatusOK && step.Then == "" {
-							if !waitUntilWithin(stepBound, func() bool { return q.LenLane(key) == 0 }) {
+							if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
 								return label + ": not retired"
 							}
 						}
@@ -901,7 +904,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 								if d := waitArchived(label); d != "" {
 									return d
 								}
-							} else if !waitUntilWithin(stepBound, func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
+							} else if !waitUntilWithin(absenceBound, func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
 								return label + ": not held"
 							}
 						}
@@ -917,7 +920,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					switch step.Then {
 					case "":
 					case "retained":
-						if !waitUntilWithin(stepBound, func() bool {
+						if !waitUntil(func() bool {
 							e, ok := laneEntry(worker, key)
 							return ok && e.State != DeviceHeld && q.LenLane(key) == 1
 						}) {
@@ -925,7 +928,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 							return fmt.Sprintf("%s: then not retained, state %s", label, e.State)
 						}
 					case "retired":
-						if !waitUntilWithin(stepBound, func() bool { return q.LenLane(key) == 0 }) {
+						if !waitUntil(func() bool { return q.LenLane(key) == 0 }) {
 							return label + ": then not retired"
 						}
 					case "archived":
@@ -945,9 +948,9 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					return ""
 				}
 				for i, step := range seq.Steps {
-					stepBound = eventBound
+					absenceBound = eventBound
 					if i == deviating {
-						stepBound = pinnedAbsenceBound
+						absenceBound = pinnedAbsenceBound
 					}
 					observed = runStep(i, step)
 					// An attempt before its deadline, in any lane, is a

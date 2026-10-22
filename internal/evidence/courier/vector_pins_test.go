@@ -72,10 +72,11 @@ func waitUntil(cond func() bool) bool {
 	return waitUntilWithin(eventBound, cond)
 }
 
-// pinnedAbsenceBound is how long the step a pin expects to deviate waits. A
-// pinned deviation is mostly an expected event that never arrives, so its
-// wait ends by timing out; it need not wait out eventBound. A pin that now
-// conforms is still seen, on any machine its event reaches within the bound.
+// pinnedAbsenceBound is how long a hold or an archive is waited for in the
+// step a pin expects to deviate. Those pins observe the expectation absent, so
+// the wait ends by timing out and need not last eventBound; every other wait
+// in that step keeps eventBound. A pin that now conforms is still seen on any
+// machine that reaches the hold or archive within the bound.
 const pinnedAbsenceBound = 2 * time.Second
 
 // pinnedStep is the step number a pinned sequence's observed deviation names,

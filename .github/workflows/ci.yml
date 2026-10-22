@@ -34,14 +34,15 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Guard supply-chain invariants
-        run: python3 scripts/check_workflows.py && python3 scripts/test_check_workflows.py
-
       - name: Verify module integrity
         run: go mod verify && (cd tools && go mod verify)
 
       - name: Install pre-commit (hash-locked)
         run: pip install --require-hashes -r .ci/requirements-precommit.txt
+
+      # The guard reads workflows with PyYAML, installed hash-locked above.
+      - name: Guard supply-chain invariants
+        run: python3 scripts/check_workflows.py && python3 scripts/test_check_workflows.py
 
       - name: Pre-commit (format + hygiene)
         env:

@@ -863,14 +863,18 @@ supply chain integrity here has direct impact on device actuation decisions.
 8. `go mod verify` must run before any build or test step. This verifies the
    integrity of the module cache against `go.sum` checksums.
 
-9. Every job in every workflow must set `CGO_ENABLED=0` at job level. The
-   gateway has no CGO dependency. The one exception is the `race` job in
-   `ci.yml`: the race detector needs cgo, so that job sets `CGO_ENABLED=1`
-   once. It sets no keys but `name`, `runs-on`, `env` and `steps`, so it has
-   no permissions of its own. It uses only the harden-runner, checkout and
-   setup-go actions, and runs only `go mod verify` and `go test -race ./...`.
-   `scripts/check_workflows.py` enforces this per job. It refuses a jobs block
-   or job header it cannot parse, and a job that calls a reusable workflow.
+9. Every job in every workflow must set `CGO_ENABLED=0` in its job `env`. No
+   step may set it to anything else. The gateway has no CGO dependency. The one
+   exception is the `race` job in `ci.yml`: the race detector needs cgo, so
+   that job sets `CGO_ENABLED=1`. Its `env` is exactly that, `GOFLAGS:
+   -mod=readonly` and an empty `GONOSUMCHECK`. It sets no keys but `name`,
+   `runs-on`, `env` and `steps`, so it has no permissions of its own, and its
+   steps set only `name`, `uses`, `with` and `run`. It uses only the
+   harden-runner, checkout and setup-go actions, with their listed inputs, and
+   runs only `go mod verify` and `go test -race ./...`.
+   `scripts/check_workflows.py` enforces this per job. It reads each workflow
+   as YAML, with PyYAML from the hash-locked CI requirements, and refuses a
+   workflow it cannot parse and a job that calls a reusable workflow.
 
 10. `go.sum` must be committed and kept up to date. Never bypass sum verification.
 

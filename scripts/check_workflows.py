@@ -9,6 +9,8 @@ import re
 import sys
 from pathlib import Path
 
+import yaml
+
 WORKFLOW_DIR = Path(".github/workflows")
 PRE_COMMIT_CONFIG = Path(".pre-commit-config.yaml")
 SHA_RE = re.compile(r"uses:\s*[^\s#]+@[0-9a-f]{40}(?:\s*#.*)?$")
@@ -18,22 +20,22 @@ REMOTE_EXEC_RE = re.compile(
     r"(?:curl|wget)\b[^\n]*(?:\|\s*(?:bash|sh|python\d*)|&&\s*(?:bash|sh|python\d*)\b)",
     re.IGNORECASE,
 )
-JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):$")
-JOB_KEY_RE = re.compile(r"^    ([A-Za-z0-9_-]+):")
-CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*[:=]\s*[\"']?([^\"'\s]*)")
-STEP_RUN_RE = re.compile(r"^\s+(?:-\s+)?run:\s*(.*?)\s*$")
-STEP_USES_RE = re.compile(r"^\s+(?:-\s+)?uses:\s*(\S+)")
+CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*=\s*[\"']?([^\"'\s;&|]*)")
+# Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
+CGO_PASS_THROUGH = {"$CGO_ENABLED", "${CGO_ENABLED}"}
 # The race detector needs cgo, so one job in ci.yml, which only runs tests,
-# may enable it. It is held to exactly what it needs.
+# may enable it. Every part of it is held to exactly what it needs.
 RACE_WORKFLOW = "ci.yml"
 RACE_JOB = "race"
 RACE_JOB_KEYS = {"name", "runs-on", "env", "steps"}
+RACE_JOB_ENV = {"CGO_ENABLED": "1", "GOFLAGS": "-mod=readonly", "GONOSUMCHECK": ""}
+RACE_STEP_KEYS = {"name", "uses", "with", "run"}
 RACE_JOB_RUNS = {"go mod verify", "go test -race ./..."}
-RACE_JOB_ACTIONS = (
-    "step-security/harden-runner@",
-    "actions/checkout@",
-    "actions/setup-go@",
-)
+RACE_JOB_ACTIONS = {
+    "step-security/harden-runner@": {"egress-policy"},
+    "actions/checkout@": set(),
+    "actions/setup-go@": {"go-version-file", "cache"},
+}
 
 
 def _workflow_files() -> list[Path]:
@@ -70,71 +72,86 @@ def _check_pre_commit_config(failures: list[str]) -> None:
             )
 
 
-def _jobs(path: Path, text: str, failures: list[str]) -> list[tuple[str, list[str]]]:
-    """Split a workflow's jobs block into (job id, job lines) pairs.
-
-    Full-line comments are dropped first. Anything in the block that is not a
-    plain job header, or a jobs key written any other way, is refused rather
-    than read past, so no job escapes the checks below.
-    """
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
-    starts = [i for i, line in enumerate(lines) if re.match(r"^jobs\b", line)]
-    if not starts:
-        return []
-    if len(starts) > 1 or lines[starts[0]].rstrip() != "jobs:":
-        failures.append(f"{path}: cannot parse the jobs block; write it as a plain 'jobs:' line")
-        return []
-    jobs: list[tuple[str, list[str]]] = []
-    for line in lines[starts[0] + 1 :]:
-        if not line.strip():
-            continue
-        if not line.startswith(" "):
-            break
-        if not line.startswith("   "):
-            header = JOB_HEADER_RE.match(line.rstrip())
-            if not header:
-                failures.append(f"{path}: cannot parse job header {line.strip()!r}")
-                return []
-            jobs.append((header.group(1), []))
-            continue
-        if not jobs:
-            failures.append(f"{path}: cannot parse the jobs block")
-            return []
-        jobs[-1][1].append(line)
-    return jobs
-
-
 def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
-    """Every job sets CGO_ENABLED=0, except ci.yml's test-only race job, which sets 1."""
-    top = re.search(r"^jobs\b", text, re.MULTILINE)
-    if CGO_SETTING_RE.search(text[: top.start()] if top else text):
+    """Every job sets CGO_ENABLED=0, except ci.yml's test-only race job, which sets 1.
+
+    The workflow is read as YAML, so comments, aliases and folded lines mean
+    what they mean to GitHub. Anything that is not the expected shape is
+    refused rather than read past.
+    """
+    try:
+        workflow = yaml.safe_load(text)
+    except yaml.YAMLError as err:
+        failures.append(f"{path}: cannot parse as YAML: {err}")
+        return
+    if not isinstance(workflow, dict):
+        failures.append(f"{path}: cannot parse: not a mapping")
+        return
+    if "CGO_ENABLED" in (workflow.get("env") or {}):
         failures.append(f"{path}: set CGO_ENABLED per job, not for the whole workflow")
-    for job, lines in _jobs(path, text, failures):
-        keys = [m.group(1) for m in map(JOB_KEY_RE.match, lines) if m]
-        if "uses" in keys:
-            failures.append(f"{path}: job {job} calls a reusable workflow, which this guard cannot check")
+    jobs = workflow.get("jobs") or {}
+    if not isinstance(jobs, dict):
+        failures.append(f"{path}: cannot parse the jobs block")
+        return
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            failures.append(f"{path}: cannot parse job {name!r}")
             continue
-        # Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
-        values = [
-            v
-            for line in lines
-            for v in CGO_SETTING_RE.findall(line)
-            if v not in {"$CGO_ENABLED", "${CGO_ENABLED}"}
-        ]
-        if path.name != RACE_WORKFLOW or job != RACE_JOB:
-            if not values or any(v != "0" for v in values):
-                failures.append(f"{path}: job {job} must set CGO_ENABLED to 0")
+        if "uses" in job:
+            failures.append(f"{path}: job {name} calls a reusable workflow, which this guard cannot check")
             continue
-        if values != ["1"]:
-            failures.append(f"{path}: job {job} must set CGO_ENABLED to 1 exactly once")
-        if extra := sorted(set(keys) - RACE_JOB_KEYS):
-            failures.append(f"{path}: job {job} may set only {sorted(RACE_JOB_KEYS)}, not {extra}")
-        runs = [m.group(1) for m in map(STEP_RUN_RE.match, lines) if m]
-        if "go test -race ./..." not in runs or any(r not in RACE_JOB_RUNS for r in runs):
-            failures.append(f"{path}: job {job} may only run {sorted(RACE_JOB_RUNS)}")
-        actions = [m.group(1) for m in map(STEP_USES_RE.match, lines) if m]
-        if any(not a.startswith(RACE_JOB_ACTIONS) for a in actions):
-            failures.append(f"{path}: job {job} may only use {list(RACE_JOB_ACTIONS)}")
+        if path.name == RACE_WORKFLOW and name == RACE_JOB:
+            _check_race_job(path, name, job, failures)
+        else:
+            _check_cgo_off(path, name, job, failures)
+
+
+def _check_cgo_off(path: Path, name: str, job: dict, failures: list[str]) -> None:
+    env = job.get("env")
+    steps = job.get("steps") or []
+    if not isinstance(env, dict) or env.get("CGO_ENABLED") != "0" or not isinstance(steps, list):
+        failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env")
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            failures.append(f"{path}: job {name} has a step this guard cannot parse")
+            continue
+        step_env = step.get("env") or {}
+        if not isinstance(step_env, dict) or step_env.get("CGO_ENABLED", "0") != "0":
+            failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env")
+        run = step.get("run")
+        if run is not None and any(
+            v not in CGO_PASS_THROUGH and v != "0" for v in CGO_SETTING_RE.findall(str(run))
+        ):
+            failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env")
+
+
+def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> None:
+    if extra := sorted(set(job) - RACE_JOB_KEYS):
+        failures.append(f"{path}: job {name} may set only {sorted(RACE_JOB_KEYS)}, not {extra}")
+    if job.get("env") != RACE_JOB_ENV:
+        failures.append(f"{path}: job {name} env must be exactly {RACE_JOB_ENV}")
+    steps = job.get("steps")
+    if not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps):
+        failures.append(f"{path}: job {name} has steps this guard cannot parse")
+        return
+    runs = []
+    for step in steps:
+        if extra := sorted(set(step) - RACE_STEP_KEYS):
+            failures.append(f"{path}: job {name} steps may set only {sorted(RACE_STEP_KEYS)}, not {extra}")
+        if "run" in step:
+            runs.append(step["run"])
+        if "uses" in step:
+            action = str(step["uses"])
+            allowed = next((keys for prefix, keys in RACE_JOB_ACTIONS.items() if action.startswith(prefix)), None)
+            if allowed is None:
+                failures.append(f"{path}: job {name} may only use {sorted(RACE_JOB_ACTIONS)}")
+            elif not isinstance(step.get("with") or {}, dict) or set(step.get("with") or {}) - allowed:
+                failures.append(f"{path}: job {name} passes {action} inputs outside {sorted(allowed)}")
+        elif "with" in step:
+            failures.append(f"{path}: job {name} has inputs on a step that uses no action")
+    if "go test -race ./..." not in runs or any(r not in RACE_JOB_RUNS for r in runs):
+        failures.append(f"{path}: job {name} may only run {sorted(RACE_JOB_RUNS)}")
 
 
 def main() -> int:
