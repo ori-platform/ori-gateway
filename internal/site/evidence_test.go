@@ -29,7 +29,7 @@ func evidenceBeat(deviceID, head string, gaps int, available bool) NodeHeartbeat
 }
 
 func TestRegistryEvidenceNormalAdvanceRaisesNoFlags(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	for seed := range byte(5) {
 		reg.Upsert(evidenceBeat("dev-01", headHash(seed), 0, true))
 	}
@@ -43,7 +43,7 @@ func TestRegistryEvidenceNormalAdvanceRaisesNoFlags(t *testing.T) {
 }
 
 func TestRegistryEvidenceEmptyHeadOnNewDeviceIsNormal(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(evidenceBeat("dev-01", "", 0, true))
 	got := reg.Snapshot()[0].Evidence
 	if got.TruncationSuspected {
@@ -52,7 +52,7 @@ func TestRegistryEvidenceEmptyHeadOnNewDeviceIsNormal(t *testing.T) {
 }
 
 func TestRegistryEvidenceDetectsTruncationAndStaysSticky(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 0, true))
 	reg.Upsert(evidenceBeat("dev-01", "", 0, true)) // chain reset underneath the runtime
 
@@ -70,7 +70,7 @@ func TestRegistryEvidenceDetectsTruncationAndStaysSticky(t *testing.T) {
 }
 
 func TestRegistryEvidenceDetectsHeadRegression(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 0, true))
 	reg.Upsert(evidenceBeat("dev-01", headHash(2), 0, true))
 	reg.Upsert(evidenceBeat("dev-01", headHash(3), 0, true))
@@ -114,7 +114,7 @@ func TestRegistryEvidenceMemoryIsPerDeviceAndClearedOnEviction(t *testing.T) {
 }
 
 func TestRegistryEvidenceOmissionAfterHistoryMarksUnavailable(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 0, true))
 	// The next heartbeat omits the evidence block entirely: this must not
 	// silently downgrade the node to "no evidence surface".
@@ -148,7 +148,7 @@ func TestRegistryEvidenceOmissionAfterHistoryMarksUnavailable(t *testing.T) {
 }
 
 func TestRegistryEvidenceOmissionWithoutHistoryStaysNil(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(NodeHeartbeat{
 		DeviceID:   "dev-01",
 		Status:     NodeStatusHealthy,
@@ -160,7 +160,7 @@ func TestRegistryEvidenceOmissionWithoutHistoryStaysNil(t *testing.T) {
 }
 
 func TestRegistrySnapshotClonesEvidence(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 0, true))
 	first := reg.Snapshot()[0].Evidence
 	first.TruncationSuspected = true
@@ -170,7 +170,7 @@ func TestRegistrySnapshotClonesEvidence(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatHandlerAcceptsAndValidatesEvidence(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	handler, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{
 		Now: func() time.Time { return time.UnixMilli(1234567895000) },
 	})
@@ -259,7 +259,7 @@ func TestProjectorDegradesNodeOnEvidenceIntegrityFlags(t *testing.T) {
 		},
 	}
 	for name, drive := range cases {
-		reg := NewRegistry()
+		reg := freshRegistry()
 		drive(reg)
 
 		projector := NewProjector(reg, ProjectOptions{
@@ -279,7 +279,7 @@ func TestProjectorDegradesNodeOnEvidenceIntegrityFlags(t *testing.T) {
 }
 
 func TestProjectorGapCountAloneStaysInformational(t *testing.T) {
-	reg := NewRegistry()
+	reg := freshRegistry()
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 3, true))
 	projector := NewProjector(reg, ProjectOptions{
 		ExpectedDeviceIDs: []string{"dev-01"},

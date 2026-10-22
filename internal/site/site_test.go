@@ -5,6 +5,7 @@ package site
 
 import (
 	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -34,9 +35,9 @@ func TestEvictStaleRemovesANodeTheGatewayHasNotHeardFrom(t *testing.T) {
 	if len(evicted) != 1 {
 		t.Fatalf("expected one eviction, got %d", len(evicted))
 	}
-	got := evicted[0]
-	if got.DeviceID != "node-stale" || got.Status != "ok" || got.LastSeenMS != 5 || got.GatewaySeen != 10 {
-		t.Fatalf("unexpected evicted heartbeat: %#v", got)
+	want := NodeHeartbeat{DeviceID: "node-stale", Status: "ok", LastSeenMS: 5, GatewaySeen: 10, ActiveTriggers: []string{}}
+	if !reflect.DeepEqual(evicted[0], want) {
+		t.Fatalf("unexpected evicted heartbeat: %#v", evicted[0])
 	}
 	if snapshot := reg.Snapshot(); len(snapshot) != 0 {
 		t.Fatalf("expected empty registry, got %d nodes", len(snapshot))

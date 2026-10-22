@@ -531,9 +531,14 @@ A node that goes silent after a `healthy` or `degraded` heartbeat, with no
 `critical` export, is dropped from the registry after three heartbeat
 intervals and shows as unobserved and `degraded`, as before.
 
-Every node's `stale` flag in `GET /health`, and its eviction, follow the same
-rule: receipt age on the gateway's monotonic clock, never the node's
-`last_seen_ms`, which is shown as the node reported it.
+Every node's eviction and `gateway_observed` follow the same rule: receipt age
+on the gateway's monotonic clock. Its `stale` flag in `GET /health` takes the
+greater of that and the age of the node's own report: how old its
+`last_seen_ms` was on the gateway's clock when the heartbeat arrived, plus the
+time since. A node whose clock runs behind, or whose `last_seen_ms` stops
+advancing while it keeps publishing, shows `stale` and `degraded` but stays
+observed and is never evicted while it reports. A node whose clock runs ahead
+is not made fresher by it. `last_seen_ms` is shown as the node reported it.
 
 The retention has no time limit, because any time limit would be critical
 decaying through silence. It is bounded instead by the configured devices:

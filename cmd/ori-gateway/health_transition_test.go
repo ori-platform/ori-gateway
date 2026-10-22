@@ -237,7 +237,7 @@ func TestHealthTransitionReachesSiteHealthAndTheWeeklyReport(t *testing.T) {
 				}
 				runtime.answer(decodeVectorItem(t, tc.Item), false)
 
-				registry := site.NewRegistry()
+				registry, _ := newTestReceiptRegistry(now.UnixMilli())
 				registry.Upsert(site.NodeHeartbeat{DeviceID: tc.RequestedDeviceID, Status: site.NodeStatusHealthy, LastSeenMS: now.UnixMilli()})
 				fetchAndUpsertPosture(context.Background(), rc, registry, tc.RequestedDeviceID, logger)
 				projection := site.NewProjector(registry, site.ProjectOptions{
@@ -308,7 +308,7 @@ func TestACriticalExportSurvivesHeartbeatsAndAFailedFetch(t *testing.T) {
 
 	now := time.UnixMilli(1_787_000_003_000)
 	secrets := gatewayAuthSecrets{Enabled: true, CurrentSecret: healthTransitionSecret}
-	registry := site.NewRegistry()
+	registry, _ := newTestReceiptRegistry(now.UnixMilli())
 	heartbeats, err := runtimeHeartbeatHandlerFromSecrets(secrets, registry, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +460,7 @@ func TestARunningGatewayKeepsACriticalExportThroughAFailedFetch(t *testing.T) {
 	fb := newFakeBroker()
 	deps := baseDeps(t, cfg, fb, &fakeProvider{healthy: true}, newFakeHeartbeat())
 	now := deps.now()
-	registry := site.NewRegistry()
+	registry, _ := newTestReceiptRegistry(now.UnixMilli())
 	deps.newSiteRegistry = func() *site.Registry { return registry }
 	runtime := &exportRuntime{t: t, now: now, handlers: map[string]broker.MessageHandler{}}
 	runtime.answer(decodeVectorItem(t, items["later_critical_true"]), false)

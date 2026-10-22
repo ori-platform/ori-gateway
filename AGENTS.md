@@ -297,18 +297,23 @@ projected member. The registry keeps it through every heartbeat, a failed
 fetch and eviction, and records a reading that arrives while the node is not
 registered; only a later export reading changes it, and a node whose
 export last read critical is retained on silence like a critical heartbeat.
-Whether a node is still reporting, its `stale` flag, silence and eviction
-included, is decided by the gateway's receipt of its heartbeats alone,
-measured on a monotonic clock the registry owns. A node's `last_seen_ms` is
-shown as reported and decides nothing, and a wall-clock step neither silences
-nor freshens a node. `gateway_seen_ms` is the wall-clock receipt, for display
-only. A producer-supplied `gateway_seen_ms` is admitted and never read.
+Whether a node is still reporting is decided by the gateway's receipt of its
+heartbeats alone, measured on a monotonic clock the registry owns: silence,
+eviction and `gateway_observed`. A node's `stale` flag takes the greater of the
+receipt age and the node's own report age: how old its `last_seen_ms` was on
+the gateway's wall clock at receipt, plus the monotonic time since. A node's
+clock can make its report older, never fresher, and a later wall-clock step
+changes nothing. `last_seen_ms` is shown as reported. `gateway_seen_ms` is the
+wall-clock receipt, for display only. A producer-supplied `gateway_seen_ms` is
+admitted and never read.
 Verified by `TestAReportingNodeIsNeverEvictedWhateverItsClockSays`,
 `TestASilentNodeIsEvictedAtTheTTLFromItsLastReceipt`,
 `TestAWallClockStepNeitherSilencesNorHidesANode`,
-`TestProjectSiteHealthNodeClockNeverDecidesStaleness`,
+`TestProjectSiteHealthANodeClockMakesAReportOlderNeverFresher`,
+`TestProjectSiteHealthAStuckReportGoesStaleWhileReceived`,
 `TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens`,
-`TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth` and
+`TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth`,
+`TestAWallClockStepNeitherSilencesNorHidesANodeThroughGetHealth` and
 `TestRuntimeHeartbeatHandlerUpdatesRegistry`.
 An expected node the registry does not hold is degraded, and critical when
 its recorded export severity is critical.
@@ -338,7 +343,7 @@ Verified by `TestProjectSiteHealthAllNodesHealthy`,
 `TestProjectSiteHealthDisabledWebhookBridgeIsInert`,
 `TestProjectSiteHealthActiveTriggerCountNotStrings`,
 `TestProjectSiteHealthNoSecretsOrURLsInJSON`,
-`TestProjectSiteHealthNodeClockNeverDecidesStaleness`,
+`TestProjectSiteHealthANodeClockMakesAReportOlderNeverFresher`,
 `TestProjectSiteHealthNodePosturePassedThrough`,
 `TestProjectSiteHealthNodeWithNoPostureOmitsField`,
 `TestProjectSiteHealthPostureLockoutRiskLevelsNeverInOutput`,

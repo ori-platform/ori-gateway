@@ -276,3 +276,15 @@ func (r *Registry) EvictStaleRetainingCritical(ttl time.Duration) (evicted, reta
 func receiptStale(heartbeat NodeHeartbeat, now, ttl time.Duration) bool {
 	return now-heartbeat.receivedMono > ttl
 }
+
+// reportStale reports whether the node's last report is older than ttl at
+// monotonic time now, taking the greater of the receiver's and the producer's
+// intervals: the time since the gateway received it, and that plus how old
+// the node's own last_seen_ms already was on the gateway's wall clock when it
+// arrived. A producer can make its report look older, never fresher, and the
+// gateway's wall clock is read only at receipt, so a later step in it changes
+// nothing. A node exactly at the TTL boundary is not stale.
+func reportStale(heartbeat NodeHeartbeat, now, ttl time.Duration) bool {
+	ageAtReceipt := time.Duration(max(heartbeat.GatewaySeen-heartbeat.LastSeenMS, 0)) * time.Millisecond
+	return now-heartbeat.receivedMono > ttl-ageAtReceipt
+}

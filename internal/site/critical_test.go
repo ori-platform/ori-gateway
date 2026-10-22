@@ -245,7 +245,7 @@ func getHealthWithGateway(t *testing.T, reg *Registry, devices []string, now tim
 // and a site with one critical and one degraded node reports critical.
 func TestCriticalHeartbeatKeptThroughGetHealth(t *testing.T) {
 	now := time.UnixMilli(1234567890000)
-	reg := NewRegistry()
+	reg := freshRegistry()
 	h, err := NewRuntimeHeartbeatHandler(reg, RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
@@ -558,12 +558,18 @@ func TestSilentCriticalJudgedOnGatewayReceiptNotProducerClock(t *testing.T) {
 }
 
 // #126 through the real entry points: a healthy node reporting every half TTL
-// with its clock 200 s behind or 2 s ahead is never evicted, never unobserved
-// and never stale in GET /health; once it stops it is evicted at the TTL from
-// its last receipt.
+// with its clock 200 s behind or 2 s ahead is never evicted and never
+// unobserved in GET /health; its report reads stale only when its own clock
+// makes it older than the TTL, never fresher. Once it stops it is evicted at
+// the TTL from its last receipt.
 func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.T) {
 	for _, skew := range []time.Duration{-200 * time.Second, 2 * time.Second} {
 		t.Run(skew.String(), func(t *testing.T) {
+			wantStale := skew < -silenceTTL
+			wantStatus := SiteStatusHealthy
+			if wantStale {
+				wantStatus = SiteStatusDegraded
+			}
 			s := newSilenceHarness(t)
 			for range 10 {
 				payload := heartbeatMap(NodeStatusHealthy, s.clock.Wall().Add(skew).UnixMilli())
@@ -573,8 +579,8 @@ func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.
 				if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
 					t.Fatalf("a reporting node was evicted: %v", evicted)
 				}
-				if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale || n.Status != SiteStatusHealthy {
-					t.Fatalf("a reporting node was judged by its clock: %+v", n)
+				if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale != wantStale || n.Status != wantStatus {
+					t.Fatalf("a reporting node: %+v, want observed, stale=%v, %s", n, wantStale, wantStatus)
 				}
 			}
 			if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
@@ -587,6 +593,31 @@ func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.
 				t.Fatalf("an evicted node: %+v", n)
 			}
 		})
+	}
+}
+
+// #128 through the real entry points: a forward step of the gateway's wall
+// clock between heartbeats silences no reporting node and makes none stale,
+// and a backward step hides no silence.
+func TestAWallClockStepNeitherSilencesNorHidesANodeThroughGetHealth(t *testing.T) {
+	s := newSilenceHarness(t)
+	for range 4 {
+		s.beat(NodeStatusHealthy, nil)
+		s.clock.stepWall(time.Hour)
+		if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
+			t.Fatalf("a forward wall step evicted a reporting node: %v", evicted)
+		}
+		if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale || n.Status != SiteStatusHealthy {
+			t.Fatalf("a forward wall step changed a reporting node: %+v", n)
+		}
+	}
+	s.beat(NodeStatusHealthy, nil)
+	s.clock.stepWall(-2 * time.Hour)
+	if evicted, _ := s.silence(silenceTTL + time.Millisecond); len(evicted) != 1 {
+		t.Fatalf("a backward wall step hid a silence: evicted %v", evicted)
+	}
+	if n := s.health().Nodes[0]; n.GatewayObserved {
+		t.Fatalf("a silent node is still observed after a backward wall step: %+v", n)
 	}
 }
 

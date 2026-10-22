@@ -255,9 +255,7 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			})
 			continue
 		}
-		// Whether the node is still reporting is the gateway's observation,
-		// its receipt age, never the node's own last_seen_ms.
-		stale := receiptStale(n, receiptNow, ttl)
+		stale := reportStale(n, receiptNow, ttl)
 		// The node's own status is a floor, never a ceiling: staleness and an
 		// evidence-integrity problem raise a healthy node to degraded and leave
 		// a critical one critical, and the severity read from its health
