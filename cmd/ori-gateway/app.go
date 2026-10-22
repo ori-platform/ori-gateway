@@ -214,6 +214,12 @@ func abandonStateDirectory(deps appDependencies, owner *gatewaystate.Owner, caus
 }
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+	return runCLIWith(args, stdout, stderr, defaultDependencies)
+}
+
+// runCLIWith is runCLI with the dependencies the run is given, so a test can
+// drive the whole process path, its exit status included.
+func runCLIWith(args []string, stdout io.Writer, stderr io.Writer, dependencies func() appDependencies) int {
 	flags := flag.NewFlagSet("ori-gateway", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", defaultConfigPath, "path to gateway.yaml")
@@ -229,7 +235,7 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	deps := defaultDependencies()
+	deps := dependencies()
 	if err := runGateway(ctx, *configPath, deps); err != nil {
 		// The process exits whether or not stderr takes the line: a log
 		// destination that blocks never keeps an escalation from ending it
@@ -666,7 +672,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	heartbeatAuth := heartbeatAuthFromSecrets(gatewaySecrets)
 
 	siteRegistry := deps.newSiteRegistry()
-	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromSecrets(gatewaySecrets, siteRegistry, deps.now)
+	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromSecrets(gatewaySecrets, siteRegistry, deps.now, deps.logger)
 	if err != nil {
 		shutdownRunners()
 		return err
@@ -713,6 +719,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			SharedSecret:         gatewaySecrets.CurrentSecret,
 			PreviousSharedSecret: gatewaySecrets.PreviousSecret,
 			Now:                  deps.now,
+			Logger:               deps.logger,
 		})
 		if err != nil {
 			shutdownRunners()
@@ -875,6 +882,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 				SharedSecret:         gatewaySecrets.CurrentSecret,
 				PreviousSharedSecret: gatewaySecrets.PreviousSecret,
 				Now:                  deps.now,
+				Logger:               deps.logger,
 			})
 			if err != nil {
 				shutdownRunners()
@@ -1266,6 +1274,7 @@ func runtimeHeartbeatHandlerFromSecrets(
 	secrets gatewayAuthSecrets,
 	registry *site.Registry,
 	now func() time.Time,
+	logger *slog.Logger,
 ) (*site.RuntimeHeartbeatHandler, error) {
 	var verifier *mqttauth.Verifier
 	if secrets.Enabled {
@@ -1274,6 +1283,7 @@ func runtimeHeartbeatHandlerFromSecrets(
 			SharedSecret:         secrets.CurrentSecret,
 			PreviousSharedSecret: secrets.PreviousSecret,
 			Now:                  now,
+			Logger:               logger,
 		})
 		if err != nil {
 			return nil, err

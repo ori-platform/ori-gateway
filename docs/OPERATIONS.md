@@ -763,8 +763,7 @@ runtime's decision.
 The gateway never waits on its log destination. If stderr, a pipe or journald
 stops accepting writes, the gateway keeps running, and its heartbeat and
 reasoning escalations still end the process (GW-6). Its log records queue, at
-most 64 each for the gateway, the heartbeat and the MQTT client. Later ones are
-counted, and once the destination accepts writes again a `WARN … log lines
+most 1,024. Later ones are counted, and once the destination accepts writes again a `WARN … log lines
 dropped behind a logger that blocked` line reports how many with `dropped`.
 A process ending on a heartbeat failure gives its last line about a second to
 be written.

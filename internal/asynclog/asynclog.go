@@ -16,8 +16,9 @@ import (
 
 // MaxQueued bounds the records waiting behind a logger that blocks; later
 // ones are counted, and the count is logged after the records queued before
-// them.
-const MaxQueued = 64
+// them. It is far above any burst the gateway logs to a working destination,
+// so a drop means the destination has stopped, or nearly.
+const MaxQueued = 1024
 
 // ExitFlushBound is how long a path that is about to end the process waits
 // for its queued records to be written: long enough for a working logger,
@@ -47,8 +48,14 @@ type queued struct {
 
 // New returns a logger whose records are queued for inner, and the queue that
 // writes them. droppedMessage is the line logged with the count of records
-// dropped behind a logger that blocked.
+// dropped behind a logger that blocked. An inner that is already queued keeps
+// its queue: records are queued once, so a Flush of the returned queue waits
+// for the records to reach the destination itself, and a component given the
+// gateway's logger shares the gateway's queue and its flush at exit.
 func New(inner slog.Handler, droppedMessage string) (*slog.Logger, *Queue) {
+	if queued, ok := inner.(*handler); ok {
+		return slog.New(queued), queued.queue
+	}
 	q := &Queue{counted: inner, droppedMessage: droppedMessage, idle: make(chan struct{})}
 	return slog.New(&handler{inner: inner, queue: q}), q
 }

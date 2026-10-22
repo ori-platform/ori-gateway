@@ -156,3 +156,22 @@ func TestTheInnerLevelIsHonoured(t *testing.T) {
 		t.Fatalf("got %q, want only the error", got)
 	}
 }
+
+// A logger built over one that is already queued shares its queue: a Flush of
+// either waits for the record to reach the destination, not the next queue.
+func TestAQueuedLoggerIsNeverQueuedTwice(t *testing.T) {
+	inner := newGatedHandler()
+	outer, outerQueue := New(inner, "outer dropped")
+	component, componentQueue := New(outer.Handler(), "component dropped")
+	if componentQueue != outerQueue {
+		t.Fatal("a logger over a queued one got a queue of its own")
+	}
+	component.Error("exiting")
+	if componentQueue.Flush(20 * time.Millisecond) {
+		t.Fatal("flush reported a record written that the destination has not taken")
+	}
+	close(inner.gate)
+	if !componentQueue.Flush(5*time.Second) || inner.String() != "exiting\n" {
+		t.Fatalf("flush returned before the record reached the destination: %q", inner.String())
+	}
+}

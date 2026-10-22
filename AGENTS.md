@@ -72,20 +72,26 @@ Verified by `TestHeartbeatFailureLimit`,
 `TestAReplyTheStopRefusesIsNotADeliveryFailure`,
 `TestAReplyFailingAfterTheCallerCancelsIsNotCounted`, and
 `TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted`.
-Neither escalation waits on the log destination. The gateway's logger, the
-heartbeat publisher's and the broker client's write their records off every
-caller's path through `internal/asynclog`: in order, by one drainer, at most
-64 waiting behind a logger that blocks, later ones counted. A heartbeat whose
-every log line would block still reaches its failure limit and exits, after
-giving its last line a bounded chance (`asynclog.ExitFlushBound`) to be
-written. The request escalation still ends the run. `runCLI` writes its final
-line within the same bound and exits whether or not it was taken. Site
+Neither escalation waits on the log destination. `runGateway` queues the
+gateway's logger through `internal/asynclog`: records are written off every
+caller's path, in order, by one drainer, with at most 1,024 waiting behind a
+logger that blocks and later ones counted. Every component it hands that
+logger to shares the one queue, the heartbeat publisher and the broker client
+among them. Each of those also queues any other logger it is given, and a
+replay verifier given none queues `slog.Default()`, so nothing on a callback
+or an escalation logs synchronously. A heartbeat whose every log line would
+block still reaches its failure limit and exits, after giving its last line a
+bounded chance (`asynclog.ExitFlushBound`, 1 s) to reach the destination. The
+request escalation still ends the run, and `runCLI` writes its final line
+within the same bound and exits whether or not it was taken. Site
 health reports the gateway `degraded` while its heartbeat is not going out:
 before the first one, after a failed attempt, or with none for three
 intervals. Verified by `TestALoggerThatBlocksNeverKeepsTheHeartbeatFromItsExit`,
 `TestTheExitLineIsWrittenBeforeTheHeartbeatExits`,
 `TestPublishingFollowsTheLatestAttempt`,
 `TestTheRequestEscalationEndsTheGatewayBehindALoggerThatBlocks`,
+`TestTheRequestEscalationEndsTheProcessBehindABlockedLoggerAndStderr`,
+`TestABlockedDefaultLoggerNeverHoldsAVerifierOrAStop`,
 `TestRunCLIExitsBehindAStderrThatBlocks`,
 `TestSiteHealthIsDegradedOnceHeartbeatsStop`,
 `TestALoggerThatBlocksNeverHoldsTheClientsDelivery` and the
@@ -211,7 +217,10 @@ and no further run begins in that process. A start refused while its first
 write is outstanding ends the same way. Quiescence is awaited for the whole
 bound, so a write completing just before it releases the directory; a warning
 is logged shortly before the bound, and nothing on the exit path waits on the
-logger, so a logger that blocks cannot keep the process alive.
+logger beyond a stated bound, so a logger that blocks cannot keep the process
+alive. The state-directory exit waits on it not at all. A run that ends gives
+its queued log records up to `asynclog.ExitFlushBound` (1 s) to be written, and
+`runCLI` gives its final line the same bound (GW-6).
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,

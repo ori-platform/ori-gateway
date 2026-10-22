@@ -17,6 +17,7 @@ import (
 	"time"
 
 	canonicaljson "github.com/ori-platform/ori-canonicaljson"
+	"github.com/ori-platform/ori-gateway/internal/asynclog"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 )
 
@@ -93,7 +94,10 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	}
 	logger := cfg.Logger
 	if logger == nil {
-		logger = slog.Default()
+		// A verifier runs on broker callbacks and request workers, so even
+		// the default logger is written off their path: a log destination
+		// that blocks never holds a message or a stop (GW-6).
+		logger, _ = asynclog.New(slog.Default().Handler(), "mqtt auth log lines dropped behind a logger that blocked")
 	}
 	return &Verifier{
 		sharedSecret:         secret,

@@ -6,6 +6,7 @@ package heartbeat
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -130,7 +131,15 @@ func TestPublishingFollowsTheLatestAttempt(t *testing.T) {
 
 // With a working logger, the line saying why the process ends is written
 // before it ends: the exit waits for its queued records, up to the bound.
+// It holds both for a plain logger and for one already queued, as the
+// gateway's own logger is when runGateway hands it to the publisher.
 func TestTheExitLineIsWrittenBeforeTheHeartbeatExits(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) { exitLineWrittenBeforeExit(t, queued) })
+	}
+}
+
+func exitLineWrittenBeforeExit(t *testing.T, queued bool) {
 	var mu sync.Mutex
 	var logs strings.Builder
 	handler := slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
@@ -138,6 +147,10 @@ func TestTheExitLineIsWrittenBeforeTheHeartbeatExits(t *testing.T) {
 		defer mu.Unlock()
 		return logs.Write(p)
 	}), nil)
+	logger := slog.New(handler)
+	if queued {
+		logger, _ = asynclog.New(handler, "gateway log lines dropped")
+	}
 	written := make(chan bool, 1)
 	publisher, err := NewPublisher(func(context.Context, []byte) error {
 		return errors.New("publish failed")
@@ -151,7 +164,7 @@ func TestTheExitLineIsWrittenBeforeTheHeartbeatExits(t *testing.T) {
 			default:
 			}
 		},
-		Logger: slog.New(handler),
+		Logger: logger,
 	})
 	if err != nil {
 		t.Fatal(err)
