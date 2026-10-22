@@ -307,7 +307,8 @@ Verified by `TestAReportingNodeIsNeverEvictedWhateverItsClockSays`,
 `TestASilentNodeIsEvictedAtTheTTLFromItsLastReceipt`,
 `TestAWallClockStepNeitherSilencesNorHidesANode`,
 `TestProjectSiteHealthNodeClockNeverDecidesStaleness`,
-`TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens` and
+`TestProjectSiteHealthAWallClockStepNeitherStalesNorFreshens`,
+`TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth` and
 `TestRuntimeHeartbeatHandlerUpdatesRegistry`.
 An expected node the registry does not hold is degraded, and critical when
 its recorded export severity is critical.

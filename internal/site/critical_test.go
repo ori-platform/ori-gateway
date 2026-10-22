@@ -557,6 +557,39 @@ func TestSilentCriticalJudgedOnGatewayReceiptNotProducerClock(t *testing.T) {
 	}
 }
 
+// #126 through the real entry points: a healthy node reporting every half TTL
+// with its clock 200 s behind or 2 s ahead is never evicted, never unobserved
+// and never stale in GET /health; once it stops it is evicted at the TTL from
+// its last receipt.
+func TestAReportingNodeWithASkewedClockStaysObservedThroughGetHealth(t *testing.T) {
+	for _, skew := range []time.Duration{-200 * time.Second, 2 * time.Second} {
+		t.Run(skew.String(), func(t *testing.T) {
+			s := newSilenceHarness(t)
+			for range 10 {
+				payload := heartbeatMap(NodeStatusHealthy, s.clock.Wall().Add(skew).UnixMilli())
+				if err := s.h.Handle(testTopic, mustJSON(t, payload)); err != nil {
+					t.Fatal(err)
+				}
+				if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
+					t.Fatalf("a reporting node was evicted: %v", evicted)
+				}
+				if n := s.health().Nodes[0]; !n.GatewayObserved || n.Stale || n.Status != SiteStatusHealthy {
+					t.Fatalf("a reporting node was judged by its clock: %+v", n)
+				}
+			}
+			if evicted, _ := s.silence(silenceTTL / 2); len(evicted) != 0 {
+				t.Fatalf("evicted at the TTL from its last receipt: %v", evicted)
+			}
+			if evicted, _ := s.silence(time.Millisecond); len(evicted) != 1 {
+				t.Fatalf("a node silent past the TTL from its last receipt was kept: %v", evicted)
+			}
+			if n := s.health().Nodes[0]; n.GatewayObserved || n.Status != SiteStatusDegraded {
+				t.Fatalf("an evicted node: %+v", n)
+			}
+		})
+	}
+}
+
 // memberCase is a heartbeat body as raw JSON, so case variants and duplicate
 // member names can be expressed.
 type memberCase struct {
