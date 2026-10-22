@@ -694,7 +694,9 @@ while its caller's context lasts, and 30 seconds at most without a deadline,
 so ending the run ends a shared subscribe at the transport. The export
 client's log records, its verifier's included, are written off every caller's
 path, in order, by one drainer, which also asks the logger's level, at most 64
-waiting behind a logger that blocks and later ones counted, so none of them holds an export past its bound, delays
+waiting behind a logger that blocks and later ones counted (in the gateway the
+logger is its shared queue, GW-6, which never blocks, so the records wait
+there among the 1,024 and a drop is counted there), so none of them holds an export past its bound, delays
 the release of its pending state, or holds the broker callback that delivers
 responses. An export page missing any
 envelope member (`request_id`, `export_type`, `device_id`, `items`,
@@ -797,7 +799,10 @@ last value issued. An episode is not a GW-6 heartbeat failure. The clock's log r
 under its lock, stamped then, and written in that order by one drainer off
 every lock, so no caller waits on the logger; at most 64 wait behind a
 logger that blocks, later ones are counted, and the refusal after a stop is
-logged once. A start whose
+logged once. In the gateway the logger is its shared queue (GW-6), which
+never blocks: the records wait there among the 1,024 and a drop is counted
+there, so under a long stall other components' lines can crowd out the
+clock's. A start whose
 first value would reach the ceiling is refused, and `Next` refuses a value at
 it (`ErrSigningClockExhausted`) or once stopped (`ErrSigningClockClosed`).
 Rule 9's upper bound is judged against the wall clock read when a mark is
