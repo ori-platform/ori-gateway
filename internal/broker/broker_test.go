@@ -19,9 +19,18 @@ import (
 	mqttsrv "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
+	"github.com/mochi-mqtt/server/v2/packets"
 )
 
 func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
+	t.Helper()
+	_, brokerURL, stop = startTestBrokerServer(t)
+	return brokerURL, stop
+}
+
+// startTestBrokerServer is startTestBroker, also returning the server so a
+// test can wait on what the broker itself observes.
+func startTestBrokerServer(t *testing.T) (srv *mqttsrv.Server, brokerURL string, stop func()) {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -33,7 +42,7 @@ func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
 		t.Fatal(err)
 	}
 
-	srv := mqttsrv.New(&mqttsrv.Options{
+	srv = mqttsrv.New(&mqttsrv.Options{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err := srv.AddHook(new(auth.AllowHook), nil); err != nil {
@@ -50,7 +59,7 @@ func startTestBroker(t *testing.T) (brokerURL string, stop func()) {
 		t.Fatal(err)
 	}
 
-	return "tcp://" + addr, func() {
+	return srv, "tcp://" + addr, func() {
 		// Paho's Disconnect returns before the embedded broker has necessarily
 		// completed its client-removal path. Mochi's Close may otherwise take a
 		// nested Clients read lock while that removal is waiting for the write
@@ -133,8 +142,12 @@ func TestConnectAndPublish(t *testing.T) {
 }
 
 func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *testing.T) {
-	brokerURL, stop := startTestBroker(t)
+	srv, brokerURL, stop := startTestBrokerServer(t)
 	defer stop()
+	queued := &queuedHook{clientID: "persistent-evidence-sub", queued: make(chan struct{}, 1)}
+	if err := srv.AddHook(queued, nil); err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	sub := testClient(t, brokerURL, "persistent-evidence-sub", Options{PersistentSession: true})
 	pub := testClient(t, brokerURL, "persistent-evidence-pub", Options{})
@@ -150,12 +163,31 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 	if err := sub.Disconnect(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// Disconnect returns before the broker has removed the client. Publish
+	// only once the broker has, so the message is published while the
+	// session is disconnected, as the test's name says.
+	deadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&srv.Info.ClientsConnected) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the broker never observed the subscriber disconnect")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err := pub.Connect(ctx); err != nil {
 		t.Fatal(err)
 	}
 	defer pub.Disconnect(ctx)
 	if err := pub.Publish(ctx, "ori/device-a/evidence/inbound/ack", QoSReasoning, false, []byte(`{"artifact":"authority"}`)); err != nil {
 		t.Fatal(err)
+	}
+	// The embedded broker acknowledges the publisher before it fans the
+	// message out, and a reconnect that takes the session over in between can
+	// leave the message on the session it replaced. Reconnect only once the
+	// message is queued on the subscriber's session.
+	select {
+	case <-queued.queued:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the broker never queued the message for the disconnected session")
 	}
 	if err := sub.Connect(ctx); err != nil {
 		t.Fatal(err)
@@ -166,7 +198,7 @@ func TestPersistentSessionReceivesQoSOneMessagePublishedWhileDisconnected(t *tes
 		if string(got) != `{"artifact":"authority"}` {
 			t.Fatalf("queued payload = %q", got)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("persistent evidence session lost QoS 1 message")
 	}
 }
@@ -885,5 +917,27 @@ func TestWaitTokenWithoutADeadlineIsBounded(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("a token wait without a deadline was not bounded")
+	}
+}
+
+// queuedHook reports each QoS 1 or 2 message the broker queues on clientID's
+// session, connected or not.
+type queuedHook struct {
+	mqttsrv.HookBase
+	clientID string
+	queued   chan struct{}
+}
+
+func (h *queuedHook) ID() string { return "queued-for-" + h.clientID }
+
+func (h *queuedHook) Provides(b byte) bool { return b == mqttsrv.OnQosPublish }
+
+func (h *queuedHook) OnQosPublish(cl *mqttsrv.Client, _ packets.Packet, _ int64, _ int) {
+	if cl.ID != h.clientID {
+		return
+	}
+	select {
+	case h.queued <- struct{}{}:
+	default:
 	}
 }

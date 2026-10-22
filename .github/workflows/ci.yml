@@ -34,14 +34,15 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Guard supply-chain invariants
-        run: python3 scripts/check_workflows.py
-
       - name: Verify module integrity
         run: go mod verify && (cd tools && go mod verify)
 
       - name: Install pre-commit (hash-locked)
         run: pip install --require-hashes -r .ci/requirements-precommit.txt
+
+      # The guard reads workflows with PyYAML, installed hash-locked above.
+      - name: Guard supply-chain invariants
+        run: python3 scripts/check_workflows.py && python3 scripts/test_check_workflows.py
 
       - name: Pre-commit (format + hygiene)
         env:
@@ -67,3 +68,35 @@ jobs:
             go test ./internal/evidence/courier -run '^TestADirectoryOwnedByAnotherUserIsRefused$' -count=1 -v)"
           echo "$out"
           grep -q -- '--- PASS: TestADirectoryOwnedByAnotherUserIsRefused' <<<"$out"
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+
+    # The race detector needs cgo. This job only runs tests and ships nothing;
+    # every other job keeps cgo off (scripts/check_workflows.py).
+    env:
+      CGO_ENABLED: "1"
+      GOFLAGS: "-mod=readonly"
+      GONOSUMCHECK: ""
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify module integrity
+        run: go mod verify
+
+      - name: Test with the race detector
+        run: go test -race ./...

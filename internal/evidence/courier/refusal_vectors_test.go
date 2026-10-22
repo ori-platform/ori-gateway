@@ -175,6 +175,15 @@ func quiesceLanes(worker *DeliveryWorker, keys ...LaneKey) func() {
 	}
 }
 
+// lastFailureAt is when the device's evidence lane last recorded a failed
+// attempt: the moment that attempt's outcome was decided.
+func lastFailureAt(worker *DeliveryWorker, device string) time.Time {
+	l := worker.lane(LaneKey{Device: device, Lane: LaneEvidence})
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastFailureAt
+}
+
 func laneState(worker *DeliveryWorker, device string) (DeviceDeliveryStatus, bool) {
 	return laneEntry(worker, LaneKey{Device: device, Lane: LaneEvidence})
 }
@@ -333,14 +342,18 @@ func TestRefusalPolicyVectorCases(t *testing.T) {
 			if tc.Staged != nil && !*tc.Staged {
 				sink.err = errors.New("the authority artifact could not be staged")
 			}
+			// No back-off can elapse on a clock that never moves, so an attempt
+			// beyond the expected ones is a retry the outcome forbids, however
+			// slow the machine.
+			clk := &manualClock{}
 			worker, err := NewDeliveryWorker(q, channel, sink, DeliveryWorkerOptions{
 				RetryInterval: time.Second, BlockedReminderInterval: time.Hour,
-				Logger: slog.New(slog.NewJSONHandler(logs, nil)),
+				Logger: slog.New(slog.NewJSONHandler(logs, nil)), clock: clk.clock(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			started := time.Now()
+			started := clk.now()
 			running := startWorker(t, worker)
 			if tc.Expected.Class == "retire" {
 				retired := waitUntil(func() bool { return q.Len() == 0 })
@@ -365,8 +378,20 @@ func TestRefusalPolicyVectorCases(t *testing.T) {
 				}
 				return
 			}
-			// A handoff: only a handoff-only outcome may use it.
+			// A handoff: only a handoff-only outcome may use it. That outcome
+			// is waited for until its second attempt has been decided, however
+			// slow the machine. Any other outcome must not attempt again, and
+			// the frozen clock keeps that exact however long the window takes.
+			decidedBefore := lastFailureAt(worker, device)
 			worker.NotifyDevice(device)
+			if tc.Expected.Class == "handoff" {
+				waitUntil(func() bool {
+					mu.Lock()
+					n := calls
+					mu.Unlock()
+					return n >= 2 && !lastFailureAt(worker, device).Equal(decidedBefore)
+				})
+			}
 			time.Sleep(30 * time.Millisecond)
 			running.stop()
 
@@ -619,10 +644,17 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 	const defaultDevice = "site-a-edge-01"
 	for _, seq := range vectors.Sequences {
 		t.Run(seq.Name, func(t *testing.T) {
+			deviating := pinnedStep(refusalSequencePins, seq.Name)
 			// play runs the sequence once. It is inconclusive when the
 			// machine outran an observation that must land before a
 			// back-off elapses; nothing was observed, so it is played again.
 			play := func() (observed string, inconclusive bool) {
+				// absenceBound is how long the step being played waits for a
+				// hold or an archive, the expectations a pin observes absent:
+				// short only for the step a pin expects to deviate. Every
+				// other wait is for an event that must arrive, and keeps
+				// eventBound.
+				absenceBound := eventBound
 				dir := filepath.Join(t.TempDir(), "queue")
 				authority := newVectorAuthority()
 				channel, err := NewHTTPChannel(HTTPChannelOptions{
@@ -685,7 +717,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					// observed; an artifact that leaves its lane anyway has left
 					// custody, which is reported as its own deviation.
 					waitArchived := func(label string) string {
-						released := waitUntil(func() bool {
+						released := waitUntilWithin(absenceBound, func() bool {
 							_, listed := laneEntry(worker, key)
 							return q.LenLane(key) == 0 && !listed
 						})
@@ -809,7 +841,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 							return fmt.Sprintf("%s: not retained, state %s", label, entry.State)
 						}
 					case "held":
-						if !waitUntil(func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
+						if !waitUntilWithin(absenceBound, func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
 							e, _ := laneEntry(worker, key)
 							return fmt.Sprintf("%s: not held, state %s", label, e.State)
 						}
@@ -893,7 +925,7 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 								if d := waitArchived(label); d != "" {
 									return d
 								}
-							} else if !waitUntil(func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
+							} else if !waitUntilWithin(absenceBound, func() bool { e, ok := laneEntry(worker, key); return ok && e.State == DeviceHeld }) {
 								return label + ": not held"
 							}
 						}
@@ -937,6 +969,10 @@ func TestRefusalPolicyVectorSequences(t *testing.T) {
 					return ""
 				}
 				for i, step := range seq.Steps {
+					absenceBound = eventBound
+					if i == deviating {
+						absenceBound = pinnedAbsenceBound
+					}
 					observed = runStep(i, step)
 					// An attempt before its deadline, in any lane, is a
 					// violation, and a violation is never inconclusive.

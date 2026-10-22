@@ -125,12 +125,12 @@ func (s *lockedSink) Store(_ context.Context, artifact AuthorityArtifact) error 
 	return nil
 }
 
-func laneWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, logs *syncBuffer, retry time.Duration) *DeliveryWorker {
+func laneWorker(t *testing.T, q *DurableQueue, authority http.RoundTripper, logs *syncBuffer, retry time.Duration, clocks ...*manualClock) *DeliveryWorker {
 	t.Helper()
-	return laneWorkerSink(t, q, authority, logs, retry, &lockedSink{})
+	return laneWorkerSink(t, q, authority, logs, retry, &lockedSink{}, clocks...)
 }
 
-func laneWorkerSink(t *testing.T, q *DurableQueue, authority http.RoundTripper, logs *syncBuffer, retry time.Duration, sink AuthoritySink) *DeliveryWorker {
+func laneWorkerSink(t *testing.T, q *DurableQueue, authority http.RoundTripper, logs *syncBuffer, retry time.Duration, sink AuthoritySink, clocks ...*manualClock) *DeliveryWorker {
 	t.Helper()
 	channel, err := NewHTTPChannel(HTTPChannelOptions{
 		Endpoint: fakeAuthorityURL, ClientID: "site-a-gateway",
@@ -143,9 +143,13 @@ func laneWorkerSink(t *testing.T, q *DurableQueue, authority http.RoundTripper, 
 	if logs != nil {
 		handler = slog.NewJSONHandler(logs, nil)
 	}
-	worker, err := NewDeliveryWorker(q, channel, sink, DeliveryWorkerOptions{
+	opts := DeliveryWorkerOptions{
 		RetryInterval: retry, MaxBackoff: 8 * retry, BlockedReminderInterval: time.Hour, Logger: slog.New(handler),
-	})
+	}
+	for _, c := range clocks {
+		opts.clock = c.clock()
+	}
+	worker, err := NewDeliveryWorker(q, channel, sink, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,9 +365,10 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 	}
 	enqueueEnvelopes(t, q, "dev-a", 1, 2)
 	envelope, _ := q.PeekLane(evLane)
-	// The back-off is the delivery interval: long enough that stopping,
-	// reopening and restarting fall well inside it on any machine.
-	worker := laneWorker(t, q, authority, nil, time.Second)
+	// Both processes read one clock that moves only when the test advances
+	// it, so stopping, reopening and restarting take no time on it.
+	clk := &manualClock{}
+	worker := laneWorker(t, q, authority, nil, time.Second, clk)
 	running := startWorker(t, worker)
 	waitFor(t, "the persisted back-off", func() bool { _, ok := q.BackoffFor(registration.ID); return ok })
 	waitFor(t, "the persisted hold", func() bool { _, ok := q.HoldFor(envelope.ID); return ok })
@@ -374,7 +379,7 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 	if !ok {
 		t.Fatal("the registration's back-off was not persisted")
 	}
-	next := laneWorker(t, reopened, authority, nil, time.Second)
+	next := laneWorker(t, reopened, authority, nil, time.Second, clk)
 	reg, okReg := laneEntry(next, regLane)
 	ev, okEv := laneEntry(next, evLane)
 	if !okReg || reg.State != DeviceBackingOff || reg.Pending != 1 {
@@ -385,17 +390,23 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 	}
 	startWorker(t, next)
 	next.NotifyDevice("dev-a")
-	// Observe before the persisted back-off elapses: an attempt then is the
-	// restart sending early, and one after it is the back-off doing its job.
-	notBefore := time.UnixMilli(persisted.NotBeforeMS)
-	time.Sleep(min(100*time.Millisecond, time.Until(notBefore)-50*time.Millisecond))
-	if time.Now().After(notBefore) {
-		t.Fatal("setup outlasted the persisted back-off, so the restart was not observed before it")
-	}
+	// The clock has not moved, so any attempt is the restart sending early.
+	time.Sleep(100 * time.Millisecond)
 	if authority.count(regLane) != 1 || authority.count(evLane) != 1 {
 		t.Fatalf("restart sent early: registration %d, envelope %d", authority.count(regLane), authority.count(evLane))
 	}
+	// A millisecond short of the persisted deadline still forbids it.
+	notBefore := time.UnixMilli(persisted.NotBeforeMS)
+	clk.advance(notBefore.Sub(clk.now()) - time.Millisecond)
+	next.NotifyDevice("dev-a")
+	time.Sleep(50 * time.Millisecond)
+	if authority.count(regLane) != 1 {
+		t.Fatalf("restart sent a millisecond early: registration %d", authority.count(regLane))
+	}
+	// At the deadline the restored back-off's own timer retries it, with no
+	// handoff to prompt it.
 	authority.set(regLane, nil)
+	clk.advance(time.Millisecond)
 	waitFor(t, "the registration after its back-off", func() bool { return reopened.LenLane(regLane) == 0 })
 	time.Sleep(50 * time.Millisecond)
 	if authority.count(evLane) != 1 || reopened.LenLane(evLane) != 2 {

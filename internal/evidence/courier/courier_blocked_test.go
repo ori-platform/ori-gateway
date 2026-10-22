@@ -174,9 +174,14 @@ func (r *runningWorker) stop() {
 	})
 }
 
+const eventBound = 10 * time.Second
+
+// waitFor waits for the event cond observes. The bound only turns a hang into
+// a failure: it is sized for a loaded machine, where reopening a queue alone
+// has taken seconds, and no assertion depends on how long the event took.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(eventBound)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)

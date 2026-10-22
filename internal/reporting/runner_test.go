@@ -4,9 +4,11 @@
 package reporting
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,148 +41,173 @@ func TestNextRunUsesSiteLocalSchedule(t *testing.T) {
 }
 
 func TestWeeklyReportRunnerLogsFailureAndContinues(t *testing.T) {
-	runtime := &runtimeclient.FakeClient{HealthSnapshot: runtimeclient.HealthSnapshot{DeviceID: "edge-1"}}
-	provider := &fakeProvider{err: errors.New("provider unavailable")}
-	generator := newGenerator(t, runtime, provider)
-	trigger := make(chan time.Time, 3)
-	now := time.Date(2026, 6, 8, 7, 0, 0, 0, time.UTC)
-	runner, err := NewWeeklyReportRunner(
-		generator,
-		WeeklyReportRequest{DeviceID: "edge-1", SensorIDs: []string{"current-main"}},
-		Schedule{Weekday: time.Monday, Hour: 8, Minute: 0, Location: time.UTC},
-		RunnerOptions{Logger: slog.New(slog.NewTextHandler(testDiscard{}, nil)), Now: func() time.Time { return now }, After: func(time.Duration) <-chan time.Time { return trigger }},
-	)
-	if err != nil {
-		t.Fatal(err)
+	provider := &scriptedProvider{outcomes: []error{errors.New("provider unavailable"), nil}, calls: make(chan struct{}, 3)}
+	spy := &spyDeliverer{delivered: make(chan WeeklyReportArtifact, 3)}
+	h := startRunner(t, provider, spy)
+
+	h.trigger <- h.now
+	receive(t, provider.calls, "first provider call")
+	h.trigger <- h.now
+	receive(t, provider.calls, "second provider call")
+	receive(t, spy.delivered, "delivery after the provider recovered")
+	logs := h.stop(t)
+
+	if got := strings.Count(logs, "weekly report generation failed"); got != 1 {
+		t.Fatalf("generation failures logged = %d, want 1:\n%s", got, logs)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
-	trigger <- now
-	for provider.calls == 0 {
-		time.Sleep(time.Millisecond)
+	if !strings.Contains(logs, "provider unavailable") {
+		t.Fatalf("generation failure logged without its error:\n%s", logs)
 	}
-	provider.err = nil
-	provider.report = ProviderReport{Text: "ok", Provider: "fake", Model: "m"}
-	trigger <- now
-	for provider.calls < 2 {
-		time.Sleep(time.Millisecond)
-	}
-	cancel()
-	trigger <- now
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("got %v, want context.Canceled", err)
-	}
+	assertNoMore(t, provider.calls, spy.delivered)
 }
 
 func TestWeeklyReportRunnerCallsDeliverers(t *testing.T) {
-	runtime := &runtimeclient.FakeClient{HealthSnapshot: runtimeclient.HealthSnapshot{DeviceID: "edge-1"}}
-	provider := &fakeProvider{report: ProviderReport{Text: "all good", Provider: "fake", Model: "m"}}
-	generator := newGenerator(t, runtime, provider)
+	provider := &scriptedProvider{outcomes: []error{nil}, calls: make(chan struct{}, 3)}
+	spy := &spyDeliverer{delivered: make(chan WeeklyReportArtifact, 3)}
+	h := startRunner(t, provider, spy)
 
-	var delivered []WeeklyReportArtifact
-	spy := &spyDeliverer{fn: func(a WeeklyReportArtifact) { delivered = append(delivered, a) }}
+	h.trigger <- h.now
+	artifact := receive(t, spy.delivered, "delivery")
+	h.stop(t)
 
-	trigger := make(chan time.Time, 2)
-	now := time.Date(2026, 6, 8, 7, 0, 0, 0, time.UTC)
-	runner, err := NewWeeklyReportRunner(
-		generator,
-		WeeklyReportRequest{DeviceID: "edge-1", SensorIDs: []string{"current-main"}},
-		Schedule{Weekday: time.Monday, Hour: 8, Minute: 0, Location: time.UTC},
-		RunnerOptions{
-			Logger:     slog.New(slog.NewTextHandler(testDiscard{}, nil)),
-			Now:        func() time.Time { return now },
-			After:      func(time.Duration) <-chan time.Time { return trigger },
-			Deliverers: []Deliverer{spy},
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
+	if artifact.DeviceID != "edge-1" {
+		t.Errorf("artifact DeviceID = %q, want edge-1", artifact.DeviceID)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
-
-	trigger <- now
-	deadline := time.Now().Add(2 * time.Second)
-	for len(delivered) == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if artifact.Text != "all good" {
+		t.Errorf("artifact Text = %q, want the provider's report", artifact.Text)
 	}
-	cancel()
-	<-done
-
-	if len(delivered) == 0 {
-		t.Fatal("expected deliverer to be called at least once")
-	}
-	if delivered[0].DeviceID != "edge-1" {
-		t.Errorf("artifact DeviceID = %q, want edge-1", delivered[0].DeviceID)
-	}
+	<-provider.calls
+	assertNoMore(t, provider.calls, spy.delivered)
 }
 
 func TestWeeklyReportRunnerContinuesAfterDeliveryFailure(t *testing.T) {
+	provider := &scriptedProvider{outcomes: []error{nil, nil}, calls: make(chan struct{}, 3)}
+	failing := &spyDeliverer{delivered: make(chan WeeklyReportArtifact, 3), err: errors.New("disk full")}
+	h := startRunner(t, provider, failing)
+
+	// Fire two ticks; runner must survive both even though delivery fails each time.
+	h.trigger <- h.now
+	receive(t, failing.delivered, "first delivery")
+	h.trigger <- h.now
+	receive(t, failing.delivered, "second delivery")
+	logs := h.stop(t)
+
+	if got := strings.Count(logs, "weekly report delivery failed"); got != 2 {
+		t.Fatalf("delivery failures logged = %d, want 2:\n%s", got, logs)
+	}
+	<-provider.calls
+	<-provider.calls
+	assertNoMore(t, provider.calls, failing.delivered)
+}
+
+// runnerHarness runs a WeeklyReportRunner whose schedule fires only when the
+// test sends on trigger. Its log is read only after Run has returned, which
+// orders every write before the read.
+type runnerHarness struct {
+	trigger chan time.Time
+	now     time.Time
+	cancel  context.CancelFunc
+	done    chan error
+	logs    *bytes.Buffer
+}
+
+func startRunner(t *testing.T, provider *scriptedProvider, deliverer Deliverer) *runnerHarness {
+	t.Helper()
 	runtime := &runtimeclient.FakeClient{HealthSnapshot: runtimeclient.HealthSnapshot{DeviceID: "edge-1"}}
-	provider := &fakeProvider{report: ProviderReport{Text: "all good", Provider: "fake", Model: "m"}}
-	generator := newGenerator(t, runtime, provider)
-
-	callCount := 0
-	failing := &spyDeliverer{fn: func(_ WeeklyReportArtifact) { callCount++ }, err: errors.New("disk full")}
-
-	trigger := make(chan time.Time, 3)
-	now := time.Date(2026, 6, 8, 7, 0, 0, 0, time.UTC)
+	generator, err := NewWeeklyReportGenerator(runtime, provider, WithNow(fixedNow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &runnerHarness{
+		trigger: make(chan time.Time, 1),
+		now:     time.Date(2026, 6, 8, 7, 0, 0, 0, time.UTC),
+		done:    make(chan error, 1),
+		logs:    &bytes.Buffer{},
+	}
 	runner, err := NewWeeklyReportRunner(
 		generator,
 		WeeklyReportRequest{DeviceID: "edge-1", SensorIDs: []string{"current-main"}},
 		Schedule{Weekday: time.Monday, Hour: 8, Minute: 0, Location: time.UTC},
 		RunnerOptions{
-			Logger:     slog.New(slog.NewTextHandler(testDiscard{}, nil)),
-			Now:        func() time.Time { return now },
-			After:      func(time.Duration) <-chan time.Time { return trigger },
-			Deliverers: []Deliverer{failing},
+			Logger:     slog.New(slog.NewTextHandler(h.logs, nil)),
+			Now:        func() time.Time { return h.now },
+			After:      func(time.Duration) <-chan time.Time { return h.trigger },
+			Deliverers: []Deliverer{deliverer},
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
+	h.cancel = cancel
+	go func() { h.done <- runner.Run(ctx) }()
+	t.Cleanup(cancel)
+	return h
+}
 
-	// Fire two ticks; runner must survive both even though delivery fails each time.
-	trigger <- now
-	deadline := time.Now().Add(2 * time.Second)
-	for callCount < 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	trigger <- now
-	deadline = time.Now().Add(2 * time.Second)
-	for callCount < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-
-	cancel()
-	trigger <- now
-	if err := <-done; !errors.Is(err, context.Canceled) {
+// stop cancels the runner, which is then waiting on a trigger that never
+// fires, and returns its log once Run has returned context.Canceled.
+func (h *runnerHarness) stop(t *testing.T) string {
+	t.Helper()
+	h.cancel()
+	if err := receive(t, h.done, "Run to return"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
-	if callCount < 2 {
-		t.Errorf("deliverer called %d times, want at least 2", callCount)
+	return h.logs.String()
+}
+
+// receive waits for the event on ch. The bound only turns a hang into a
+// failure; no assertion depends on how long the event took.
+func receive[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
 	}
+}
+
+// assertNoMore checks, once Run has returned, that no call or delivery
+// happened beyond those the test received.
+func assertNoMore(t *testing.T, calls <-chan struct{}, delivered <-chan WeeklyReportArtifact) {
+	t.Helper()
+	if n := len(calls); n != 0 {
+		t.Fatalf("%d unexpected provider calls", n)
+	}
+	if n := len(delivered); n != 0 {
+		t.Fatalf("%d unexpected deliveries", n)
+	}
+}
+
+// scriptedProvider answers its nth call with outcomes[n], a nil outcome being
+// a report, and announces each call on calls, an unscripted one included, so
+// a test sees every call. Only the runner's goroutine touches outcomes.
+type scriptedProvider struct {
+	outcomes []error
+	calls    chan struct{}
+}
+
+func (p *scriptedProvider) GenerateWeeklyReport(context.Context, WeeklyReportInput) (ProviderReport, error) {
+	p.calls <- struct{}{}
+	if len(p.outcomes) == 0 {
+		return ProviderReport{}, errors.New("scriptedProvider: unscripted call")
+	}
+	err := p.outcomes[0]
+	p.outcomes = p.outcomes[1:]
+	if err != nil {
+		return ProviderReport{}, err
+	}
+	return ProviderReport{Text: "all good", Provider: "fake", Model: "m"}, nil
 }
 
 type spyDeliverer struct {
-	fn  func(WeeklyReportArtifact)
-	err error
+	delivered chan WeeklyReportArtifact
+	err       error
 }
 
 func (s *spyDeliverer) Deliver(_ context.Context, a WeeklyReportArtifact) error {
-	if s.fn != nil {
-		s.fn(a)
-	}
+	s.delivered <- a
 	return s.err
 }
-
-type testDiscard struct{}
-
-func (testDiscard) Write(p []byte) (int, error) { return len(p), nil }

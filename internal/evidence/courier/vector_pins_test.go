@@ -4,6 +4,7 @@
 package courier
 
 import (
+	"fmt"
 	"regexp"
 	"testing"
 	"time"
@@ -66,9 +67,34 @@ func checkPinsExist(t *testing.T, pins map[string]vectorPin, names []string) {
 
 // waitUntil reports whether cond held within the harness's wait, without
 // failing: a behaviour that never arrives is a deviation to report, not a
-// harness fault.
+// harness fault. Its bound is waitFor's.
 func waitUntil(cond func() bool) bool {
-	deadline := time.Now().Add(2 * time.Second)
+	return waitUntilWithin(eventBound, cond)
+}
+
+// pinnedAbsenceBound is how long a hold or an archive is waited for in the
+// step a pin expects to deviate. Those pins observe the expectation absent, so
+// the wait ends by timing out and need not last eventBound; every other wait
+// in that step keeps eventBound. A pin that now conforms is still seen on any
+// machine that reaches the hold or archive within the bound.
+const pinnedAbsenceBound = 2 * time.Second
+
+// pinnedStep is the step number a pinned sequence's observed deviation names,
+// or -1 for a sequence that is not pinned.
+func pinnedStep(pins map[string]vectorPin, name string) int {
+	pin, ok := pins[name]
+	if !ok {
+		return -1
+	}
+	var step int
+	if _, err := fmt.Sscanf(pin.Observed, "step %d ", &step); err != nil {
+		return -1
+	}
+	return step
+}
+
+func waitUntilWithin(bound time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(bound)
 	for !cond() {
 		if time.Now().After(deadline) {
 			return false
