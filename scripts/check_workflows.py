@@ -30,7 +30,8 @@ RACE_JOB = "race"
 RACE_JOB_KEYS = {"name", "runs-on", "env", "steps"}
 RACE_JOB_ENV = {"CGO_ENABLED": "1", "GOFLAGS": "-mod=readonly", "GONOSUMCHECK": ""}
 RACE_STEP_KEYS = {"name", "uses", "with", "run"}
-RACE_JOB_RUNS = {"go mod verify", "go test -race ./..."}
+# Module integrity is verified before any test runs (supply-chain rule 8).
+RACE_JOB_RUNS = ["go mod verify", "go test -race ./..."]
 RACE_JOB_RUNNER = "ubuntu-latest"
 RACE_JOB_ACTIONS = {
     "step-security/harden-runner": {"egress-policy"},
@@ -134,6 +135,8 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
     if not isinstance(jobs, dict):
         failures.append(f"{path}: cannot parse the jobs block")
         return
+    if path.name == RACE_WORKFLOW and RACE_JOB not in jobs:
+        failures.append(f"{path}: must keep the {RACE_JOB} job, so CI runs the race detector")
     for name, job in jobs.items():
         if not isinstance(job, dict):
             failures.append(f"{path}: cannot parse job {name!r}")
@@ -190,8 +193,8 @@ def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> No
                 failures.append(f"{path}: job {name} passes {action} inputs outside {sorted(allowed)}")
         elif "with" in step:
             failures.append(f"{path}: job {name} has inputs on a step that uses no action")
-    if "go test -race ./..." not in runs or any(not isinstance(r, str) or r not in RACE_JOB_RUNS for r in runs):
-        failures.append(f"{path}: job {name} may only run {sorted(RACE_JOB_RUNS)}")
+    if runs != RACE_JOB_RUNS:
+        failures.append(f"{path}: job {name} may only run, in order, {RACE_JOB_RUNS}")
 
 
 def main() -> int:

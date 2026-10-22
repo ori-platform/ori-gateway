@@ -872,8 +872,8 @@ supply chain integrity here has direct impact on device actuation decisions.
    and an empty `GONOSUMCHECK`. It sets no keys but `name`, `runs-on`, `env`
    and `steps`, so it has no permissions of its own, and its steps set only
    `name`, `uses`, `with` and `run`. It uses only the SHA-pinned harden-runner,
-   checkout and setup-go actions, with their listed inputs, and runs only
-   `go mod verify` and `go test -race ./...`.
+   checkout and setup-go actions, with their listed inputs, and runs exactly
+   `go mod verify`, then `go test -race ./...`. `ci.yml` must keep the job.
    `scripts/check_workflows.py` checks these declared settings per job. It
    reads each workflow as YAML with PyYAML, from the hash-locked CI
    requirements. It refuses what it cannot parse, and what GitHub could read

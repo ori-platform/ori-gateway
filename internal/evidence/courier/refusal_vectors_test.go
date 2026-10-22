@@ -175,6 +175,15 @@ func quiesceLanes(worker *DeliveryWorker, keys ...LaneKey) func() {
 	}
 }
 
+// lastFailureAt is when the device's evidence lane last recorded a failed
+// attempt: the moment that attempt's outcome was decided.
+func lastFailureAt(worker *DeliveryWorker, device string) time.Time {
+	l := worker.lane(LaneKey{Device: device, Lane: LaneEvidence})
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastFailureAt
+}
+
 func laneState(worker *DeliveryWorker, device string) (DeviceDeliveryStatus, bool) {
 	return laneEntry(worker, LaneKey{Device: device, Lane: LaneEvidence})
 }
@@ -369,8 +378,20 @@ func TestRefusalPolicyVectorCases(t *testing.T) {
 				}
 				return
 			}
-			// A handoff: only a handoff-only outcome may use it.
+			// A handoff: only a handoff-only outcome may use it. That outcome
+			// is waited for until its second attempt has been decided, however
+			// slow the machine. Any other outcome must not attempt again, and
+			// the frozen clock keeps that exact however long the window takes.
+			decidedBefore := lastFailureAt(worker, device)
 			worker.NotifyDevice(device)
+			if tc.Expected.Class == "handoff" {
+				waitUntil(func() bool {
+					mu.Lock()
+					n := calls
+					mu.Unlock()
+					return n >= 2 && !lastFailureAt(worker, device).Equal(decidedBefore)
+				})
+			}
 			time.Sleep(30 * time.Millisecond)
 			running.stop()
 

@@ -94,7 +94,7 @@ class CheckWorkflowsTest(unittest.TestCase):
         self.assertPasses(workflow(job(), race()))
 
     def test_passing_the_jobs_own_setting_through_sets_nothing(self) -> None:
-        self.assertPasses(workflow(job(run='sudo env "CGO_ENABLED=$CGO_ENABLED" go test ./...')))
+        self.assertPasses(workflow(job(run='sudo env "CGO_ENABLED=$CGO_ENABLED" go test ./...'), race()))
 
     def test_a_quoted_or_commented_job_header_is_read_as_yaml_reads_it(self) -> None:
         for header in ('"build":', "build: # ships"):
@@ -241,6 +241,22 @@ class CheckWorkflowsTest(unittest.TestCase):
         ):
             with self.subTest(run):
                 self.assertRefused(workflow(race(run=run)), "may only run")
+
+    def test_ci_yml_without_the_race_job_is_refused(self) -> None:
+        self.assertRefused(workflow(job()), "must keep the race job")
+        self.assertPasses(workflow(job()), name="pr-title.yml")
+
+    def test_a_race_job_must_verify_modules_before_testing(self) -> None:
+        verify = "      - run: go mod verify\n"
+        test = "      - run: go test -race ./...\n"
+        for label, text in (
+            ("verification removed", race().replace(verify, "")),
+            ("verification after the tests", race().replace(verify, "") + verify),
+            ("tests twice", race() + test),
+            ("verification twice", race().replace(verify, verify + verify)),
+        ):
+            with self.subTest(label):
+                self.assertRefused(workflow(text), "may only run, in order")
 
     def test_a_race_job_naming_the_race_detector_only_in_a_comment_is_refused(self) -> None:
         text = race(run="go build ./...").replace("    steps:", "    # go test -race ./...\n    steps:")
