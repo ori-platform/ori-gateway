@@ -72,6 +72,30 @@ Verified by `TestHeartbeatFailureLimit`,
 `TestAReplyTheStopRefusesIsNotADeliveryFailure`,
 `TestAReplyFailingAfterTheCallerCancelsIsNotCounted`, and
 `TestARefusalByAClosedClockWhileTheRunIsLiveIsNotCounted`.
+Neither escalation waits on the log destination. `runGateway` queues the
+gateway's logger through `internal/asynclog`: records are written off every
+caller's path, in order, by one drainer, with at most 1,024 waiting behind a
+logger that blocks and later ones counted. Every component it hands that
+logger to shares the one queue, the heartbeat publisher and the broker client
+among them. Each of those also queues any other logger it is given, and a
+replay verifier given none queues `slog.Default()`, so nothing on a callback
+or an escalation logs synchronously. A heartbeat whose every log line would
+block still reaches its failure limit and exits, after giving its last line a
+bounded chance (`asynclog.ExitFlushBound`, 1 s) to reach the destination. The
+request escalation still ends the run, and `runCLI` writes its final line
+within the same bound and exits whether or not it was taken. Site
+health reports the gateway `degraded` while its heartbeat is not going out:
+before the first one, after a failed attempt, or with none for three
+intervals. Verified by `TestALoggerThatBlocksNeverKeepsTheHeartbeatFromItsExit`,
+`TestTheExitLineIsWrittenBeforeTheHeartbeatExits`,
+`TestPublishingFollowsTheLatestAttempt`,
+`TestTheRequestEscalationEndsTheGatewayBehindALoggerThatBlocks`,
+`TestTheRequestEscalationEndsTheProcessBehindABlockedLoggerAndStderr`,
+`TestABlockedDefaultLoggerNeverHoldsAVerifierOrAStop`,
+`TestRunCLIExitsBehindAStderrThatBlocks`,
+`TestSiteHealthIsDegradedOnceHeartbeatsStop`,
+`TestALoggerThatBlocksNeverHoldsTheClientsDelivery` and the
+`internal/asynclog` tests.
 
 7. `GW-7` Fleet/cloud forwarding is opt-in.
 With fleet disabled, gateway must not call `ori-cloud`, resolve cloud hosts, or
@@ -193,7 +217,10 @@ and no further run begins in that process. A start refused while its first
 write is outstanding ends the same way. Quiescence is awaited for the whole
 bound, so a write completing just before it releases the directory; a warning
 is logged shortly before the bound, and nothing on the exit path waits on the
-logger, so a logger that blocks cannot keep the process alive.
+logger beyond a stated bound, so a logger that blocks cannot keep the process
+alive. The state-directory exit waits on it not at all. A run that ends gives
+its queued log records up to `asynclog.ExitFlushBound` (1 s) to be written, and
+`runCLI` gives its final line the same bound (GW-6).
 Verified by `TestMainStartupMissingConfig`,
 `TestGatewayStartupProviderFailureStopsBeforeBroker`,
 `TestGatewayStartupConnectFailureStopsBeforeOptionalModules`,
@@ -667,7 +694,9 @@ while its caller's context lasts, and 30 seconds at most without a deadline,
 so ending the run ends a shared subscribe at the transport. The export
 client's log records, its verifier's included, are written off every caller's
 path, in order, by one drainer, which also asks the logger's level, at most 64
-waiting behind a logger that blocks and later ones counted, so none of them holds an export past its bound, delays
+waiting behind a logger that blocks and later ones counted (in the gateway the
+logger is its shared queue, GW-6, which never blocks, so the records wait
+there among the 1,024 and a drop is counted there), so none of them holds an export past its bound, delays
 the release of its pending state, or holds the broker callback that delivers
 responses. An export page missing any
 envelope member (`request_id`, `export_type`, `device_id`, `items`,
@@ -770,7 +799,10 @@ last value issued. An episode is not a GW-6 heartbeat failure. The clock's log r
 under its lock, stamped then, and written in that order by one drainer off
 every lock, so no caller waits on the logger; at most 64 wait behind a
 logger that blocks, later ones are counted, and the refusal after a stop is
-logged once. A start whose
+logged once. In the gateway the logger is its shared queue (GW-6), which
+never blocks: the records wait there among the 1,024 and a drop is counted
+there, so under a long stall other components' lines can crowd out the
+clock's. A start whose
 first value would reach the ceiling is refused, and `Next` refuses a value at
 it (`ErrSigningClockExhausted`) or once stopped (`ErrSigningClockClosed`).
 Rule 9's upper bound is judged against the wall clock read when a mark is

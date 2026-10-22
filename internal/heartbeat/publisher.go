@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ori-platform/ori-gateway/internal/asynclog"
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
 	"github.com/ori-platform/ori-gateway/internal/mqttauth"
@@ -40,7 +41,10 @@ type Publisher struct {
 	failureLimit int
 	startedAt    time.Time
 	now          func() time.Time
+	// log queues every record off the loop's path (asynclog), so a logger
+	// that blocks never keeps the loop from its failure limit and exit.
 	log          *slog.Logger
+	logs         *asynclog.Queue
 	fatal        func(code int)
 	auth         AuthConfig
 	webhook      func() *contracts.WebhookBridgePosture
@@ -48,6 +52,10 @@ type Publisher struct {
 
 	mu            sync.Mutex
 	everPublished bool
+	// failing is whether the latest publish attempt failed, and
+	// lastPublished when the latest one succeeded, on the monotonic clock.
+	failing       bool
+	lastPublished time.Time
 }
 
 // Options configures Publisher.
@@ -110,6 +118,7 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 	if signingClock == nil {
 		signingClock = mqttauth.NewSigningClock(now, log)
 	}
+	queuedLog, logs := asynclog.New(log.Handler(), "heartbeat log lines dropped behind a logger that blocked")
 	return &Publisher{
 		publish:      publish,
 		provider:     prov,
@@ -118,7 +127,8 @@ func NewPublisher(publish PublishFunc, prov ProviderStatus, sim SIMStatus, opts 
 		failureLimit: failureLimit,
 		startedAt:    startedAt,
 		now:          now,
-		log:          log,
+		log:          queuedLog,
+		logs:         logs,
 		fatal:        fatal,
 		auth:         opts.Auth,
 		webhook:      opts.WebhookBridge,
@@ -206,9 +216,21 @@ func (p *Publisher) publishOnce(ctx context.Context, failures *int) bool {
 
 	p.mu.Lock()
 	p.everPublished = true
+	p.failing = false
+	p.lastPublished = time.Now()
 	p.mu.Unlock()
 	*failures = 0
 	return false
+}
+
+// Publishing reports whether heartbeats are going out: one has been
+// published, the latest attempt succeeded, and it did so within three
+// intervals on the monotonic clock. Site health reads it, so the gateway
+// never reports itself healthy once its heartbeat has stopped (GW-6).
+func (p *Publisher) Publishing() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.everPublished && !p.failing && time.Since(p.lastPublished) <= 3*p.interval
 }
 
 // stopping reports whether err comes from the run's own stop: its context
@@ -219,9 +241,15 @@ func stopping(ctx context.Context, err error) bool {
 
 func (p *Publisher) recordFailure(failures *int, err error) bool {
 	*failures++
+	p.mu.Lock()
+	p.failing = true
+	p.mu.Unlock()
 	p.log.Warn("heartbeat publish failed", "error", err, "failures", *failures, "limit", p.failureLimit)
 	if *failures >= p.failureLimit {
 		p.log.Error("heartbeat failure limit reached, exiting")
+		// The line is given a bounded chance to be written; a logger that
+		// blocks cannot keep the process alive past it.
+		p.logs.Flush(asynclog.ExitFlushBound)
 		p.fatal(1)
 		return true
 	}

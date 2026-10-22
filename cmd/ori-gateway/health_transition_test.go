@@ -309,7 +309,7 @@ func TestACriticalExportSurvivesHeartbeatsAndAFailedFetch(t *testing.T) {
 	now := time.UnixMilli(1_787_000_003_000)
 	secrets := gatewayAuthSecrets{Enabled: true, CurrentSecret: healthTransitionSecret}
 	registry := site.NewRegistry()
-	heartbeats, err := runtimeHeartbeatHandlerFromSecrets(secrets, registry, func() time.Time { return now })
+	heartbeats, err := runtimeHeartbeatHandlerFromSecrets(secrets, registry, func() time.Time { return now }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

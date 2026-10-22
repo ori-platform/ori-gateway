@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ori-platform/ori-gateway/internal/asynclog"
 	"github.com/ori-platform/ori-gateway/internal/broker"
 	"github.com/ori-platform/ori-gateway/internal/config"
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -58,6 +59,9 @@ type brokerClient interface {
 
 type heartbeatRunner interface {
 	Run(ctx context.Context) error
+	// Publishing reports whether heartbeats are going out, so site health
+	// never shows the gateway healthy once its heartbeat has stopped (GW-6).
+	Publishing() bool
 }
 
 type webhookBridgeRunner interface {
@@ -210,6 +214,12 @@ func abandonStateDirectory(deps appDependencies, owner *gatewaystate.Owner, caus
 }
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+	return runCLIWith(args, stdout, stderr, defaultDependencies)
+}
+
+// runCLIWith is runCLI with the dependencies the run is given, so a test can
+// drive the whole process path, its exit status included.
+func runCLIWith(args []string, stdout io.Writer, stderr io.Writer, dependencies func() appDependencies) int {
 	flags := flag.NewFlagSet("ori-gateway", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", defaultConfigPath, "path to gateway.yaml")
@@ -225,17 +235,43 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	deps := defaultDependencies()
+	deps := dependencies()
 	if err := runGateway(ctx, *configPath, deps); err != nil {
-		_, _ = fmt.Fprintf(stderr, "ori-gateway: %v\n", err)
+		// The process exits whether or not stderr takes the line: a log
+		// destination that blocks never keeps an escalation from ending it
+		// (GW-6).
+		writeWithin(stderr, fmt.Sprintf("ori-gateway: %v\n", err), asynclog.ExitFlushBound)
 		return 1
 	}
-	_, _ = fmt.Fprintln(stdout, "ori-gateway stopped")
+	writeWithin(stdout, "ori-gateway stopped\n", asynclog.ExitFlushBound)
 	return 0
+}
+
+// writeWithin writes line to w, waiting at most bound for it; a writer that
+// blocks is left to finish, or not, on its own.
+func writeWithin(w io.Writer, line string, bound time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.WriteString(w, line)
+	}()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 func runGateway(ctx context.Context, configPath string, deps appDependencies) (runErr error) {
 	deps = normalizeDependencies(deps)
+	// Every record the gateway logs is written off its caller's path, so a log
+	// destination that stops accepting writes never stalls startup, a
+	// callback or an escalation on its way to ending the process (GW-6).
+	// What is queued when the run ends gets a bounded chance to be written.
+	queuedLog, logs := asynclog.New(deps.logger.Handler(), "gateway log lines dropped behind a logger that blocked")
+	deps.logger = queuedLog
+	defer logs.Flush(asynclog.ExitFlushBound)
 	startedAt := deps.now()
 
 	cfg, err := deps.loadConfig(configPath)
@@ -636,7 +672,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	heartbeatAuth := heartbeatAuthFromSecrets(gatewaySecrets)
 
 	siteRegistry := deps.newSiteRegistry()
-	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromSecrets(gatewaySecrets, siteRegistry, deps.now)
+	runtimeHeartbeatHandler, err := runtimeHeartbeatHandlerFromSecrets(gatewaySecrets, siteRegistry, deps.now, deps.logger)
 	if err != nil {
 		shutdownRunners()
 		return err
@@ -683,6 +719,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 			SharedSecret:         gatewaySecrets.CurrentSecret,
 			PreviousSharedSecret: gatewaySecrets.PreviousSecret,
 			Now:                  deps.now,
+			Logger:               deps.logger,
 		})
 		if err != nil {
 			shutdownRunners()
@@ -845,6 +882,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 				SharedSecret:         gatewaySecrets.CurrentSecret,
 				PreviousSharedSecret: gatewaySecrets.PreviousSecret,
 				Now:                  deps.now,
+				Logger:               deps.logger,
 			})
 			if err != nil {
 				shutdownRunners()
@@ -886,7 +924,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 		gatewayViewFn := func() site.GatewayView {
 			status := site.SiteStatusHealthy
 			evidenceDelivery := evidenceDeliveryView(evidenceWorker)
-			if !providerStatus.Healthy(runCtx) || signingClock.Degraded() ||
+			if !providerStatus.Healthy(runCtx) || signingClock.Degraded() || !hb.Publishing() ||
 				(evidenceDelivery != nil && (evidenceDelivery.Degraded || evidenceDelivery.Blocked)) {
 				status = site.SiteStatusDegraded
 			}
@@ -1236,6 +1274,7 @@ func runtimeHeartbeatHandlerFromSecrets(
 	secrets gatewayAuthSecrets,
 	registry *site.Registry,
 	now func() time.Time,
+	logger *slog.Logger,
 ) (*site.RuntimeHeartbeatHandler, error) {
 	var verifier *mqttauth.Verifier
 	if secrets.Enabled {
@@ -1244,6 +1283,7 @@ func runtimeHeartbeatHandlerFromSecrets(
 			SharedSecret:         secrets.CurrentSecret,
 			PreviousSharedSecret: secrets.PreviousSecret,
 			Now:                  now,
+			Logger:               logger,
 		})
 		if err != nil {
 			return nil, err

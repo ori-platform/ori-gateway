@@ -139,6 +139,7 @@ func TestPayloadMemberVectorCases(t *testing.T) {
 // family and reason is written synchronously.
 func assertLogged(t *testing.T, r *ingressRig, want string) {
 	t.Helper()
+	r.client.flushLogs(t)
 	if !strings.Contains(r.logs.String(), want) {
 		t.Fatalf("log lacks %q:\n%s", want, r.logs.String())
 	}

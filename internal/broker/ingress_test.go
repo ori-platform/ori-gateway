@@ -391,6 +391,7 @@ func TestIngressRefusalsAreRecordedWithoutContent(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	r.client.flushLogs(t)
 	logs := r.logs.String()
 	if strings.Contains(logs, marker) || strings.Contains(logs, "dev-secret-7") {
 		t.Fatalf("a refusal record carries payload content or a device identifier:\n%s", logs)
@@ -468,6 +469,9 @@ func TestADropAtTheHeldBoundIsLoggedApartFromTheRate(t *testing.T) {
 	var logs bytes.Buffer
 	stats := NewIngressStats(slog.New(slog.NewTextHandler(&logs, nil)))
 	stats.Drop(contracts.FamilyReasoningRequest, 300)
+	if !stats.logs.Flush(10 * time.Second) {
+		t.Fatal("the drop's log record was not written")
+	}
 	if got := stats.Snapshot()[contracts.FamilyReasoningRequest]; got.VolumeDropped != 1 || got.PayloadTooLarge != 0 {
 		t.Fatalf("counts = %+v, want one volume drop", got)
 	}

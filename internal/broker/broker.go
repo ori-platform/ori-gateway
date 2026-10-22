@@ -14,6 +14,8 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	"github.com/ori-platform/ori-gateway/internal/asynclog"
 )
 
 const (
@@ -55,6 +57,7 @@ type Options struct {
 type Client struct {
 	opts    Options
 	log     *slog.Logger
+	logs    *asynclog.Queue
 	ingress *IngressStats
 
 	mu            sync.Mutex
@@ -78,10 +81,13 @@ func New(opts Options) (*Client, error) {
 		return nil, ErrEmptyClientID
 	}
 
-	log := opts.Logger
-	if log == nil {
-		log = slog.Default()
+	given := opts.Logger
+	if given == nil {
+		given = slog.Default()
 	}
+	// Records are written off paho's routing goroutine, so a logger that
+	// blocks never holds the messages behind the one being logged.
+	log, logs := asynclog.New(given.Handler(), "mqtt log lines dropped behind a logger that blocked")
 
 	reconnectInitial := opts.ReconnectInitial
 	if reconnectInitial == 0 {
@@ -104,11 +110,12 @@ func New(opts Options) (*Client, error) {
 
 	ingress := opts.Ingress
 	if ingress == nil {
-		ingress = NewIngressStats(log)
+		ingress = NewIngressStats(given)
 	}
 	c := &Client{
 		opts:          opts,
 		log:           log,
+		logs:          logs,
 		ingress:       ingress,
 		subscriptions: make(map[string]subscription),
 	}
