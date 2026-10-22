@@ -38,9 +38,9 @@ def race(cgo: str = "1", run: str = "go test -race ./...") -> str:
 
 
 class CheckWorkflowsTest(unittest.TestCase):
-    def guard(self, text: str) -> subprocess.CompletedProcess[str]:
+    def guard(self, text: str, name: str = "ci.yml") -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root, ".github/workflows/ci.yml")
+            path = Path(root, ".github/workflows", name)
             path.parent.mkdir(parents=True)
             path.write_text(text)
             return subprocess.run(
@@ -51,8 +51,8 @@ class CheckWorkflowsTest(unittest.TestCase):
         result = self.guard(text)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def assertRefused(self, text: str, reason: str) -> None:
-        result = self.guard(text)
+    def assertRefused(self, text: str, reason: str, name: str = "ci.yml") -> None:
+        result = self.guard(text, name)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn(reason, result.stderr)
 
@@ -65,8 +65,32 @@ class CheckWorkflowsTest(unittest.TestCase):
     def test_passing_the_jobs_own_setting_through_sets_nothing(self) -> None:
         self.assertPasses(workflow(job(run='sudo env "CGO_ENABLED=$CGO_ENABLED" go test ./...')))
 
-    def test_a_job_without_go_needs_no_setting(self) -> None:
-        self.assertPasses(workflow("\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"))
+    def test_a_job_that_does_not_look_like_go_still_needs_the_setting(self) -> None:
+        text = "\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make build\n"
+        self.assertRefused(workflow(text), "job build must set CGO_ENABLED to 0")
+
+    def test_a_job_header_with_a_trailing_comment_is_refused(self) -> None:
+        text = job() + "\n  build: # ships\n    runs-on: ubuntu-latest\n    steps:\n      - run: go build ./...\n"
+        self.assertRefused(workflow(text), "cannot parse job header")
+
+    def test_a_quoted_job_header_is_refused(self) -> None:
+        text = job() + '\n  "build":\n    runs-on: ubuntu-latest\n    steps:\n      - run: go build ./...\n'
+        self.assertRefused(workflow(text), "cannot parse job header")
+
+    def test_a_jobs_key_with_a_comment_is_refused(self) -> None:
+        self.assertRefused(workflow(job()).replace("jobs:", "jobs: # all"), "cannot parse the jobs block")
+
+    def test_flow_style_jobs_are_refused(self) -> None:
+        text = workflow().replace("jobs:", "jobs: {build: {runs-on: ubuntu-latest}}")
+        self.assertRefused(text, "cannot parse the jobs block")
+
+    def test_a_reusable_workflow_job_is_refused(self) -> None:
+        text = "\n  build:\n    uses: org/repo/.github/workflows/b.yml@" + "a" * 40 + "\n"
+        self.assertRefused(workflow(text), "calls a reusable workflow")
+
+    def test_a_commented_out_setting_does_not_count(self) -> None:
+        text = "\n  build:\n    runs-on: ubuntu-latest\n    # CGO_ENABLED: \"0\"\n    steps:\n      - run: go build ./...\n"
+        self.assertRefused(workflow(text), "job build must set CGO_ENABLED to 0")
 
     def test_a_go_job_that_enables_cgo_is_refused(self) -> None:
         self.assertRefused(workflow(job(cgo="1")), "job test must set CGO_ENABLED to 0")
@@ -88,17 +112,45 @@ class CheckWorkflowsTest(unittest.TestCase):
         self.assertRefused(workflow(race(cgo="0")), "job race must set CGO_ENABLED to 1")
 
     def test_a_race_job_without_the_race_detector_is_refused(self) -> None:
-        self.assertRefused(workflow(race(run="go test ./...")), "job race must run go test -race")
+        self.assertRefused(workflow(race(run="go test ./...")), "may only run")
 
     def test_a_race_job_that_builds_is_refused(self) -> None:
         self.assertRefused(
             workflow(race(run="go test -race ./... && go build ./cmd/ori-gateway")),
-            "job race may only run tests",
+            "may only run",
         )
+
+    def test_a_race_job_outside_ci_yml_is_refused(self) -> None:
+        self.assertRefused(workflow(race()), "job race must set CGO_ENABLED to 0", name="release.yml")
+
+    def test_a_race_job_that_names_the_race_detector_only_in_a_comment_is_refused(self) -> None:
+        text = race(run="go build ./...").replace("    steps:", "    # go test -race ./...\n    steps:")
+        self.assertRefused(workflow(text), "may only run")
+
+    def test_a_race_job_that_builds_a_test_binary_and_releases_it_is_refused(self) -> None:
+        self.assertRefused(
+            workflow(race(run="go test -race -c -o gw.test ./cmd/ori-gateway && gh release upload v1 gw.test")),
+            "may only run",
+        )
+
+    def test_a_race_job_running_a_script_is_refused(self) -> None:
+        self.assertRefused(workflow(race(run="scripts/build.sh")), "may only run")
+
+    def test_a_race_job_with_its_own_permissions_is_refused(self) -> None:
+        text = race().replace("    env:", "    permissions:\n      contents: write\n    env:")
+        self.assertRefused(workflow(text), "may set only")
+
+    def test_a_race_job_that_saves_a_cache_is_refused(self) -> None:
+        text = race() + "      - uses: actions/cache/save@" + "a" * 40 + " # v4\n"
+        self.assertRefused(workflow(text), "may only use")
+
+    def test_a_race_job_whose_step_enables_cgo_again_is_refused(self) -> None:
+        text = race() + '      - run: go mod verify\n        env:\n          CGO_ENABLED: "1"\n'
+        self.assertRefused(workflow(text), "must set CGO_ENABLED to 1 exactly once")
 
     def test_a_race_job_that_uploads_is_refused(self) -> None:
         text = race() + "      - uses: actions/upload-artifact@" + "a" * 40 + " # v4\n"
-        self.assertRefused(workflow(text), "job race may only run tests")
+        self.assertRefused(workflow(text), "may only use")
 
 
 if __name__ == "__main__":

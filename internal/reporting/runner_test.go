@@ -182,20 +182,20 @@ func assertNoMore(t *testing.T, calls <-chan struct{}, delivered <-chan WeeklyRe
 }
 
 // scriptedProvider answers its nth call with outcomes[n], a nil outcome being
-// a report, and announces each call on calls. Only the runner's goroutine
-// touches outcomes.
+// a report, and announces each call on calls, an unscripted one included, so
+// a test sees every call. Only the runner's goroutine touches outcomes.
 type scriptedProvider struct {
 	outcomes []error
 	calls    chan struct{}
 }
 
 func (p *scriptedProvider) GenerateWeeklyReport(context.Context, WeeklyReportInput) (ProviderReport, error) {
+	p.calls <- struct{}{}
 	if len(p.outcomes) == 0 {
 		return ProviderReport{}, errors.New("scriptedProvider: unscripted call")
 	}
 	err := p.outcomes[0]
 	p.outcomes = p.outcomes[1:]
-	p.calls <- struct{}{}
 	if err != nil {
 		return ProviderReport{}, err
 	}

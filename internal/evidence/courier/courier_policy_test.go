@@ -170,8 +170,10 @@ func TestRefusalPolicyIsOneDecisionIndependentOfTheRetriableFlag(t *testing.T) {
 						t.Fatalf("%s was attempted %d times by the timer, want 1", want, attempts)
 					}
 				case classBackoff:
-					if row.status == http.StatusTooManyRequests && attempts != 1 {
-						t.Fatalf("Retry-After ignored: %d attempts", attempts)
+					// The clock never moved, so no back-off or Retry-After
+					// elapsed.
+					if attempts != 1 {
+						t.Fatalf("a back-off was retried before it elapsed: %d attempts", attempts)
 					}
 				case classInterval:
 					if attempts < 3 {

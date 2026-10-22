@@ -939,10 +939,11 @@ func TestBackoffSurvivesARestart(t *testing.T) {
 	if authority.count("dev-a") != 1 {
 		t.Fatalf("restart resent a millisecond before the back-off elapsed: %d attempts", authority.count("dev-a"))
 	}
+	// At the deadline the restored back-off's own timer retries it, with no
+	// handoff to prompt it.
 	authority.refuse("dev-a", nil)
 	clk.advance(time.Millisecond)
-	next.NotifyDevice("dev-a")
-	waitFor(t, "the retry at the persisted deadline", func() bool { return reopened.Len() == 0 })
+	waitFor(t, "the timer's retry at the persisted deadline", func() bool { return reopened.Len() == 0 })
 	if _, err := os.Stat(filepath.Join(dir, backoffFilePrefix+entry.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("retirement left the back-off record: %v", err)
 	}

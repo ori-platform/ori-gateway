@@ -18,13 +18,21 @@ REMOTE_EXEC_RE = re.compile(
     r"(?:curl|wget)\b[^\n]*(?:\|\s*(?:bash|sh|python\d*)|&&\s*(?:bash|sh|python\d*)\b)",
     re.IGNORECASE,
 )
-JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
+JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):$")
+JOB_KEY_RE = re.compile(r"^    ([A-Za-z0-9_-]+):")
 CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*[:=]\s*[\"']?([^\"'\s]*)")
-GO_JOB_RE = re.compile(r"setup-go|\bgo\s+(?:test|build|vet|run|install|generate)\b")
-# The race detector needs cgo, so one job, which only runs tests, may enable it.
+STEP_RUN_RE = re.compile(r"^\s+(?:-\s+)?run:\s*(.*?)\s*$")
+STEP_USES_RE = re.compile(r"^\s+(?:-\s+)?uses:\s*(\S+)")
+# The race detector needs cgo, so one job in ci.yml, which only runs tests,
+# may enable it. It is held to exactly what it needs.
+RACE_WORKFLOW = "ci.yml"
 RACE_JOB = "race"
-RACE_JOB_FORBIDDEN_RE = re.compile(
-    r"\bgo\s+(?:build|install|run|generate)\b|actions/upload-artifact|goreleaser"
+RACE_JOB_KEYS = {"name", "runs-on", "env", "steps"}
+RACE_JOB_RUNS = {"go mod verify", "go test -race ./..."}
+RACE_JOB_ACTIONS = (
+    "step-security/harden-runner@",
+    "actions/checkout@",
+    "actions/setup-go@",
 )
 
 
@@ -62,42 +70,71 @@ def _check_pre_commit_config(failures: list[str]) -> None:
             )
 
 
-def _jobs(text: str) -> list[tuple[str, str]]:
-    """Split a workflow's jobs block into (job id, job text) pairs."""
-    start = re.search(r"^jobs:\s*$", text, re.MULTILINE)
-    if not start:
+def _jobs(path: Path, text: str, failures: list[str]) -> list[tuple[str, list[str]]]:
+    """Split a workflow's jobs block into (job id, job lines) pairs.
+
+    Full-line comments are dropped first. Anything in the block that is not a
+    plain job header, or a jobs key written any other way, is refused rather
+    than read past, so no job escapes the checks below.
+    """
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    starts = [i for i, line in enumerate(lines) if re.match(r"^jobs\b", line)]
+    if not starts:
         return []
-    body = text[start.end() :]
-    headers = list(JOB_HEADER_RE.finditer(body))
-    return [
-        (h.group(1), body[h.start() : headers[i + 1].start() if i + 1 < len(headers) else len(body)])
-        for i, h in enumerate(headers)
-    ]
+    if len(starts) > 1 or lines[starts[0]].rstrip() != "jobs:":
+        failures.append(f"{path}: cannot parse the jobs block; write it as a plain 'jobs:' line")
+        return []
+    jobs: list[tuple[str, list[str]]] = []
+    for line in lines[starts[0] + 1 :]:
+        if not line.strip():
+            continue
+        if not line.startswith(" "):
+            break
+        if not line.startswith("   "):
+            header = JOB_HEADER_RE.match(line.rstrip())
+            if not header:
+                failures.append(f"{path}: cannot parse job header {line.strip()!r}")
+                return []
+            jobs.append((header.group(1), []))
+            continue
+        if not jobs:
+            failures.append(f"{path}: cannot parse the jobs block")
+            return []
+        jobs[-1][1].append(line)
+    return jobs
 
 
 def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
-    """Every Go job sets CGO_ENABLED=0, except the test-only race job, which sets 1."""
-    top = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    """Every job sets CGO_ENABLED=0, except ci.yml's test-only race job, which sets 1."""
+    top = re.search(r"^jobs\b", text, re.MULTILINE)
     if CGO_SETTING_RE.search(text[: top.start()] if top else text):
         failures.append(f"{path}: set CGO_ENABLED per job, not for the whole workflow")
-    for job, body in _jobs(text):
+    for job, lines in _jobs(path, text, failures):
+        keys = [m.group(1) for m in map(JOB_KEY_RE.match, lines) if m]
+        if "uses" in keys:
+            failures.append(f"{path}: job {job} calls a reusable workflow, which this guard cannot check")
+            continue
         # Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
         values = [
-            v for v in CGO_SETTING_RE.findall(body)
+            v
+            for line in lines
+            for v in CGO_SETTING_RE.findall(line)
             if v not in {"$CGO_ENABLED", "${CGO_ENABLED}"}
         ]
-        if job == RACE_JOB:
-            if "go test -race" not in body:
-                failures.append(f"{path}: job {job} must run go test -race")
-            if values != ["1"]:
-                failures.append(f"{path}: job {job} must set CGO_ENABLED to 1 exactly once")
-            if RACE_JOB_FORBIDDEN_RE.search(body):
-                failures.append(f"{path}: job {job} may only run tests")
+        if path.name != RACE_WORKFLOW or job != RACE_JOB:
+            if not values or any(v != "0" for v in values):
+                failures.append(f"{path}: job {job} must set CGO_ENABLED to 0")
             continue
-        if not GO_JOB_RE.search(body) and not values:
-            continue
-        if not values or any(v != "0" for v in values):
-            failures.append(f"{path}: job {job} must set CGO_ENABLED to 0")
+        if values != ["1"]:
+            failures.append(f"{path}: job {job} must set CGO_ENABLED to 1 exactly once")
+        if extra := sorted(set(keys) - RACE_JOB_KEYS):
+            failures.append(f"{path}: job {job} may set only {sorted(RACE_JOB_KEYS)}, not {extra}")
+        runs = [m.group(1) for m in map(STEP_RUN_RE.match, lines) if m]
+        if "go test -race ./..." not in runs or any(r not in RACE_JOB_RUNS for r in runs):
+            failures.append(f"{path}: job {job} may only run {sorted(RACE_JOB_RUNS)}")
+        actions = [m.group(1) for m in map(STEP_USES_RE.match, lines) if m]
+        if any(not a.startswith(RACE_JOB_ACTIONS) for a in actions):
+            failures.append(f"{path}: job {job} may only use {list(RACE_JOB_ACTIONS)}")
 
 
 def main() -> int:

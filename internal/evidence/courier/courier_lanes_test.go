@@ -403,9 +403,10 @@ func TestRestartRestoresPerLaneState(t *testing.T) {
 	if authority.count(regLane) != 1 {
 		t.Fatalf("restart sent a millisecond early: registration %d", authority.count(regLane))
 	}
+	// At the deadline the restored back-off's own timer retries it, with no
+	// handoff to prompt it.
 	authority.set(regLane, nil)
 	clk.advance(time.Millisecond)
-	next.NotifyDevice("dev-a")
 	waitFor(t, "the registration after its back-off", func() bool { return reopened.LenLane(regLane) == 0 })
 	time.Sleep(50 * time.Millisecond)
 	if authority.count(evLane) != 1 || reopened.LenLane(evLane) != 2 {

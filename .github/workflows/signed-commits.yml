@@ -17,6 +17,8 @@ jobs:
   signed:
     name: Signed commits
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2
