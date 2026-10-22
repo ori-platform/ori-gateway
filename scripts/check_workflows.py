@@ -31,11 +31,46 @@ RACE_JOB_KEYS = {"name", "runs-on", "env", "steps"}
 RACE_JOB_ENV = {"CGO_ENABLED": "1", "GOFLAGS": "-mod=readonly", "GONOSUMCHECK": ""}
 RACE_STEP_KEYS = {"name", "uses", "with", "run"}
 RACE_JOB_RUNS = {"go mod verify", "go test -race ./..."}
+RACE_JOB_RUNNER = "ubuntu-latest"
 RACE_JOB_ACTIONS = {
-    "step-security/harden-runner@": {"egress-policy"},
-    "actions/checkout@": set(),
-    "actions/setup-go@": {"go-version-file", "cache"},
+    "step-security/harden-runner": {"egress-policy"},
+    "actions/checkout": set(),
+    "actions/setup-go": {"go-version-file", "cache"},
 }
+PINNED_ACTION_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@[0-9a-f]{40}$")
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """A SafeLoader that refuses what GitHub reads differently: duplicate keys and merge keys."""
+
+
+def _construct_strict_mapping(loader: _StrictLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+    seen: list[object] = []
+    for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            raise yaml.constructor.ConstructorError(None, None, "merge keys (<<) are not allowed", key_node.start_mark)
+        key = loader.construct_object(key_node, deep=True)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(None, None, f"duplicate key {key!r}", key_node.start_mark)
+        seen.append(key)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_strict_mapping)
+
+
+def _cgo_settings(value: object):
+    """Every value CGO_ENABLED is declared with anywhere in value: as a key, or as an assignment in a string."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "CGO_ENABLED":
+                yield item
+            yield from _cgo_settings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _cgo_settings(item)
+    elif isinstance(value, str):
+        yield from CGO_SETTING_RE.findall(value)
 
 
 def _workflow_files() -> list[Path]:
@@ -80,15 +115,16 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
     refused rather than read past.
     """
     try:
-        workflow = yaml.safe_load(text)
+        workflow = yaml.load(text, Loader=_StrictLoader)
     except yaml.YAMLError as err:
         failures.append(f"{path}: cannot parse as YAML: {err}")
         return
     if not isinstance(workflow, dict):
         failures.append(f"{path}: cannot parse: not a mapping")
         return
-    if "CGO_ENABLED" in (workflow.get("env") or {}):
-        failures.append(f"{path}: set CGO_ENABLED per job, not for the whole workflow")
+    for key in ("env", "defaults"):
+        if key in workflow:
+            failures.append(f"{path}: set {key} per job, not for the whole workflow")
     jobs = workflow.get("jobs") or {}
     if not isinstance(jobs, dict):
         failures.append(f"{path}: cannot parse the jobs block")
@@ -100,6 +136,10 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
         if "uses" in job:
             failures.append(f"{path}: job {name} calls a reusable workflow, which this guard cannot check")
             continue
+        for step in job.get("steps") or []:
+            action = step.get("uses") if isinstance(step, dict) else None
+            if action is not None and not (str(action).startswith("./") or PINNED_ACTION_RE.match(str(action))):
+                failures.append(f"{path}: job {name} uses {action}, not pinned to a full commit SHA")
         if path.name == RACE_WORKFLOW and name == RACE_JOB:
             _check_race_job(path, name, job, failures)
         else:
@@ -108,27 +148,20 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
 
 def _check_cgo_off(path: Path, name: str, job: dict, failures: list[str]) -> None:
     env = job.get("env")
-    steps = job.get("steps") or []
-    if not isinstance(env, dict) or env.get("CGO_ENABLED") != "0" or not isinstance(steps, list):
-        failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env")
-        return
-    for step in steps:
-        if not isinstance(step, dict):
-            failures.append(f"{path}: job {name} has a step this guard cannot parse")
-            continue
-        step_env = step.get("env") or {}
-        if not isinstance(step_env, dict) or step_env.get("CGO_ENABLED", "0") != "0":
-            failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env")
-        run = step.get("run")
-        if run is not None and any(
-            v not in CGO_PASS_THROUGH and v != "0" for v in CGO_SETTING_RE.findall(str(run))
-        ):
-            failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env")
+    settings = list(_cgo_settings(job))
+    if (
+        not isinstance(env, dict)
+        or env.get("CGO_ENABLED") != "0"
+        or any(v != "0" and v not in CGO_PASS_THROUGH for v in settings)
+    ):
+        failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env, and nowhere to anything else")
 
 
 def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> None:
     if extra := sorted(set(job) - RACE_JOB_KEYS):
         failures.append(f"{path}: job {name} may set only {sorted(RACE_JOB_KEYS)}, not {extra}")
+    if job.get("runs-on") != RACE_JOB_RUNNER:
+        failures.append(f"{path}: job {name} must run on {RACE_JOB_RUNNER}")
     if job.get("env") != RACE_JOB_ENV:
         failures.append(f"{path}: job {name} env must be exactly {RACE_JOB_ENV}")
     steps = job.get("steps")
@@ -143,7 +176,8 @@ def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> No
             runs.append(step["run"])
         if "uses" in step:
             action = str(step["uses"])
-            allowed = next((keys for prefix, keys in RACE_JOB_ACTIONS.items() if action.startswith(prefix)), None)
+            pinned = PINNED_ACTION_RE.match(action)
+            allowed = RACE_JOB_ACTIONS.get(pinned.group(1)) if pinned else None
             if allowed is None:
                 failures.append(f"{path}: job {name} may only use {sorted(RACE_JOB_ACTIONS)}")
             elif not isinstance(step.get("with") or {}, dict) or set(step.get("with") or {}) - allowed:

@@ -139,8 +139,49 @@ class CheckWorkflowsTest(unittest.TestCase):
         text = race().replace("    env:\n", "    env: &raceenv\n", 1) + job() + "      - run: go build ./...\n        env: *raceenv\n"
         self.assertRefused(workflow(text), "job test must set CGO_ENABLED")
 
-    def test_a_workflow_wide_setting_is_refused(self) -> None:
-        self.assertRefused(workflow(job(), head='env:\n  CGO_ENABLED: "0"\n'), "set CGO_ENABLED per job")
+    def test_workflow_wide_env_or_defaults_are_refused(self) -> None:
+        # Both reach every job, the race job included, unseen by its checks.
+        for head, key in (
+            ('env:\n  CGO_ENABLED: "0"\n', "env"),
+            ("env:\n  CC: ./scripts/anything\n", "env"),
+            ("env:\n  GOTOOLCHAIN: go1.99.0\n", "env"),
+            ("defaults:\n  run:\n    shell: bash -c 'go build ./...; bash {0}'\n", "defaults"),
+        ):
+            with self.subTest(head):
+                self.assertRefused(workflow(job(), race(), head=head), f"set {key} per job")
+
+    def test_a_shell_container_or_defaults_that_enable_cgo_are_refused(self) -> None:
+        for extra in (
+            "      - run: go build ./...\n        shell: env CGO_ENABLED=1 bash -e {0}\n",
+        ):
+            with self.subTest(extra):
+                self.assertRefused(workflow(job() + extra), "job test must set CGO_ENABLED")
+        for key in (
+            "defaults:\n      run:\n        shell: env CGO_ENABLED=1 bash -e {0}",
+            'container:\n      image: golang:1\n      env:\n        CGO_ENABLED: "1"',
+        ):
+            with self.subTest(key):
+                text = job().replace("    steps:", f"    {key}\n    steps:", 1)
+                self.assertRefused(workflow(text), "job test must set CGO_ENABLED")
+
+    def test_yaml_github_reads_differently_is_refused(self) -> None:
+        duplicate_env = job().replace('CGO_ENABLED: "0"', 'CGO_ENABLED: "1"\n      CGO_ENABLED: "0"')
+        duplicate_run = race().replace("      - run: go mod verify\n", "      - run: go build ./...\n        run: go mod verify\n")
+        merged = job().replace('    env:\n      CGO_ENABLED: "0"', '    env:\n      <<: {CGO_ENABLED: "0"}')
+        for text, reason in ((duplicate_env, "duplicate key"), (duplicate_run, "duplicate key"), (merged, "merge keys")):
+            with self.subTest(reason):
+                self.assertRefused(workflow(text), reason)
+
+    def test_an_action_not_pinned_to_a_full_sha_is_refused(self) -> None:
+        for ref in ("feature-x", "v4", "a" * 39):
+            with self.subTest(ref):
+                text = job().replace(f"actions/setup-go@{SHA}", f"actions/setup-go@{ref}")
+                self.assertRefused(workflow(text), "not pinned to a full commit SHA")
+                race_text = race().replace(f"actions/checkout@{SHA}", f"actions/checkout@{ref}")
+                self.assertRefused(workflow(race_text), "may only use")
+
+    def test_a_race_job_on_another_runner_is_refused(self) -> None:
+        self.assertRefused(workflow(race().replace("runs-on: ubuntu-latest", "runs-on: self-hosted")), "must run on ubuntu-latest")
 
     def test_a_reusable_workflow_job_is_refused(self) -> None:
         for indent in ("    ", "      "):
