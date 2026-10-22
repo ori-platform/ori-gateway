@@ -5,12 +5,17 @@ package site
 
 import (
 	"sync"
+	"time"
 )
 
 type NodeHeartbeat struct {
-	DeviceID       string   `json:"device_id"`
-	Status         string   `json:"status"`
-	LastSeenMS     int64    `json:"last_seen_ms"`
+	DeviceID string `json:"device_id"`
+	Status   string `json:"status"`
+	// LastSeenMS is the runtime's own clock, shown as reported. It never
+	// decides whether the node is still reporting.
+	LastSeenMS int64 `json:"last_seen_ms"`
+	// GatewaySeen is when the gateway last accepted a heartbeat from the
+	// node, on its wall clock, for display only. The registry stamps it.
 	GatewaySeen    int64    `json:"gateway_seen_ms"`
 	ActiveTriggers []string `json:"active_triggers"`
 	// DegradationReasons is nil when the heartbeat omitted the field. It is
@@ -23,6 +28,24 @@ type NodeHeartbeat struct {
 	// export, kept by the registry across heartbeats and eviction: only a
 	// later export reading changes it. It is not a projected member.
 	ExportSeverity string `json:"-"`
+	// receivedMono is the same receipt on the registry's monotonic clock.
+	// Liveness, silence and eviction are measured on it alone.
+	receivedMono time.Duration
+}
+
+// receiptClock reads the wall clock and a monotonic clock separately. A
+// node's receipt age decides whether it is still reporting, and is measured
+// on the monotonic clock alone: a wall clock that steps forward never makes a
+// reporting node look silent, and one that steps back never hides a silence.
+// The wall reading only shows when a heartbeat was received.
+type receiptClock struct {
+	wall func() time.Time
+	mono func() time.Duration
+}
+
+func systemReceiptClock() receiptClock {
+	origin := time.Now()
+	return receiptClock{wall: time.Now, mono: func() time.Duration { return time.Since(origin) }}
 }
 
 type Registry struct {
@@ -38,23 +61,41 @@ type Registry struct {
 	// silentCritical holds the devices EvictStale has retained as critical
 	// since their last heartbeat, so the retention is reported once.
 	silentCritical map[string]struct{}
+	// clock stamps each heartbeat's receipt.
+	clock receiptClock
 }
 
 func NewRegistry() *Registry {
+	return newRegistry(systemReceiptClock())
+}
+
+// NewRegistryWithClock is NewRegistry with the receipt clock's two readings
+// supplied: wall for the displayed receipt time, mono for receipt age. A test
+// moves them apart to step the wall clock.
+func NewRegistryWithClock(wall func() time.Time, mono func() time.Duration) *Registry {
+	return newRegistry(receiptClock{wall: wall, mono: mono})
+}
+
+func newRegistry(clock receiptClock) *Registry {
 	return &Registry{
 		nodes:          map[string]NodeHeartbeat{},
 		evidence:       map[string]*evidenceTrack{},
 		exportSeverity: map[string]string{},
 		silentCritical: map[string]struct{}{},
+		clock:          clock,
 	}
 }
 
+// Upsert records an accepted heartbeat, stamping its receipt on both of the
+// registry's clocks: the registry is where the gateway observes the node.
 func (r *Registry) Upsert(heartbeat NodeHeartbeat) {
 	if heartbeat.ActiveTriggers == nil {
 		heartbeat.ActiveTriggers = []string{}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	heartbeat.GatewaySeen = r.clock.wall().UnixMilli()
+	heartbeat.receivedMono = r.clock.mono()
 	if heartbeat.Evidence != nil {
 		track, ok := r.evidence[heartbeat.DeviceID]
 		if !ok {
@@ -107,7 +148,9 @@ func (r *Registry) snapshotLocked() []NodeHeartbeat {
 // snapshotWithExportSeverity returns Snapshot and a copy of every recorded
 // export severity, taken under one lock, so a projection reads both at the
 // same moment, the severity of a device with no node included.
-func (r *Registry) snapshotWithExportSeverity() ([]NodeHeartbeat, map[string]string) {
+// The duration returned is the registry's monotonic clock at the snapshot, to
+// measure each node's receipt age against.
+func (r *Registry) snapshotWithExportSeverity() ([]NodeHeartbeat, map[string]string, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// Copied under the lock with nodes, so a projection never pairs a node
@@ -120,7 +163,7 @@ func (r *Registry) snapshotWithExportSeverity() ([]NodeHeartbeat, map[string]str
 			severity[deviceID] = value
 		}
 	}
-	return r.snapshotLocked(), severity
+	return r.snapshotLocked(), severity, r.clock.mono()
 }
 
 // cloneStrings copies a string slice, preserving nil. The nil/empty
@@ -179,13 +222,14 @@ func (r *Registry) UpsertPosture(deviceID string, posture SiteNodePosture) {
 	r.nodes[deviceID] = hb
 }
 
-// EvictStale removes nodes where nowMS-lastSeenMS > ttlMS and returns them.
-// A node exactly at the TTL boundary is retained. Future-dated heartbeats are
-// evicted because clock-skewed nodes must not become immortal in the registry.
-// A node whose last heartbeat or health export read critical is never
-// evicted: see EvictStaleRetainingCritical.
-func (r *Registry) EvictStale(nowMS, ttlMS int64) []NodeHeartbeat {
-	evicted, _ := r.EvictStaleRetainingCritical(nowMS, ttlMS)
+// EvictStale removes the nodes the gateway has accepted no heartbeat from for
+// longer than ttl, measured on the registry's monotonic receipt clock, and
+// returns them. A node exactly at the TTL boundary is retained. A node's own
+// last_seen_ms never decides it: a reporting node whose clock is wrong is
+// still reporting. A node whose last heartbeat or health export read critical
+// is never evicted: see EvictStaleRetainingCritical.
+func (r *Registry) EvictStale(ttl time.Duration) []NodeHeartbeat {
+	evicted, _ := r.EvictStaleRetainingCritical(ttl)
 	return evicted
 }
 
@@ -194,23 +238,22 @@ func (r *Registry) EvictStale(nowMS, ttlMS int64) []NodeHeartbeat {
 // read critical, stays in the registry, stale and critical, until it reports
 // again (and, for the export, until a later export reads otherwise): silence
 // after critical may be the failure itself, and a projection must not fold
-// critical. A critical node is silent
-// when the gateway has accepted no heartbeat from it for longer than ttlMS,
-// judged on GatewaySeen, the gateway's own receipt time. retained lists the
-// nodes first found silent by this call, so the caller can report each silence
-// once.
+// critical. retained lists the nodes first found silent by this call, so the
+// caller can report each silence once.
 // The retention is bounded by the configured devices, the only ones whose
 // heartbeats reach the registry; a decommissioned node is cleared by removing
 // it from gateway.device_ids and restarting the gateway.
-func (r *Registry) EvictStaleRetainingCritical(nowMS, ttlMS int64) (evicted, retained []NodeHeartbeat) {
+func (r *Registry) EvictStaleRetainingCritical(ttl time.Duration) (evicted, retained []NodeHeartbeat) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := r.clock.mono()
 	evicted = make([]NodeHeartbeat, 0)
 	for deviceID, heartbeat := range r.nodes {
+		// Silence is the gateway's observation: the time since it last
+		// accepted a heartbeat, never the producer's last_seen_ms.
+		silent := receiptStale(heartbeat, now, ttl)
 		if heartbeat.Status == NodeStatusCritical || heartbeat.ExportSeverity == ExportSeverityCritical {
-			// Silence is the gateway's observation: the time since it last
-			// accepted a heartbeat, never the producer's last_seen_ms.
-			if nowMS-heartbeat.GatewaySeen > ttlMS {
+			if silent {
 				if _, already := r.silentCritical[deviceID]; !already {
 					r.silentCritical[deviceID] = struct{}{}
 					retained = append(retained, heartbeat)
@@ -218,11 +261,18 @@ func (r *Registry) EvictStaleRetainingCritical(nowMS, ttlMS int64) (evicted, ret
 			}
 			continue
 		}
-		if heartbeat.LastSeenMS > nowMS || nowMS-heartbeat.LastSeenMS > ttlMS {
+		if silent {
 			evicted = append(evicted, heartbeat)
 			delete(r.nodes, deviceID)
 			delete(r.evidence, deviceID)
 		}
 	}
 	return evicted, retained
+}
+
+// receiptStale reports whether the gateway has accepted no heartbeat from the
+// node for longer than ttl, at monotonic time now. A node exactly at the TTL
+// boundary is not stale.
+func receiptStale(heartbeat NodeHeartbeat, now, ttl time.Duration) bool {
+	return now-heartbeat.receivedMono > ttl
 }

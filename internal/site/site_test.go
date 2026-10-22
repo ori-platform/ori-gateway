@@ -5,9 +5,9 @@ package site
 
 import (
 	"encoding/json"
-	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRegistryUpsertAndSnapshot(t *testing.T) {
@@ -24,23 +24,19 @@ func TestRegistryUpsertAndSnapshot(t *testing.T) {
 	}
 }
 
-func TestEvictStaleRemovesOldNode(t *testing.T) {
-	reg := NewRegistry()
-	want := NodeHeartbeat{
-		DeviceID:       "node-stale",
-		Status:         "ok",
-		LastSeenMS:     0,
-		GatewaySeen:    10,
-		ActiveTriggers: []string{},
-	}
-	reg.Upsert(want)
+func TestEvictStaleRemovesANodeTheGatewayHasNotHeardFrom(t *testing.T) {
+	clock := newFakeReceiptClock(10)
+	reg := clock.registry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-stale", Status: "ok", LastSeenMS: 5})
 
-	evicted := reg.EvictStale(1000, 100)
+	clock.advance(101 * time.Millisecond)
+	evicted := reg.EvictStale(100 * time.Millisecond)
 	if len(evicted) != 1 {
 		t.Fatalf("expected one eviction, got %d", len(evicted))
 	}
-	if !reflect.DeepEqual(evicted[0], want) {
-		t.Fatalf("unexpected evicted heartbeat: %#v", evicted[0])
+	got := evicted[0]
+	if got.DeviceID != "node-stale" || got.Status != "ok" || got.LastSeenMS != 5 || got.GatewaySeen != 10 {
+		t.Fatalf("unexpected evicted heartbeat: %#v", got)
 	}
 	if snapshot := reg.Snapshot(); len(snapshot) != 0 {
 		t.Fatalf("expected empty registry, got %d nodes", len(snapshot))
@@ -48,16 +44,12 @@ func TestEvictStaleRemovesOldNode(t *testing.T) {
 }
 
 func TestEvictStaleKeepsFreshNode(t *testing.T) {
-	reg := NewRegistry()
-	reg.Upsert(NodeHeartbeat{
-		DeviceID:    "node-fresh",
-		Status:      "ok",
-		LastSeenMS:  950,
-		GatewaySeen: 960,
-	})
+	clock := newFakeReceiptClock(960)
+	reg := clock.registry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-fresh", Status: "ok", LastSeenMS: 950})
 
-	evicted := reg.EvictStale(1000, 100)
-	if len(evicted) != 0 {
+	clock.advance(40 * time.Millisecond)
+	if evicted := reg.EvictStale(100 * time.Millisecond); len(evicted) != 0 {
 		t.Fatalf("expected no evictions, got %d", len(evicted))
 	}
 	if snapshot := reg.Snapshot(); len(snapshot) != 1 {
@@ -66,40 +58,25 @@ func TestEvictStaleKeepsFreshNode(t *testing.T) {
 }
 
 func TestEvictStaleAtTTLBoundary(t *testing.T) {
-	const (
-		nowMS = int64(1000)
-		ttlMS = int64(100)
-	)
+	const ttl = 100 * time.Millisecond
+	clock := newFakeReceiptClock(1000)
+	reg := clock.registry()
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-past-ttl", Status: "ok", LastSeenMS: 1000})
+	clock.advance(time.Millisecond)
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-at-ttl", Status: "ok", LastSeenMS: 1001})
 
-	reg := NewRegistry()
-	reg.Upsert(NodeHeartbeat{
-		DeviceID:   "node-at-ttl",
-		Status:     "ok",
-		LastSeenMS: nowMS - ttlMS,
-	})
-
-	evicted := reg.EvictStale(nowMS, ttlMS)
-	if len(evicted) != 0 {
-		t.Fatalf("node exactly at TTL should be retained, got %d evictions", len(evicted))
+	clock.advance(ttl)
+	evicted := reg.EvictStale(ttl)
+	if len(evicted) != 1 || evicted[0].DeviceID != "node-past-ttl" {
+		t.Fatalf("only the node past the TTL should be evicted, got %#v", evicted)
 	}
-
-	reg.Upsert(NodeHeartbeat{
-		DeviceID:   "node-past-ttl",
-		Status:     "ok",
-		LastSeenMS: nowMS - ttlMS - 1,
-	})
-
-	evicted = reg.EvictStale(nowMS, ttlMS)
-	if len(evicted) != 1 {
-		t.Fatalf("node past TTL should be evicted, got %d evictions", len(evicted))
-	}
-	if evicted[0].DeviceID != "node-past-ttl" {
-		t.Fatalf("unexpected evicted device_id: %q", evicted[0].DeviceID)
+	if snapshot := reg.Snapshot(); len(snapshot) != 1 || snapshot[0].DeviceID != "node-at-ttl" {
+		t.Fatalf("the node exactly at the TTL should be retained, got %#v", snapshot)
 	}
 }
 
 func TestNodeHeartbeatActiveTriggersJSON(t *testing.T) {
-	reg := NewRegistry()
+	reg := newFakeReceiptClock(20).registry()
 	reg.Upsert(NodeHeartbeat{
 		DeviceID:   "node-1",
 		Status:     "ok",
@@ -118,7 +95,7 @@ func TestNodeHeartbeatActiveTriggersJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) != `{"device_id":"node-1","status":"ok","last_seen_ms":10,"gateway_seen_ms":0,"active_triggers":[]}` {
+	if string(encoded) != `{"device_id":"node-1","status":"ok","last_seen_ms":10,"gateway_seen_ms":20,"active_triggers":[]}` {
 		t.Fatalf("unexpected JSON: %s", encoded)
 	}
 
@@ -141,10 +118,9 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			reg.Upsert(NodeHeartbeat{
-				DeviceID:    "node-1",
-				Status:      "ok",
-				LastSeenMS:  int64(id),
-				GatewaySeen: int64(id + 1),
+				DeviceID:   "node-1",
+				Status:     "ok",
+				LastSeenMS: int64(id),
 			})
 		}(i)
 	}
@@ -157,7 +133,7 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 	for range workers {
 		go func() {
 			defer wg.Done()
-			_ = reg.EvictStale(1000, 100)
+			_ = reg.EvictStale(100 * time.Millisecond)
 		}()
 	}
 
@@ -243,19 +219,74 @@ func TestSnapshotPostureIsDeepCopied(t *testing.T) {
 	}
 }
 
-func TestEvictStaleRemovesFutureDatedNode(t *testing.T) {
-	reg := NewRegistry()
-	reg.Upsert(NodeHeartbeat{
-		DeviceID:   "node-future",
-		Status:     "healthy",
-		LastSeenMS: 2000,
-	})
+// The node's own clock never decides whether it is still reporting
+// (#126's acceptance criteria): a node reporting every interval is kept, with
+// its clock far behind or a little ahead of the gateway's.
+func TestAReportingNodeIsNeverEvictedWhateverItsClockSays(t *testing.T) {
+	const (
+		interval = 5 * time.Second
+		ttl      = 3 * interval
+	)
+	for name, skew := range map[string]time.Duration{"200 s behind": -200 * time.Second, "2 s ahead": 2 * time.Second} {
+		t.Run(name, func(t *testing.T) {
+			clock := newFakeReceiptClock(1_800_000_000_000)
+			reg := clock.registry()
+			for range 20 {
+				reg.Upsert(NodeHeartbeat{
+					DeviceID: "node-1", Status: NodeStatusHealthy,
+					LastSeenMS: clock.Wall().Add(skew).UnixMilli(),
+				})
+				clock.advance(interval)
+				if evicted := reg.EvictStale(ttl); len(evicted) != 0 {
+					t.Fatalf("a reporting node was evicted: %#v", evicted)
+				}
+			}
+		})
+	}
+}
 
-	evicted := reg.EvictStale(1000, 100)
-	if len(evicted) != 1 {
-		t.Fatalf("future-dated node should be evicted, got %d evictions", len(evicted))
+// A node that stops reporting is evicted at the TTL measured from its last
+// receipt, whatever its last_seen_ms claimed.
+func TestASilentNodeIsEvictedAtTheTTLFromItsLastReceipt(t *testing.T) {
+	const ttl = 15 * time.Second
+	clock := newFakeReceiptClock(1_800_000_000_000)
+	reg := clock.registry()
+	// A last_seen_ms far ahead of the gateway's clock buys no extra life.
+	reg.Upsert(NodeHeartbeat{DeviceID: "node-1", Status: NodeStatusHealthy, LastSeenMS: clock.Wall().Add(time.Hour).UnixMilli()})
+
+	clock.advance(ttl)
+	if evicted := reg.EvictStale(ttl); len(evicted) != 0 {
+		t.Fatalf("evicted at the TTL boundary: %#v", evicted)
 	}
-	if evicted[0].DeviceID != "node-future" {
-		t.Fatalf("unexpected evicted device_id: %q", evicted[0].DeviceID)
+	clock.advance(time.Millisecond)
+	if evicted := reg.EvictStale(ttl); len(evicted) != 1 {
+		t.Fatalf("a node silent past the TTL from its last receipt was kept: %#v", evicted)
 	}
+}
+
+// Receipt age runs on the monotonic clock (#128): a wall clock that steps
+// forward makes no reporting node silent, and one that steps back hides no
+// silence.
+func TestAWallClockStepNeitherSilencesNorHidesANode(t *testing.T) {
+	const ttl = 15 * time.Second
+	t.Run("forward", func(t *testing.T) {
+		clock := newFakeReceiptClock(1_800_000_000_000)
+		reg := clock.registry()
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-1", Status: NodeStatusHealthy, LastSeenMS: 1})
+		clock.stepWall(time.Hour)
+		clock.advance(time.Second)
+		if evicted := reg.EvictStale(ttl); len(evicted) != 0 {
+			t.Fatalf("a forward wall step evicted a reporting node: %#v", evicted)
+		}
+	})
+	t.Run("back", func(t *testing.T) {
+		clock := newFakeReceiptClock(1_800_000_000_000)
+		reg := clock.registry()
+		reg.Upsert(NodeHeartbeat{DeviceID: "node-1", Status: NodeStatusHealthy, LastSeenMS: 1})
+		clock.stepWall(-time.Hour)
+		clock.advance(ttl + time.Millisecond)
+		if evicted := reg.EvictStale(ttl); len(evicted) != 1 {
+			t.Fatalf("a backward wall step hid a silence: %#v", evicted)
+		}
+	})
 }

@@ -4,6 +4,7 @@
 package site
 
 import (
+	"math"
 	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -200,7 +201,9 @@ type GatewayEvidenceDeliveryHeld struct {
 type ProjectOptions struct {
 	// ExpectedDeviceIDs lists the device IDs the gateway expects to observe heartbeats from.
 	ExpectedDeviceIDs []string
-	// NodeTTLMS is the staleness threshold: nodes not seen within this window are stale.
+	// NodeTTLMS is the staleness threshold: a node the gateway has accepted no
+	// heartbeat from within this window, on its monotonic receipt clock, is
+	// stale.
 	NodeTTLMS int64
 }
 
@@ -225,7 +228,12 @@ func NewProjector(registry *Registry, opts ProjectOptions) *Projector {
 // Project returns a point-in-time SiteHealth snapshot.
 func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	nowMS := now.UnixMilli()
-	snapshot, exportSeverity := p.registry.snapshotWithExportSeverity()
+	snapshot, exportSeverity, receiptNow := p.registry.snapshotWithExportSeverity()
+	// A TTL too long to hold as a Duration never ends.
+	ttl := time.Duration(math.MaxInt64)
+	if p.opts.NodeTTLMS < math.MaxInt64/int64(time.Millisecond) {
+		ttl = time.Duration(p.opts.NodeTTLMS) * time.Millisecond
+	}
 	observed := make(map[string]NodeHeartbeat, len(snapshot))
 	for _, n := range snapshot {
 		observed[n.DeviceID] = n
@@ -247,7 +255,9 @@ func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 			})
 			continue
 		}
-		stale := siteNodeIsStale(n.LastSeenMS, nowMS, p.opts.NodeTTLMS)
+		// Whether the node is still reporting is the gateway's observation,
+		// its receipt age, never the node's own last_seen_ms.
+		stale := receiptStale(n, receiptNow, ttl)
 		// The node's own status is a floor, never a ceiling: staleness and an
 		// evidence-integrity problem raise a healthy node to degraded and leave
 		// a critical one critical, and the severity read from its health
@@ -324,10 +334,4 @@ func siteStatusName(severity int) string {
 	default:
 		return SiteStatusCritical
 	}
-}
-
-// siteNodeIsStale mirrors the staleness predicate in Registry.EvictStale.
-// A node exactly at the TTL boundary is not stale. Future-dated heartbeats are stale.
-func siteNodeIsStale(lastSeenMS, nowMS, ttlMS int64) bool {
-	return lastSeenMS > nowMS || nowMS-lastSeenMS > ttlMS
 }

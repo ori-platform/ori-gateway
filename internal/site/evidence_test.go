@@ -91,7 +91,8 @@ func TestRegistryEvidenceDetectsHeadRegression(t *testing.T) {
 }
 
 func TestRegistryEvidenceMemoryIsPerDeviceAndClearedOnEviction(t *testing.T) {
-	reg := NewRegistry()
+	clock := newFakeReceiptClock(1)
+	reg := clock.registry()
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 0, true))
 	reg.Upsert(evidenceBeat("dev-02", headHash(1), 0, true))
 	reg.Upsert(evidenceBeat("dev-01", "", 0, true))
@@ -103,7 +104,8 @@ func TestRegistryEvidenceMemoryIsPerDeviceAndClearedOnEviction(t *testing.T) {
 	}
 
 	// Eviction drops the evidence memory: a re-registered device starts fresh.
-	reg.EvictStale(time.Now().UnixMilli()+10_000_000_000, 1)
+	clock.advance(time.Hour)
+	reg.EvictStale(time.Millisecond)
 	reg.Upsert(evidenceBeat("dev-01", "", 0, true))
 	got := reg.Snapshot()[0].Evidence
 	if got.TruncationSuspected {

@@ -86,6 +86,10 @@ func refuseInexactMembers(raw []byte, members []string, path string) error {
 // key. A struct decode would match member names case-insensitively.
 func decodeRuntimeHeartbeat(members map[string]json.RawMessage) (contracts.RuntimeNodeHeartbeat, error) {
 	var beat contracts.RuntimeNodeHeartbeat
+	// gateway_seen_ms is decoded for its type only and never read: the
+	// gateway stamps its own receipt, so no producer-supplied value reaches
+	// the receiver's clock.
+	var gatewaySeenMS int64
 	for _, m := range []struct {
 		name string
 		dst  any
@@ -93,7 +97,7 @@ func decodeRuntimeHeartbeat(members map[string]json.RawMessage) (contracts.Runti
 		{"device_id", &beat.DeviceID},
 		{"status", &beat.Status},
 		{"last_seen_ms", &beat.LastSeenMS},
-		{"gateway_seen_ms", &beat.GatewaySeenMS},
+		{"gateway_seen_ms", &gatewaySeenMS},
 		{"active_triggers", &beat.ActiveTriggers},
 	} {
 		if err := decodeExactMember(members, m.name, m.dst); err != nil {

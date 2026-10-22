@@ -110,7 +110,6 @@ type RuntimeNodeHeartbeat struct {
 	DeviceID       string                        `json:"device_id"`
 	Status         string                        `json:"status"`
 	LastSeenMS     int64                         `json:"last_seen_ms"`
-	GatewaySeenMS  int64                         `json:"gateway_seen_ms"`
 	ActiveTriggers []string                      `json:"active_triggers"`
 	Evidence       *RuntimeNodeHeartbeatEvidence `json:"evidence,omitempty"`
 	Auth           *HeartbeatAuth                `json:"auth,omitempty"`

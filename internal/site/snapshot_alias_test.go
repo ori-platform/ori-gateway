@@ -215,7 +215,7 @@ func TestAliasProbeCoversEveryReferenceField(t *testing.T) {
 func TestSnapshotSharesNoMutableReference(t *testing.T) {
 	probe := aliasProbeHeartbeat()
 
-	reg := NewRegistry()
+	reg := frozenRegistry()
 	reg.Upsert(aliasProbeHeartbeat())
 	baseline := reg.Snapshot()[0]
 
@@ -229,7 +229,7 @@ func TestSnapshotSharesNoMutableReference(t *testing.T) {
 
 	for idx, describe := range paths {
 		t.Run(describe.path, func(t *testing.T) {
-			fresh := NewRegistry()
+			fresh := frozenRegistry()
 			fresh.Upsert(aliasProbeHeartbeat())
 
 			taken := fresh.Snapshot()[0]
@@ -262,14 +262,14 @@ func TestSnapshotSharesNoMutableReference(t *testing.T) {
 // baselineOf returns what a snapshot should still look like: the registry's
 // own view, taken from a registry no caller has touched.
 func baselineOf(probe NodeHeartbeat, _ *Registry) NodeHeartbeat {
-	clean := NewRegistry()
+	clean := frozenRegistry()
 	clean.Upsert(probe)
 	return clean.Snapshot()[0]
 }
 
 // Two snapshots must not share backing arrays with each other either.
 func TestSnapshotsAreIndependentOfEachOther(t *testing.T) {
-	reg := NewRegistry()
+	reg := frozenRegistry()
 	reg.Upsert(aliasProbeHeartbeat())
 
 	first := reg.Snapshot()[0]
@@ -299,4 +299,10 @@ func TestCloneStringsPreservesNil(t *testing.T) {
 	if got := cloneStrings([]string{}); got == nil || len(got) != 0 {
 		t.Fatalf("empty became %#v", got)
 	}
+}
+
+// frozenRegistry stamps every receipt at the same instant, so two registries
+// given the same heartbeats hold equal state.
+func frozenRegistry() *Registry {
+	return newFakeReceiptClock(2).registry()
 }

@@ -286,29 +286,35 @@ func TestCriticalHeartbeatKeptThroughGetHealth(t *testing.T) {
 // evidence-integrity problem, not a degraded gateway, not a missing node.
 func TestCriticalNodeNeverFoldedBelowCritical(t *testing.T) {
 	nowMS := int64(1234567890000)
-	now := time.UnixMilli(nowMS)
 	degradedDelivery := &GatewayEvidenceDeliveryView{Degraded: true, Blocked: true}
 	cases := []struct {
 		name string
 		beat NodeHeartbeat
-		gw   GatewayView
+		// silent is how long the gateway has heard nothing from the node.
+		silent time.Duration
+		gw     GatewayView
 	}{
-		{"fresh", NodeHeartbeat{LastSeenMS: nowMS}, healthyGateway()},
-		{"stale", NodeHeartbeat{LastSeenMS: nowMS - 60000}, healthyGateway()},
-		{"future-dated", NodeHeartbeat{LastSeenMS: nowMS + 60000}, healthyGateway()},
-		{"evidence unavailable", NodeHeartbeat{LastSeenMS: nowMS, Evidence: &NodeEvidence{Available: false}}, healthyGateway()},
-		{"evidence regressed", NodeHeartbeat{LastSeenMS: nowMS, Evidence: &NodeEvidence{Available: true, HeadRegressed: true, TruncationSuspected: true}}, healthyGateway()},
-		{"gateway degraded", NodeHeartbeat{LastSeenMS: nowMS}, GatewayView{Status: SiteStatusDegraded, EvidenceDelivery: degradedDelivery}},
-		{"gateway starting", NodeHeartbeat{LastSeenMS: nowMS}, GatewayView{Status: "starting"}},
+		{"fresh", NodeHeartbeat{LastSeenMS: nowMS}, 0, healthyGateway()},
+		{"stale", NodeHeartbeat{LastSeenMS: nowMS}, time.Minute, healthyGateway()},
+		{"future-dated", NodeHeartbeat{LastSeenMS: nowMS + 60000}, 0, healthyGateway()},
+		{"evidence unavailable", NodeHeartbeat{LastSeenMS: nowMS, Evidence: &NodeEvidence{Available: false}}, 0, healthyGateway()},
+		{"evidence regressed", NodeHeartbeat{LastSeenMS: nowMS, Evidence: &NodeEvidence{Available: true, HeadRegressed: true, TruncationSuspected: true}}, 0, healthyGateway()},
+		{"gateway degraded", NodeHeartbeat{LastSeenMS: nowMS}, 0, GatewayView{Status: SiteStatusDegraded, EvidenceDelivery: degradedDelivery}},
+		{"gateway starting", NodeHeartbeat{LastSeenMS: nowMS}, 0, GatewayView{Status: "starting"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reg := NewRegistry()
+			clock := newFakeReceiptClock(nowMS)
+			reg := clock.registry()
 			beat := tc.beat
 			beat.DeviceID = "node-a"
 			beat.Status = NodeStatusCritical
 			reg.Upsert(beat)
-			out := getHealthWithGateway(t, reg, []string{"node-a", "node-missing"}, now, tc.gw)
+			clock.advance(tc.silent)
+			out := getHealthWithGateway(t, reg, []string{"node-a", "node-missing"}, clock.Wall(), tc.gw)
+			if out.Nodes[0].Stale != (tc.silent > 0) {
+				t.Errorf("node stale = %v after %v of silence", out.Nodes[0].Stale, tc.silent)
+			}
 			if out.Status != SiteStatusCritical {
 				t.Errorf("site status = %q, want critical", out.Status)
 			}
@@ -361,18 +367,19 @@ func TestProjectedSeverityUnknownIsDegraded(t *testing.T) {
 // silenceHarness drives heartbeats through the real handler at a movable
 // clock, evicts as the gateway's eviction loop does, and reads GET /health.
 type silenceHarness struct {
-	t   *testing.T
-	now time.Time
-	h   *RuntimeHeartbeatHandler
-	reg *Registry
+	t     *testing.T
+	clock *fakeReceiptClock
+	h     *RuntimeHeartbeatHandler
+	reg   *Registry
 }
 
-const silenceTTLMS = 5000
+const silenceTTL = 5 * time.Second
 
 func newSilenceHarness(t *testing.T) *silenceHarness {
 	t.Helper()
-	s := &silenceHarness{t: t, now: time.UnixMilli(1234567890000), reg: NewRegistry()}
-	h, err := NewRuntimeHeartbeatHandler(s.reg, RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return s.now }})
+	clock := newFakeReceiptClock(1234567890000)
+	s := &silenceHarness{t: t, clock: clock, reg: clock.registry()}
+	h, err := NewRuntimeHeartbeatHandler(s.reg, RuntimeHeartbeatHandlerOptions{Now: clock.Wall})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +389,7 @@ func newSilenceHarness(t *testing.T) *silenceHarness {
 
 func (s *silenceHarness) beat(status string, reasons []any) {
 	s.t.Helper()
-	payload := heartbeatMap(status, s.now.UnixMilli())
+	payload := heartbeatMap(status, s.clock.Wall().UnixMilli())
 	if reasons != nil {
 		payload["degradation_reasons"] = reasons
 	}
@@ -392,13 +399,13 @@ func (s *silenceHarness) beat(status string, reasons []any) {
 }
 
 func (s *silenceHarness) silence(d time.Duration) (evicted, retained []NodeHeartbeat) {
-	s.now = s.now.Add(d)
-	return s.reg.EvictStaleRetainingCritical(s.now.UnixMilli(), silenceTTLMS)
+	s.clock.advance(d)
+	return s.reg.EvictStaleRetainingCritical(silenceTTL)
 }
 
 func (s *silenceHarness) health() SiteHealth {
 	s.t.Helper()
-	return getHealth(s.t, s.reg, []string{"dev-01"}, s.now)
+	return getHealth(s.t, s.reg, []string{"dev-01"}, s.clock.Wall())
 }
 
 // Critical, then silence past eviction: still critical, reported once; a fresh
@@ -407,7 +414,7 @@ func TestSilentCriticalNodeStaysCriticalUntilItReportsAgain(t *testing.T) {
 	s := newSilenceHarness(t)
 	s.beat(NodeStatusCritical, []any{"decision_record_lost"})
 
-	evicted, retained := s.silence(10 * silenceTTLMS * time.Millisecond)
+	evicted, retained := s.silence(10 * silenceTTL)
 	if len(evicted) != 0 || len(retained) != 1 || retained[0].DeviceID != "dev-01" {
 		t.Fatalf("first eviction past TTL: evicted %v retained %v", evicted, retained)
 	}
@@ -420,7 +427,7 @@ func TestSilentCriticalNodeStaysCriticalUntilItReportsAgain(t *testing.T) {
 		t.Fatalf("silent critical node lost its reasons: %#v", n.DegradationReasons)
 	}
 
-	evicted, retained = s.silence(1000 * silenceTTLMS * time.Millisecond)
+	evicted, retained = s.silence(1000 * silenceTTL)
 	if len(evicted) != 0 || len(retained) != 0 {
 		t.Fatalf("later eviction: evicted %v, retained %v (retention is reported once)", evicted, retained)
 	}
@@ -433,7 +440,7 @@ func TestSilentCriticalNodeStaysCriticalUntilItReportsAgain(t *testing.T) {
 		t.Fatalf("fresh healthy heartbeat did not clear critical: %#v", out)
 	}
 
-	evicted, retained = s.silence(2 * silenceTTLMS * time.Millisecond)
+	evicted, retained = s.silence(2 * silenceTTL)
 	if len(evicted) != 1 || len(retained) != 0 {
 		t.Fatalf("silent healthy node: evicted %v retained %v", evicted, retained)
 	}
@@ -446,11 +453,11 @@ func TestSilentCriticalNodeStaysCriticalUntilItReportsAgain(t *testing.T) {
 func TestSilentCriticalRetentionReportedPerSilence(t *testing.T) {
 	s := newSilenceHarness(t)
 	s.beat(NodeStatusCritical, nil)
-	if _, retained := s.silence(2 * silenceTTLMS * time.Millisecond); len(retained) != 1 {
+	if _, retained := s.silence(2 * silenceTTL); len(retained) != 1 {
 		t.Fatalf("first silence retained %v", retained)
 	}
 	s.beat(NodeStatusCritical, nil)
-	if _, retained := s.silence(silenceTTLMS * time.Millisecond); len(retained) != 0 {
+	if _, retained := s.silence(silenceTTL); len(retained) != 0 {
 		t.Fatalf("a node at the TTL boundary is not silent: retained %v", retained)
 	}
 	if _, retained := s.silence(time.Millisecond); len(retained) != 1 {
@@ -466,7 +473,7 @@ func TestSilenceAfterDegradedIsEvicted(t *testing.T) {
 			s := newSilenceHarness(t)
 			s.beat(NodeStatusCritical, nil)
 			s.beat(status, nil)
-			evicted, retained := s.silence(2 * silenceTTLMS * time.Millisecond)
+			evicted, retained := s.silence(2 * silenceTTL)
 			if len(evicted) != 1 || len(retained) != 0 {
 				t.Fatalf("evicted %v retained %v", evicted, retained)
 			}
@@ -478,16 +485,23 @@ func TestSilenceAfterDegradedIsEvicted(t *testing.T) {
 	}
 }
 
-// A future-dated critical node, which eviction otherwise drops at once, is
-// retained critical as well, and EvictStale keeps it too.
+// A future last_seen_ms neither shortens nor lengthens a node's life: both
+// nodes are kept while reporting, and once silent past the TTL the healthy one
+// is evicted and the critical one retained.
 func TestFutureDatedCriticalNodeRetained(t *testing.T) {
-	reg := NewRegistry()
+	clock := newFakeReceiptClock(1000)
+	reg := clock.registry()
 	reg.Upsert(NodeHeartbeat{DeviceID: "dev-01", Status: NodeStatusCritical, LastSeenMS: 2000})
 	reg.Upsert(NodeHeartbeat{DeviceID: "dev-02", Status: NodeStatusHealthy, LastSeenMS: 2000})
-	if evicted := reg.EvictStale(1000, 100); len(evicted) != 1 || evicted[0].DeviceID != "dev-02" {
+	if evicted := reg.EvictStale(100 * time.Millisecond); len(evicted) != 0 {
+		t.Fatalf("a reporting node with its clock ahead was evicted: %v", evicted)
+	}
+	// Past both the eviction TTL and the projection's (5 s).
+	clock.advance(6 * time.Second)
+	if evicted := reg.EvictStale(100 * time.Millisecond); len(evicted) != 1 || evicted[0].DeviceID != "dev-02" {
 		t.Fatalf("evicted %v", evicted)
 	}
-	out := getHealth(t, reg, []string{"dev-01", "dev-02"}, time.UnixMilli(1000))
+	out := getHealth(t, reg, []string{"dev-01", "dev-02"}, clock.Wall())
 	if out.Status != SiteStatusCritical || out.Nodes[0].Status != SiteStatusCritical || !out.Nodes[0].Stale {
 		t.Fatalf("future-dated critical node: %#v", out)
 	}
@@ -496,11 +510,13 @@ func TestFutureDatedCriticalNodeRetained(t *testing.T) {
 // A retained node keeps its evidence history, so a chain that comes back
 // truncated after the silence is still caught.
 func TestRetainedCriticalNodeKeepsEvidenceHistory(t *testing.T) {
-	reg := NewRegistry()
+	clock := newFakeReceiptClock(1000)
+	reg := clock.registry()
 	beat := evidenceBeat("dev-01", headHash(1), 0, true)
 	beat.Status = NodeStatusCritical
 	reg.Upsert(beat)
-	if evicted, retained := reg.EvictStaleRetainingCritical(beat.LastSeenMS+10_000, 100); len(evicted) != 0 || len(retained) != 1 {
+	clock.advance(10 * time.Second)
+	if evicted, retained := reg.EvictStaleRetainingCritical(100 * time.Millisecond); len(evicted) != 0 || len(retained) != 1 {
 		t.Fatalf("evicted %v retained %v", evicted, retained)
 	}
 	reg.Upsert(evidenceBeat("dev-01", "", 0, true))
@@ -516,16 +532,16 @@ func TestSilentCriticalJudgedOnGatewayReceiptNotProducerClock(t *testing.T) {
 	for _, skew := range []time.Duration{2 * time.Second, -200 * time.Second} {
 		t.Run(skew.String(), func(t *testing.T) {
 			s := newSilenceHarness(t)
-			payload := heartbeatMap(NodeStatusCritical, s.now.Add(skew).UnixMilli())
+			payload := heartbeatMap(NodeStatusCritical, s.clock.Wall().Add(skew).UnixMilli())
 			if err := s.h.Handle(testTopic, mustJSON(t, payload)); err != nil {
 				t.Fatal(err)
 			}
 			for range 3 {
-				if evicted, retained := s.reg.EvictStaleRetainingCritical(s.now.UnixMilli(), silenceTTLMS); len(evicted) != 0 || len(retained) != 0 {
+				if evicted, retained := s.reg.EvictStaleRetainingCritical(silenceTTL); len(evicted) != 0 || len(retained) != 0 {
 					t.Fatalf("tick at arrival: evicted %v retained %v", evicted, retained)
 				}
 			}
-			if _, retained := s.silence(silenceTTLMS * time.Millisecond); len(retained) != 0 {
+			if _, retained := s.silence(silenceTTL); len(retained) != 0 {
 				t.Fatalf("tick at the TTL of arrival: retained %v", retained)
 			}
 			if _, retained := s.silence(time.Millisecond); len(retained) != 1 {
@@ -601,7 +617,8 @@ func TestHeartbeatMemberNamesAreExact(t *testing.T) {
 		for _, tc := range memberCases(1234567890000) {
 			t.Run(fmt.Sprintf("signed=%v/%s", signed, tc.name), func(t *testing.T) {
 				now := time.UnixMilli(1234567890000)
-				reg := NewRegistry()
+				clock := newFakeReceiptClock(now.UnixMilli())
+				reg := clock.registry()
 				opts := RuntimeHeartbeatHandlerOptions{Now: func() time.Time { return now }}
 				if signed {
 					verifier, err := mqttauth.NewVerifier(mqttauth.Config{SharedSecret: secret, Now: func() time.Time { return now }})
@@ -623,7 +640,8 @@ func TestHeartbeatMemberNamesAreExact(t *testing.T) {
 				if err := h.Handle(testTopic, body); err != nil {
 					t.Fatal(err)
 				}
-				reg.EvictStaleRetainingCritical(now.Add(time.Hour).UnixMilli(), silenceTTLMS)
+				clock.advance(time.Hour)
+				reg.EvictStaleRetainingCritical(silenceTTL)
 				before := reg.Snapshot()
 
 				now = now.Add(time.Hour)
@@ -677,7 +695,7 @@ func TestParseRuntimeHeartbeatReadsExactKeysOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reasons != nil || beat.DeviceID != "" || beat.LastSeenMS != 0 || beat.ActiveTriggers != nil || beat.GatewaySeenMS != 0 {
+	if reasons != nil || beat.DeviceID != "" || beat.LastSeenMS != 0 || beat.ActiveTriggers != nil {
 		t.Fatalf("case variants read as members: beat %#v reasons %#v", beat, reasons)
 	}
 	if beat.Evidence == nil || *beat.Evidence != (contracts.RuntimeNodeHeartbeatEvidence{}) {

@@ -20,7 +20,6 @@ func TestVerifierAcceptsSignedRuntimeHeartbeat(t *testing.T) {
 		DeviceID:       "dev-01",
 		Status:         "healthy",
 		LastSeenMS:     now.UnixMilli(),
-		GatewaySeenMS:  0,
 		ActiveTriggers: []string{},
 	}
 	auth, err := Sign(beat, contracts.RuntimeHeartbeatMessageType, "dev-01", "", now.UnixMilli(), "site-local-secret")
