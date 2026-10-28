@@ -217,6 +217,31 @@ supply chain integrity here has direct impact on device actuation decisions.
 
 8. `go mod verify` must run before any build or test step. This verifies the
    integrity of the module cache against `go.sum` checksums.
+   `scripts/check_workflows.py` holds rules 2, 7 and 8 for every job:
+   - each workflow declares `contents: read` and `id-token: none`, and so does
+     any job that sets its own permissions, except in `release.yml` (rule 3);
+   - each job sets `GOFLAGS=-mod=readonly` in its env and sets no
+     `defaults`. `GOFLAGS` and `CGO_ENABLED` are set only as keys of a job's
+     env; any other mention of either, in any case and anywhere but a job's or
+     step's display name, is refused, even a harmless one such as
+     `go env GOFLAGS`. The one exception is the run text of the root-only step
+     in `ci.yml`'s `test` job, pinned exactly, which passes both as constants
+     through `sudo env`;
+   - every env mapping (job, step, container, service), and every mapping that
+     holds one, is literal: no key anywhere in a job is an expression, and no
+     container, service, services block or step is computed (a container may
+     be a literal image name);
+   - each job's first command is exactly `go mod verify` or
+     `go mod verify && (cd tools && go mod verify)`, in a step that sets only
+     `name` and `run`.
+
+   The guard is a fail-closed policy on how a workflow is written. It parses no
+   shell and does not prove that a command cannot change the environment. It
+   leaves these to review: an action run before the verify step, a setting
+   changed at run time (`$GITHUB_ENV`, `go env -w`, a script, or a command
+   computed from an expression such as `run: ${{ vars.CMD }}`), a command-line
+   flag such as `go build -mod=mod`, and the runner's `PATH` that the pinned
+   root step carries into root.
 
 9. Every job in every workflow must set `CGO_ENABLED=0` in its job `env`, and
    nothing in the job may set it to anything else. The gateway has no CGO

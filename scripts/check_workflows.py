@@ -20,9 +20,6 @@ REMOTE_EXEC_RE = re.compile(
     r"(?:curl|wget)\b[^\n]*(?:\|\s*(?:bash|sh|python\d*)|&&\s*(?:bash|sh|python\d*)\b)",
     re.IGNORECASE,
 )
-CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*=\s*[\"']?([^\"'\s;&|]*)", re.IGNORECASE)
-# Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
-CGO_PASS_THROUGH = {"$CGO_ENABLED", "${CGO_ENABLED}"}
 # The race detector needs cgo, so one job in ci.yml, which only runs tests,
 # may enable it. Every part of it is held to exactly what it needs.
 RACE_WORKFLOW = "ci.yml"
@@ -38,6 +35,30 @@ RACE_JOB_ACTIONS = {
     "actions/checkout": set(),
     "actions/setup-go": {"go-version-file", "cache"},
 }
+# Every job keeps go.mod and go.sum as committed, and verifies the module
+# cache against go.sum before it runs any other command.
+GOFLAGS_SETTING = "-mod=readonly"
+# The verify step runs exactly one of these commands, whose failure fails the
+# job, and sets nothing that could skip or soften it. No other shell is read.
+VERIFY_RUNS = {"go mod verify", "go mod verify && (cd tools && go mod verify)"}
+VERIFY_STEP_KEYS = {"name", "run"}
+# The guard reads no shell. GOFLAGS and CGO_ENABLED are set only as keys of a
+# job's env, and any other mention of either, in any case, is refused unread,
+# even a harmless one such as `go env GOFLAGS`. The one exception is the run
+# text of the step below, pinned exactly: it gives the elevated process both
+# settings as constants, since sudo does not pass the job env through.
+ROOT_STEP_JOB = "test"
+ROOT_STEP_RUN = (
+    'out="$(sudo env "PATH=$PATH" CGO_ENABLED=0 GOFLAGS=-mod=readonly \\\n'
+    '  "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=$(mktemp -d)" \\\n'
+    "  go test ./internal/evidence/courier -run '^TestADirectoryOwnedByAnotherUserIsRefused$' -count=1 -v)\"\n"
+    'echo "$out"\n'
+    "grep -q -- '--- PASS: TestADirectoryOwnedByAnotherUserIsRefused' <<<\"$out\"\n"
+)
+MENTION_REFUSAL = "the guard reads no shell, so any other mention is refused, even a harmless one"
+# Every workflow declares contents: read and id-token: none; only a release
+# workflow's jobs may declare otherwise (rule 3).
+RELEASE_WORKFLOW = "release.yml"
 PINNED_ACTION_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@[0-9a-f]{40}$")
 
 
@@ -60,18 +81,86 @@ def _construct_strict_mapping(loader: _StrictLoader, node: yaml.MappingNode, dee
 _StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_strict_mapping)
 
 
-def _cgo_settings(value: object):
-    """Every value CGO_ENABLED is declared with anywhere in value: as a key, or as an assignment in a string."""
+def _leaves(value: object, at: tuple = ()):
+    """Every mapping key and scalar in value, with the path that reaches it."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if str(key).upper() == "CGO_ENABLED":
-                yield item
-            yield from _cgo_settings(item)
+            yield at + (key,), key
+            yield from _leaves(item, at + (key,))
     elif isinstance(value, list):
-        for item in value:
-            yield from _cgo_settings(item)
-    elif isinstance(value, str):
-        yield from CGO_SETTING_RE.findall(value)
+        for index, item in enumerate(value):
+            yield from _leaves(item, at + (index,))
+    else:
+        yield at, value
+
+
+def _mentions(path: Path, job_name: str, job: dict, setting: str) -> bool:
+    """Whether job mentions setting anywhere but as a key of its env.
+
+    Only the job's and its steps' display names are skipped, and the pinned
+    root step's run text in ci.yml's test job.
+    """
+    for at, leaf in _leaves(job):
+        if not isinstance(leaf, str) or setting.lower() not in leaf.lower():
+            continue
+        if at == ("env", setting) and leaf == setting:
+            continue
+        if at == ("name",) or (len(at) == 3 and at[0] == "steps" and at[2] == "name"):
+            continue
+        if (
+            path.name == RACE_WORKFLOW
+            and job_name == ROOT_STEP_JOB
+            and len(at) == 3 and at[0] == "steps" and at[2] == "run"
+            and leaf == ROOT_STEP_RUN
+        ):
+            continue
+        return True
+    return False
+
+
+def _check_literal_env(path: Path, job_name: str, job: dict, failures: list[str]) -> None:
+    """Every env mapping in the job, and every mapping that holds one, is literal.
+
+    No key anywhere in the job is an expression, which refuses mapping
+    insertions; a container, the services, each service and each step are
+    literal mappings (a container may also be a literal image name); every
+    env is a mapping. So the guard sees every setting the job declares.
+    """
+    def computed(value: object) -> bool:
+        return isinstance(value, str) and "${{" in value
+
+    def keys(value: object):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield key
+                yield from keys(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from keys(item)
+
+    refused = any(not isinstance(key, str) or computed(key) for key in keys(job))
+    container = job.get("container")
+    services = job.get("services")
+    steps = job.get("steps") or []
+    mappings = [job.get("env")]
+    if container is not None and not isinstance(container, dict) and (not isinstance(container, str) or computed(container)):
+        refused = True
+    elif isinstance(container, dict):
+        mappings.append(container.get("env"))
+    if services is not None and (
+        not isinstance(services, dict) or any(not isinstance(service, dict) for service in services.values())
+    ):
+        refused = True
+    for service in services.values() if isinstance(services, dict) else ():
+        if isinstance(service, dict):
+            mappings.append(service.get("env"))
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        refused = True
+    for step in steps if isinstance(steps, list) else ():
+        if isinstance(step, dict):
+            mappings.append(step.get("env"))
+    if refused or any(env is not None and not isinstance(env, dict) for env in mappings):
+        failures.append(f"{path}: job {job_name} env, and every mapping that holds one, must be literal, not computed")
 
 
 def _workflow_files() -> list[Path]:
@@ -111,6 +200,9 @@ def _check_pre_commit_config(failures: list[str]) -> None:
 def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
     """Every job sets CGO_ENABLED=0, except ci.yml's test-only race job, which sets 1.
 
+    Every job also sets GOFLAGS=-mod=readonly and runs go mod verify first, and
+    every workflow but a release one grants contents: read and id-token: none.
+
     The workflow is read as YAML, so comments, aliases and folded lines mean
     what they mean to GitHub. Anything that is not the expected shape is
     refused rather than read past.
@@ -132,6 +224,7 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
         if key in workflow:
             failures.append(f"{path}: set {key} per job, not for the whole workflow")
     jobs = workflow.get("jobs") or {}
+    _check_permissions(path, workflow.get("permissions"), jobs if path.name != RELEASE_WORKFLOW else {}, failures)
     if not isinstance(jobs, dict):
         failures.append(f"{path}: cannot parse the jobs block")
         return
@@ -153,17 +246,57 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
             _check_race_job(path, name, job, failures)
         else:
             _check_cgo_off(path, name, job, failures)
+        _check_go_modules(path, name, job, failures)
+        _check_literal_env(path, name, job, failures)
+
+
+def _check_permissions(path: Path, permissions: object, jobs: object, failures: list[str]) -> None:
+    def normal(value: object) -> bool:
+        return isinstance(value, dict) and value.get("contents") == "read" and value.get("id-token") == "none"
+
+    if not normal(permissions):
+        failures.append(f"{path}: permissions must declare contents: read and id-token: none")
+    for name, job in jobs.items() if isinstance(jobs, dict) else ():
+        if isinstance(job, dict) and "permissions" in job and not normal(job["permissions"]):
+            failures.append(f"{path}: job {name} permissions must declare contents: read and id-token: none")
+
+
+def _check_go_modules(path: Path, name: str, job: dict, failures: list[str]) -> None:
+    """GOFLAGS=-mod=readonly in the job env, and go mod verify before any other command.
+
+    It is a fail-closed policy on how the workflow is written, not proof of
+    what its commands do: an action run before the verify step, a setting
+    changed at run time ($GITHUB_ENV, go env -w, a script, a command computed
+    from an expression such as `run: ${{ vars.CMD }}`), a command-line -mod
+    flag and the runner PATH the pinned root step carries into root are left
+    to review.
+    """
+    env = job.get("env")
+    if (
+        not isinstance(env, dict)
+        or env.get("GOFLAGS") != GOFLAGS_SETTING
+        or _mentions(path, name, job, "GOFLAGS")
+    ):
+        failures.append(
+            f"{path}: job {name} must set GOFLAGS to \"{GOFLAGS_SETTING}\" in its env and mention it nowhere else: {MENTION_REFUSAL}"
+        )
+    if "defaults" in job:
+        failures.append(f"{path}: job {name} sets defaults, which reach the go mod verify step")
+    steps = job.get("steps")
+    runs = [step for step in steps if isinstance(step, dict) and "run" in step] if isinstance(steps, list) else []
+    first = runs[0] if runs else {}
+    if first.get("run") not in VERIFY_RUNS or set(first) - VERIFY_STEP_KEYS:
+        failures.append(f"{path}: job {name} must first run exactly one of {sorted(VERIFY_RUNS)}, in a step with only a name")
 
 
 def _check_cgo_off(path: Path, name: str, job: dict, failures: list[str]) -> None:
     env = job.get("env")
-    settings = list(_cgo_settings(job))
     if (
         not isinstance(env, dict)
         or env.get("CGO_ENABLED") != "0"
-        or any(not isinstance(v, str) or (v != "0" and v not in CGO_PASS_THROUGH) for v in settings)
+        or _mentions(path, name, job, "CGO_ENABLED")
     ):
-        failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env, and nowhere to anything else")
+        failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env and mention it nowhere else: {MENTION_REFUSAL}")
 
 
 def _check_race_job(path: Path, name: str, job: dict, failures: list[str]) -> None:
