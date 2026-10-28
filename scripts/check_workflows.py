@@ -20,9 +20,6 @@ REMOTE_EXEC_RE = re.compile(
     r"(?:curl|wget)\b[^\n]*(?:\|\s*(?:bash|sh|python\d*)|&&\s*(?:bash|sh|python\d*)\b)",
     re.IGNORECASE,
 )
-CGO_SETTING_RE = re.compile(r"CGO_ENABLED\s*=\s*[\"']?([^\"'\s;&|]*)", re.IGNORECASE)
-# Passing the job's own setting through, CGO_ENABLED=$CGO_ENABLED, sets nothing.
-CGO_PASS_THROUGH = {"$CGO_ENABLED", "${CGO_ENABLED}"}
 # The race detector needs cgo, so one job in ci.yml, which only runs tests,
 # may enable it. Every part of it is held to exactly what it needs.
 RACE_WORKFLOW = "ci.yml"
@@ -41,11 +38,9 @@ RACE_JOB_ACTIONS = {
 # Every job keeps go.mod and go.sum as committed, and verifies the module
 # cache against go.sum before it runs any other command.
 GOFLAGS_SETTING = "-mod=readonly"
-GOFLAGS_SETTING_RE = re.compile(r"GOFLAGS\s*=\s*[\"']?([^\"'\s;&|]*)", re.IGNORECASE)
-GOFLAGS_PASS_THROUGH = {"$GOFLAGS", "${GOFLAGS}"}
-# The verify step is that command alone, or followed by && and more, so its
-# failure fails the job; the step sets nothing that could skip or soften it.
-GO_MOD_VERIFY_RE = re.compile(r"^go mod verify\s*(?:$|&&)")
+# The verify step runs exactly one of these commands, whose failure fails the
+# job, and sets nothing that could skip or soften it. No other shell is read.
+VERIFY_RUNS = {"go mod verify", "go mod verify && (cd tools && go mod verify)"}
 VERIFY_STEP_KEYS = {"name", "run"}
 # Every workflow declares contents: read and id-token: none; only a release
 # workflow's jobs may declare otherwise (rule 3).
@@ -72,22 +67,30 @@ def _construct_strict_mapping(loader: _StrictLoader, node: yaml.MappingNode, dee
 _StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_strict_mapping)
 
 
-def _settings(value: object, name: str, pattern: re.Pattern[str]):
-    """Every value name is declared with anywhere in value: as a key, or as an assignment in a string."""
+def _setting_violations(value: object, name: str, required: str):
+    """Every place value sets name to anything but required, outside step and job names.
+
+    A key for name must hold exactly required: YAML expands nothing, so
+    "$NAME" there is a literal. In a string, name may appear only as the
+    quoted pass-through "NAME=$NAME" (or ${NAME}), which sets nothing, or as
+    NAME=required standing alone; any other mention is refused unread.
+    """
+    allowed = re.compile(
+        rf'"{name}=\$(?:{name}|\{{{name}\}})"|(?<![^\s;&|]){name}={re.escape(required)}(?=[\s;&|]|$)',
+        re.IGNORECASE,
+    )
     if isinstance(value, dict):
         for key, item in value.items():
-            if str(key).upper() == name:
+            if str(key) == "name" and isinstance(item, str):
+                continue
+            if str(key).upper() == name and item != required:
                 yield item
-            yield from _settings(item, name, pattern)
+            yield from _setting_violations(item, name, required)
     elif isinstance(value, list):
         for item in value:
-            yield from _settings(item, name, pattern)
-    elif isinstance(value, str):
-        yield from pattern.findall(value)
-
-
-def _cgo_settings(value: object):
-    return _settings(value, "CGO_ENABLED", CGO_SETTING_RE)
+            yield from _setting_violations(item, name, required)
+    elif isinstance(value, str) and name.lower() in allowed.sub("", value).lower():
+        yield value
 
 
 def _workflow_files() -> list[Path]:
@@ -195,11 +198,10 @@ def _check_go_modules(path: Path, name: str, job: dict, failures: list[str]) -> 
     review.
     """
     env = job.get("env")
-    settings = list(_settings(job, "GOFLAGS", GOFLAGS_SETTING_RE))
     if (
         not isinstance(env, dict)
         or env.get("GOFLAGS") != GOFLAGS_SETTING
-        or any(not isinstance(v, str) or (v != GOFLAGS_SETTING and v not in GOFLAGS_PASS_THROUGH) for v in settings)
+        or any(True for _ in _setting_violations(job, "GOFLAGS", GOFLAGS_SETTING))
     ):
         failures.append(f"{path}: job {name} must set GOFLAGS to \"{GOFLAGS_SETTING}\" in its env, and nowhere to anything else")
     if "defaults" in job:
@@ -207,17 +209,16 @@ def _check_go_modules(path: Path, name: str, job: dict, failures: list[str]) -> 
     steps = job.get("steps")
     runs = [step for step in steps if isinstance(step, dict) and "run" in step] if isinstance(steps, list) else []
     first = runs[0] if runs else {}
-    if not isinstance(first.get("run"), str) or not GO_MOD_VERIFY_RE.match(first["run"]) or set(first) - VERIFY_STEP_KEYS:
-        failures.append(f"{path}: job {name} must run go mod verify, as a step with only a name, before any other command")
+    if first.get("run") not in VERIFY_RUNS or set(first) - VERIFY_STEP_KEYS:
+        failures.append(f"{path}: job {name} must first run exactly one of {sorted(VERIFY_RUNS)}, in a step with only a name")
 
 
 def _check_cgo_off(path: Path, name: str, job: dict, failures: list[str]) -> None:
     env = job.get("env")
-    settings = list(_cgo_settings(job))
     if (
         not isinstance(env, dict)
         or env.get("CGO_ENABLED") != "0"
-        or any(not isinstance(v, str) or (v != "0" and v not in CGO_PASS_THROUGH) for v in settings)
+        or any(True for _ in _setting_violations(job, "CGO_ENABLED", "0"))
     ):
         failures.append(f"{path}: job {name} must set CGO_ENABLED to \"0\" in its env, and nowhere to anything else")
 

@@ -220,13 +220,17 @@ supply chain integrity here has direct impact on device actuation decisions.
    `scripts/check_workflows.py` holds rules 2, 7 and 8 for every job:
    - each workflow declares `contents: read` and `id-token: none`, and so does
      any job that sets its own permissions, except in `release.yml` (rule 3);
-   - each job sets `GOFLAGS=-mod=readonly` in its env and nowhere to anything
-     else, and sets no `defaults`;
-   - each job's first command is `go mod verify` (alone or before `&&`), in a
-     step that sets only `name` and `run`.
+   - each job sets `GOFLAGS=-mod=readonly` in its env and sets no
+     `defaults`. A command mentions `GOFLAGS`, like `CGO_ENABLED`, only as
+     the quoted pass-through `"GOFLAGS=$GOFLAGS"` or the bare required value;
+     any other mention is refused without being read;
+   - each job's first command is exactly `go mod verify` or
+     `go mod verify && (cd tools && go mod verify)`, in a step that sets only
+     `name` and `run`.
 
-   An action run before that step, and a command that writes `GOFLAGS` at run
-   time, are left to review.
+   An action run before that step, and a script that changes a setting
+   without naming it (through `$GITHUB_ENV` or `go env -w`), are left to
+   review.
 
 9. Every job in every workflow must set `CGO_ENABLED=0` in its job `env`, and
    nothing in the job may set it to anything else. The gateway has no CGO
