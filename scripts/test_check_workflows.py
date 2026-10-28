@@ -14,6 +14,9 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().with_name("check_workflows.py")
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 SHA = "a" * 40
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SCRIPT.parent))
+from check_workflows import ROOT_STEP_RUN  # noqa: E402
 
 TEST_JOB = """
   test:
@@ -94,9 +97,6 @@ class CheckWorkflowsTest(unittest.TestCase):
 
     def test_a_test_job_with_cgo_off_and_a_race_job_with_cgo_on_pass(self) -> None:
         self.assertPasses(workflow(job(), race()))
-
-    def test_passing_the_jobs_own_setting_through_sets_nothing(self) -> None:
-        self.assertPasses(workflow(job(run='sudo env "CGO_ENABLED=$CGO_ENABLED" go test ./...'), race()))
 
     def test_a_quoted_or_commented_job_header_is_read_as_yaml_reads_it(self) -> None:
         for header in ('"build":', "build: # ships"):
@@ -278,44 +278,89 @@ class CheckWorkflowsTest(unittest.TestCase):
         named = job().replace("      - run: go mod verify\n", "      - name: Verify\n        run: go mod verify\n")
         self.assertPasses(workflow(named), name="pr-title.yml")
 
-    def test_a_cgo_value_go_does_not_read_as_off_is_refused(self) -> None:
-        # Go enables cgo for any value but "0" or "1" when a C compiler is present.
-        for step in (
-            "      - run: go build ./...\n        env:\n          CGO_ENABLED: $CGO_ENABLED\n",
-            '      - run: sudo env "CGO_ENABLED=$CGO_ENABLED x" go build ./...\n',
-            "      - run: CGO_ENABLED='0 1' go build ./...\n",
+    # GOFLAGS and CGO_ENABLED are keys of a job's env and mentioned nowhere else.
+    # The guard reads no shell, so every other mention is refused unread.
+
+    def test_any_mention_of_a_setting_outside_the_job_env_is_refused(self) -> None:
+        for setting, reason in (("GOFLAGS", "job test must set GOFLAGS"), ("CGO_ENABLED", "job test must set CGO_ENABLED")):
+            for step in (
+                f"      - run: go build ./...\n        env:\n          {setting}: x\n",
+                f"      - run: go build ./...\n        env:\n          {setting.lower()}: x\n",
+                f"      - run: {setting}=x go build ./...\n",
+                f'      - run: sudo env "{setting}=${setting}" go test ./...\n',
+                f"      - run: sudo env \"{setting}=${setting}\"' x' go test ./...\n",
+                f'      - run: sudo env "{setting}=${setting.lower()}" go test ./...\n',
+                f"      - run: {setting}='-mod=readonly -mod=mod' go build ./...\n",
+                f"      - run: go build -ldflags=-X=main.{setting}=x ./...\n",
+                f"      - run: go env {setting}\n",
+                f"      - run: go build ./...\n        shell: env {setting}=x bash -e {{0}}\n",
+            ):
+                with self.subTest(setting=setting, step=step):
+                    self.assertRefused(workflow(job() + step, race()), reason)
+        self.assertRefused(workflow(job() + "      - run: CGO_ENABLED=0 go build ./...\n", race()), "mention it nowhere else")
+
+    def test_a_setting_hidden_in_a_matrix_name_is_refused(self) -> None:
+        text = job().replace(
+            "    steps:",
+            "    strategy:\n      matrix:\n        include:\n          - name: env GOFLAGS=-mod=mod go build ./...\n    steps:",
+            1,
+        ) + "      - run: ${{ matrix.name }}\n"
+        self.assertRefused(workflow(text, race()), "job test must set GOFLAGS")
+
+    def test_a_display_name_mentioning_a_setting_passes(self) -> None:
+        for named in (
+            job() + "      - name: Explain GOFLAGS=-mod=mod is forbidden\n        run: go test ./...\n",
+            job().replace("  test:\n    runs-on", "  test:\n    name: Never CGO_ENABLED=1\n    runs-on", 1),
         ):
-            with self.subTest(step):
-                self.assertRefused(workflow(job() + step), "job test must set CGO_ENABLED")
-        named = job() + "      - name: Never CGO_ENABLED=1\n        run: go test ./...\n"
-        self.assertPasses(workflow(named, race()))
-        self.assertPasses(workflow(job() + "      - run: CGO_ENABLED=0 go build ./...\n", race()))
+            with self.subTest(named):
+                self.assertPasses(workflow(named, race()))
+
+    # An env mapping has literal keys, so the guard can see what it sets.
+
+    def test_a_computed_env_or_env_key_is_refused(self) -> None:
+        for env in (
+            "        env: ${{ fromJSON(vars.BUILD_ENV) }}\n",
+            "        env:\n          ${{ vars.KEY }}: x\n",
+            "        env:\n          ${{ insert }}: ${{ fromJSON(vars.BUILD_ENV) }}\n",
+        ):
+            with self.subTest(env):
+                self.assertRefused(workflow(job() + "      - run: go build ./...\n" + env, race()), "env must be a mapping with literal keys")
+        for key in (
+            "container:\n      image: golang:1\n      env: ${{ fromJSON(vars.BUILD_ENV) }}",
+            "services:\n      db:\n        image: postgres:16\n        env: ${{ fromJSON(vars.BUILD_ENV) }}",
+            "env: ${{ fromJSON(vars.BUILD_ENV) }}",
+        ):
+            with self.subTest(key):
+                text = job().replace("    env:\n      CGO_ENABLED", f"    {key}\n    env:\n      CGO_ENABLED", 1) if not key.startswith("env") else job()
+                if key.startswith("env"):
+                    text = job().replace('    env:\n      CGO_ENABLED: "0"\n      GOFLAGS: "-mod=readonly"\n', f"    {key}\n", 1)
+                self.assertRefused(workflow(text, race()), "job test")
+        self.assertRefused(workflow(job(), race(), head="env: ${{ fromJSON(vars.BUILD_ENV) }}\n"), "set env per job")
+        literal = job() + "      - run: go build ./...\n        env:\n          VERSION: ${{ github.sha }}\n"
+        self.assertPasses(workflow(literal, race()))
+
+    # One exception: the root step's run text in ci.yml's test job, pinned exactly.
+
+    def test_the_pinned_root_step_passes_only_where_it_is_designated(self) -> None:
+        root = "      - name: As root\n        run: |\n" + "".join(
+            f"          {line}\n" if line else "\n" for line in ROOT_STEP_RUN.rstrip("\n").split("\n")
+        )
+        self.assertPasses(workflow(job() + root, race()))
+        self.assertRefused(workflow(job() + root, race()).replace("  test:\n", "  build:\n", 1), "job build must set")
+        self.assertRefused(workflow(job() + root), "job test must set", name="pr-title.yml")
+        for label, edit in (
+            ("one space more", root.replace("sudo env", "sudo  env")),
+            ("a trailing space", root.replace('<<<"$out"\n', '<<<"$out" \n')),
+            ("a value changed", root.replace("GOFLAGS=-mod=readonly", "GOFLAGS=-mod=mod")),
+        ):
+            with self.subTest(label):
+                self.assertRefused(workflow(job() + edit, race()), "mention it nowhere else")
+        renamed = root.replace("      - name: As root\n", "      - name: As root\n        env:\n          GOFLAGS: -mod=mod\n")
+        self.assertRefused(workflow(job() + renamed, race()), "job test must set GOFLAGS")
 
     def test_job_defaults_are_refused(self) -> None:
         text = job().replace("    steps:", "    defaults:\n      run:\n        shell: 'true {0}'\n    steps:", 1)
         self.assertRefused(workflow(text), "job test sets defaults", name="pr-title.yml")
-
-    def test_goflags_set_anywhere_but_the_job_env_is_refused(self) -> None:
-        for step in (
-            "      - run: go build ./...\n        env:\n          GOFLAGS: -mod=mod\n",
-            "      - run: GOFLAGS=-mod=mod go build ./...\n",
-            "      - run: go build ./...\n        env:\n          goflags: -mod=mod\n",
-            "      - run: GOFLAGS='-mod=readonly -mod=mod' go build ./...\n",
-            '      - run: GOFLAGS="$GOFLAGS -mod=mod" go build ./...\n',
-            '      - run: sudo env "GOFLAGS=$GOFLAGS -mod=mod" go build ./...\n',
-            "      - run: GOFLAGS=-mod=readonly,-mod=mod go build ./...\n",
-            "      - run: go build -ldflags=-X=main.GOFLAGS=-mod=readonly ./...\n",
-            "      - run: go build ./...\n        env:\n          GOFLAGS: $GOFLAGS\n",
-        ):
-            with self.subTest(step):
-                self.assertRefused(workflow(job() + step), "and nowhere to anything else", name="pr-title.yml")
-        for step in (
-            '      - run: sudo env "GOFLAGS=$GOFLAGS" go test ./...\n',
-            "      - run: GOFLAGS=-mod=readonly go test ./...\n",
-            "      - name: Explain GOFLAGS=-mod=mod is forbidden\n        run: go test ./...\n",
-        ):
-            with self.subTest(step):
-                self.assertPasses(workflow(job() + step), name="pr-title.yml")
 
     def test_a_release_workflow_declares_both_for_the_workflow_and_may_differ_per_job(self) -> None:
         signing = job().replace("    env:", "    permissions:\n      contents: read\n      id-token: write\n    env:", 1)
