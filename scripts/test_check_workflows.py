@@ -324,7 +324,7 @@ class CheckWorkflowsTest(unittest.TestCase):
             "        env:\n          ${{ insert }}: ${{ fromJSON(vars.BUILD_ENV) }}\n",
         ):
             with self.subTest(env):
-                self.assertRefused(workflow(job() + "      - run: go build ./...\n" + env, race()), "env must be a mapping with literal keys")
+                self.assertRefused(workflow(job() + "      - run: go build ./...\n" + env, race()), "must be literal, not computed")
         for key in (
             "container:\n      image: golang:1\n      env: ${{ fromJSON(vars.BUILD_ENV) }}",
             "services:\n      db:\n        image: postgres:16\n        env: ${{ fromJSON(vars.BUILD_ENV) }}",
@@ -336,6 +336,27 @@ class CheckWorkflowsTest(unittest.TestCase):
                     text = job().replace('    env:\n      CGO_ENABLED: "0"\n      GOFLAGS: "-mod=readonly"\n', f"    {key}\n", 1)
                 self.assertRefused(workflow(text, race()), "job test")
         self.assertRefused(workflow(job(), race(), head="env: ${{ fromJSON(vars.BUILD_ENV) }}\n"), "set env per job")
+        for parent in (
+            "container: ${{ fromJSON(vars.CONTAINER) }}",
+            "services:\n      db: ${{ fromJSON(vars.SERVICE) }}",
+            "services: ${{ fromJSON(vars.SERVICES) }}",
+            "services:\n      ${{ insert }}: ${{ fromJSON(vars.SERVICES) }}",
+            "${{ insert }}: ${{ fromJSON(vars.JOB) }}",
+            "container:\n      image: golang:1\n      ${{ insert }}: ${{ fromJSON(vars.CONTAINER) }}",
+        ):
+            with self.subTest(parent):
+                text = job().replace("    env:\n      CGO_ENABLED", f"    {parent}\n    env:\n      CGO_ENABLED", 1)
+                self.assertRefused(workflow(text, race()), "must be literal, not computed")
+        for steps in (
+            "      - ${{ fromJSON(vars.STEP) }}\n",
+            "      - run: go build ./...\n        ${{ insert }}: ${{ fromJSON(vars.STEP) }}\n",
+        ):
+            with self.subTest(steps):
+                self.assertRefused(workflow(job() + steps, race()), "must be literal, not computed")
+        for parent in ("container: golang:1", "container:\n      image: golang:1", "services:\n      db:\n        image: postgres:16"):
+            with self.subTest(parent):
+                text = job().replace("    env:\n      CGO_ENABLED", f"    {parent}\n    env:\n      CGO_ENABLED", 1)
+                self.assertPasses(workflow(text, race()))
         literal = job() + "      - run: go build ./...\n        env:\n          VERSION: ${{ github.sha }}\n"
         self.assertPasses(workflow(literal, race()))
 

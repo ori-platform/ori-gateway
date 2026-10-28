@@ -227,8 +227,10 @@ supply chain integrity here has direct impact on device actuation decisions.
      `go env GOFLAGS`. The one exception is the run text of the root-only step
      in `ci.yml`'s `test` job, pinned exactly, which passes both as constants
      through `sudo env`;
-   - every env mapping (job, step, container, service) has literal keys, never
-     a computed mapping or an expression key;
+   - every env mapping (job, step, container, service), and every mapping that
+     holds one, is literal: no key anywhere in a job is an expression, and no
+     container, service, services block or step is computed (a container may
+     be a literal image name);
    - each job's first command is exactly `go mod verify` or
      `go mod verify && (cd tools && go mod verify)`, in a step that sets only
      `name` and `run`.
@@ -236,7 +238,8 @@ supply chain integrity here has direct impact on device actuation decisions.
    The guard is a fail-closed policy on how a workflow is written. It parses no
    shell and does not prove that a command cannot change the environment. It
    leaves these to review: an action run before the verify step, a setting
-   changed at run time (`$GITHUB_ENV`, `go env -w`, a script), a command-line
+   changed at run time (`$GITHUB_ENV`, `go env -w`, a script, or a command
+   computed from an expression such as `run: ${{ vars.CMD }}`), a command-line
    flag such as `go build -mod=mod`, and the runner's `PATH` that the pinned
    root step carries into root.
 

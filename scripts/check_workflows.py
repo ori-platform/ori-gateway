@@ -119,24 +119,48 @@ def _mentions(path: Path, job_name: str, job: dict, setting: str) -> bool:
 
 
 def _check_literal_env(path: Path, job_name: str, job: dict, failures: list[str]) -> None:
-    """Every env mapping in the job has literal keys, so the guard can see what it sets."""
-    mappings = [job.get("env")]
+    """Every env mapping in the job, and every mapping that holds one, is literal.
+
+    No key anywhere in the job is an expression, which refuses mapping
+    insertions; a container, the services, each service and each step are
+    literal mappings (a container may also be a literal image name); every
+    env is a mapping. So the guard sees every setting the job declares.
+    """
+    def computed(value: object) -> bool:
+        return isinstance(value, str) and "${{" in value
+
+    def keys(value: object):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield key
+                yield from keys(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from keys(item)
+
+    refused = any(not isinstance(key, str) or computed(key) for key in keys(job))
     container = job.get("container")
-    if isinstance(container, dict):
-        mappings.append(container.get("env"))
     services = job.get("services")
+    steps = job.get("steps") or []
+    mappings = [job.get("env")]
+    if container is not None and not isinstance(container, dict) and (not isinstance(container, str) or computed(container)):
+        refused = True
+    elif isinstance(container, dict):
+        mappings.append(container.get("env"))
+    if services is not None and (
+        not isinstance(services, dict) or any(not isinstance(service, dict) for service in services.values())
+    ):
+        refused = True
     for service in services.values() if isinstance(services, dict) else ():
         if isinstance(service, dict):
             mappings.append(service.get("env"))
-    for step in job.get("steps") or []:
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        refused = True
+    for step in steps if isinstance(steps, list) else ():
         if isinstance(step, dict):
             mappings.append(step.get("env"))
-    for env in mappings:
-        if env is None:
-            continue
-        if not isinstance(env, dict) or any(not isinstance(key, str) or "${{" in key for key in env):
-            failures.append(f"{path}: job {job_name} env must be a mapping with literal keys, not computed")
-            return
+    if refused or any(env is not None and not isinstance(env, dict) for env in mappings):
+        failures.append(f"{path}: job {job_name} env, and every mapping that holds one, must be literal, not computed")
 
 
 def _workflow_files() -> list[Path]:
@@ -242,9 +266,10 @@ def _check_go_modules(path: Path, name: str, job: dict, failures: list[str]) -> 
 
     It is a fail-closed policy on how the workflow is written, not proof of
     what its commands do: an action run before the verify step, a setting
-    changed at run time ($GITHUB_ENV, go env -w, a script), a command-line
-    -mod flag and the runner PATH the pinned root step carries into root are
-    left to review.
+    changed at run time ($GITHUB_ENV, go env -w, a script, a command computed
+    from an expression such as `run: ${{ vars.CMD }}`), a command-line -mod
+    flag and the runner PATH the pinned root step carries into root are left
+    to review.
     """
     env = job.get("env")
     if (
