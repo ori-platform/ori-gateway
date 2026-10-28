@@ -217,6 +217,16 @@ supply chain integrity here has direct impact on device actuation decisions.
 
 8. `go mod verify` must run before any build or test step. This verifies the
    integrity of the module cache against `go.sum` checksums.
+   `scripts/check_workflows.py` holds rules 2, 7 and 8 for every job:
+   - each workflow declares `contents: read` and `id-token: none`, and so does
+     any job that sets its own permissions, except in `release.yml` (rule 3);
+   - each job sets `GOFLAGS=-mod=readonly` in its env and nowhere to anything
+     else, and sets no `defaults`;
+   - each job's first command is `go mod verify` (alone or before `&&`), in a
+     step that sets only `name` and `run`.
+
+   An action run before that step, and a command that writes `GOFLAGS` at run
+   time, are left to review.
 
 9. Every job in every workflow must set `CGO_ENABLED=0` in its job `env`, and
    nothing in the job may set it to anything else. The gateway has no CGO

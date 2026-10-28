@@ -38,6 +38,18 @@ RACE_JOB_ACTIONS = {
     "actions/checkout": set(),
     "actions/setup-go": {"go-version-file", "cache"},
 }
+# Every job keeps go.mod and go.sum as committed, and verifies the module
+# cache against go.sum before it runs any other command.
+GOFLAGS_SETTING = "-mod=readonly"
+GOFLAGS_SETTING_RE = re.compile(r"GOFLAGS\s*=\s*[\"']?([^\"'\s;&|]*)", re.IGNORECASE)
+GOFLAGS_PASS_THROUGH = {"$GOFLAGS", "${GOFLAGS}"}
+# The verify step is that command alone, or followed by && and more, so its
+# failure fails the job; the step sets nothing that could skip or soften it.
+GO_MOD_VERIFY_RE = re.compile(r"^go mod verify\s*(?:$|&&)")
+VERIFY_STEP_KEYS = {"name", "run"}
+# Every workflow declares contents: read and id-token: none; only a release
+# workflow's jobs may declare otherwise (rule 3).
+RELEASE_WORKFLOW = "release.yml"
 PINNED_ACTION_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@[0-9a-f]{40}$")
 
 
@@ -60,18 +72,22 @@ def _construct_strict_mapping(loader: _StrictLoader, node: yaml.MappingNode, dee
 _StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_strict_mapping)
 
 
-def _cgo_settings(value: object):
-    """Every value CGO_ENABLED is declared with anywhere in value: as a key, or as an assignment in a string."""
+def _settings(value: object, name: str, pattern: re.Pattern[str]):
+    """Every value name is declared with anywhere in value: as a key, or as an assignment in a string."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if str(key).upper() == "CGO_ENABLED":
+            if str(key).upper() == name:
                 yield item
-            yield from _cgo_settings(item)
+            yield from _settings(item, name, pattern)
     elif isinstance(value, list):
         for item in value:
-            yield from _cgo_settings(item)
+            yield from _settings(item, name, pattern)
     elif isinstance(value, str):
-        yield from CGO_SETTING_RE.findall(value)
+        yield from pattern.findall(value)
+
+
+def _cgo_settings(value: object):
+    return _settings(value, "CGO_ENABLED", CGO_SETTING_RE)
 
 
 def _workflow_files() -> list[Path]:
@@ -111,6 +127,9 @@ def _check_pre_commit_config(failures: list[str]) -> None:
 def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
     """Every job sets CGO_ENABLED=0, except ci.yml's test-only race job, which sets 1.
 
+    Every job also sets GOFLAGS=-mod=readonly and runs go mod verify first, and
+    every workflow but a release one grants contents: read and id-token: none.
+
     The workflow is read as YAML, so comments, aliases and folded lines mean
     what they mean to GitHub. Anything that is not the expected shape is
     refused rather than read past.
@@ -132,6 +151,7 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
         if key in workflow:
             failures.append(f"{path}: set {key} per job, not for the whole workflow")
     jobs = workflow.get("jobs") or {}
+    _check_permissions(path, workflow.get("permissions"), jobs if path.name != RELEASE_WORKFLOW else {}, failures)
     if not isinstance(jobs, dict):
         failures.append(f"{path}: cannot parse the jobs block")
         return
@@ -153,6 +173,42 @@ def _check_cgo(path: Path, text: str, failures: list[str]) -> None:
             _check_race_job(path, name, job, failures)
         else:
             _check_cgo_off(path, name, job, failures)
+        _check_go_modules(path, name, job, failures)
+
+
+def _check_permissions(path: Path, permissions: object, jobs: object, failures: list[str]) -> None:
+    def normal(value: object) -> bool:
+        return isinstance(value, dict) and value.get("contents") == "read" and value.get("id-token") == "none"
+
+    if not normal(permissions):
+        failures.append(f"{path}: permissions must declare contents: read and id-token: none")
+    for name, job in jobs.items() if isinstance(jobs, dict) else ():
+        if isinstance(job, dict) and "permissions" in job and not normal(job["permissions"]):
+            failures.append(f"{path}: job {name} permissions must declare contents: read and id-token: none")
+
+
+def _check_go_modules(path: Path, name: str, job: dict, failures: list[str]) -> None:
+    """GOFLAGS=-mod=readonly in the job env, and go mod verify before any other command.
+
+    It reads declared settings: an action run before the verify step, or a
+    command that writes GOFLAGS to $GITHUB_ENV or with go env -w, is left to
+    review.
+    """
+    env = job.get("env")
+    settings = list(_settings(job, "GOFLAGS", GOFLAGS_SETTING_RE))
+    if (
+        not isinstance(env, dict)
+        or env.get("GOFLAGS") != GOFLAGS_SETTING
+        or any(not isinstance(v, str) or (v != GOFLAGS_SETTING and v not in GOFLAGS_PASS_THROUGH) for v in settings)
+    ):
+        failures.append(f"{path}: job {name} must set GOFLAGS to \"{GOFLAGS_SETTING}\" in its env, and nowhere to anything else")
+    if "defaults" in job:
+        failures.append(f"{path}: job {name} sets defaults, which reach the go mod verify step")
+    steps = job.get("steps")
+    runs = [step for step in steps if isinstance(step, dict) and "run" in step] if isinstance(steps, list) else []
+    first = runs[0] if runs else {}
+    if not isinstance(first.get("run"), str) or not GO_MOD_VERIFY_RE.match(first["run"]) or set(first) - VERIFY_STEP_KEYS:
+        failures.append(f"{path}: job {name} must run go mod verify, as a step with only a name, before any other command")
 
 
 def _check_cgo_off(path: Path, name: str, job: dict, failures: list[str]) -> None:

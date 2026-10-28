@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  id-token: none
 
 jobs:
   signed:
@@ -19,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
+      GOFLAGS: "-mod=readonly"
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2
@@ -28,6 +30,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify module integrity
+        run: go mod verify && (cd tools && go mod verify)
 
       - name: Test the check
         run: python3 scripts/test_check_signed_commits.py

@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  id-token: none
 
 jobs:
   conventional:
@@ -22,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
+      GOFLAGS: "-mod=readonly"
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2
@@ -29,6 +31,15 @@ jobs:
           egress-policy: audit
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify module integrity
+        run: go mod verify && (cd tools && go mod verify)
 
       - name: Check the pull request title
         # The title is read from the environment rather than interpolated into
