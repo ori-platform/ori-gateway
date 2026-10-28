@@ -24,7 +24,7 @@ const (
 
 var (
 	summaryPattern = regexp.MustCompile("(?m)^\\d+\\. `(GW-\\d+)`")
-	sectionPattern = regexp.MustCompile("(?m)^## (GW-\\d+): ")
+	sectionPattern = regexp.MustCompile(`(?m)^## (GW-\d+): `)
 	testPattern    = regexp.MustCompile("`(Test[A-Za-z0-9_]+)`")
 	funcPattern    = regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]+)\(`)
 )
