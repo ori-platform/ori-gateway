@@ -64,7 +64,7 @@ func mqttIngressShape(t *testing.T, h SiteHealth) map[string]map[string]uint64 {
 }
 
 func TestProjectSiteHealthMQTTIngressIsExactlyTheReceivedFamilies(t *testing.T) {
-	p := NewProjector(NewRegistry(), ProjectOptions{NodeTTLMS: 5000})
+	p := NewProjector(NewRegistry(), ProjectOptions{NodeTTL: 5 * time.Second})
 	gateway := healthyGateway()
 	if counts := mqttIngressShape(t, p.Project(time.UnixMilli(10000), gateway)); counts[contracts.FamilyReasoningRequest]["payload_too_large"] != 0 {
 		t.Fatalf("counts without refusals: %v", counts)

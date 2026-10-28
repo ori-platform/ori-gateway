@@ -264,7 +264,7 @@ func TestProjectorDegradesNodeOnEvidenceIntegrityFlags(t *testing.T) {
 
 		projector := NewProjector(reg, ProjectOptions{
 			ExpectedDeviceIDs: []string{"dev-01"},
-			NodeTTLMS:         10_000_000_000_000,
+			NodeTTL:           NodeTTL,
 		})
 		health := projector.Project(
 			time.UnixMilli(1234567891000), GatewayView{Status: SiteStatusHealthy},
@@ -283,7 +283,7 @@ func TestProjectorGapCountAloneStaysInformational(t *testing.T) {
 	reg.Upsert(evidenceBeat("dev-01", headHash(1), 3, true))
 	projector := NewProjector(reg, ProjectOptions{
 		ExpectedDeviceIDs: []string{"dev-01"},
-		NodeTTLMS:         10_000_000_000_000,
+		NodeTTL:           NodeTTL,
 	})
 	health := projector.Project(time.UnixMilli(1234567891000), GatewayView{Status: SiteStatusHealthy})
 	node := health.Nodes[0]

@@ -227,7 +227,7 @@ func getHealth(t *testing.T, reg *Registry, devices []string, now time.Time) Sit
 
 func getHealthWithGateway(t *testing.T, reg *Registry, devices []string, now time.Time, gw GatewayView) SiteHealth {
 	t.Helper()
-	viewer := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: devices, NodeTTLMS: 5000})
+	viewer := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: devices, NodeTTL: 5 * time.Second})
 	h := NewHealthHandler(viewer, func() GatewayView { return gw }, "127.0.0.1:0", func() time.Time { return now })
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))

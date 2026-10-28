@@ -324,6 +324,13 @@ projected member. The registry keeps it through every heartbeat, a failed
 fetch and eviction, and records a reading that arrives while the node is not
 registered; only a later export reading changes it, and a node whose
 export last read critical is retained on silence like a critical heartbeat.
+The TTL for silence, eviction and staleness is one fixed value,
+`site.NodeTTL`, 90 seconds (gateway-api/v2 Site Health), never derived from
+`heartbeat_interval_s` and not configurable, so no TTL outside 90 seconds to
+24 hours can be set. Verified by
+`TestSiteHealthJudgesNodesOnTheNinetySecondTTLWhateverTheHeartbeatInterval`,
+`TestEvictionAndTheProjectorShareTheNodeTTL` and
+`TestTheNodeTTLIsTheContractsNinetySeconds`.
 Whether a node is still reporting is decided by the gateway's receipt of its
 heartbeats alone, measured on a monotonic clock the registry owns: silence,
 eviction and `gateway_observed`. A node's `stale` flag is set when its report

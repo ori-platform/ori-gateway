@@ -19,7 +19,7 @@ import (
 func newTestHandler(t *testing.T, status string) *HealthHandler {
 	t.Helper()
 	reg := NewRegistry()
-	viewer := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{}, NodeTTLMS: 5000})
+	viewer := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{}, NodeTTL: 5 * time.Second})
 	return NewHealthHandler(viewer, func() GatewayView {
 		return GatewayView{Status: status, ProviderName: "test"}
 	}, "127.0.0.1:0", time.Now)
@@ -121,7 +121,7 @@ func TestHealthHandlerGeneratedAtMSIsPopulated(t *testing.T) {
 
 func TestHealthHandlerRunStartsAndStopsCleanly(t *testing.T) {
 	reg := NewRegistry()
-	viewer := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{}, NodeTTLMS: 5000})
+	viewer := NewProjector(reg, ProjectOptions{ExpectedDeviceIDs: []string{}, NodeTTL: 5 * time.Second})
 	h := NewHealthHandler(viewer, func() GatewayView {
 		return GatewayView{Status: SiteStatusHealthy, ProviderName: "test"}
 	}, "127.0.0.1:0", time.Now)
