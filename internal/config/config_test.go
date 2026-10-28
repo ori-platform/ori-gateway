@@ -1444,11 +1444,11 @@ provider:
 // character, "/", "+" or "#"; no other device is, whether the courier is
 // disabled, enabled with nothing declared, or enabled with another device
 // declaring (gateway-config/v2). Every device is held to gateway.device_ids'
-// own rule: no MQTT separator, wildcard, auth delimiter or control character.
+// own rule: no MQTT separator, wildcard or auth delimiter.
 func TestDeviceIDsMustBeInTheEvidenceRoutingDomain(t *testing.T) {
 	// Only a device that declares gateway-evidence-carriage/v1 is held to the
 	// routing domain; every other is held to the gateway.device_ids rule alone,
-	// control characters included (gateway-config/v2).
+	// which admits a control character (gateway-config/v2).
 	for _, tc := range []struct {
 		name  string
 		id    string // a YAML double-quoted scalar body

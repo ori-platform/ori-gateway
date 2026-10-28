@@ -4,6 +4,10 @@ This file records accepted architecture decisions for `ori-gateway`. Decisions
 here are meant to preserve runtime/gateway boundaries and prevent future
 implementation drift.
 
+Entries are never rewritten. A line `> **Status (YYYY-MM-DD):** ...` under an
+entry's status records what is no longer true of it, what is true now, and
+where.
+
 ---
 
 ## 2026-06-02 — Gemini Integration Boundary
@@ -80,6 +84,8 @@ Rationale:
 
 **Status:** Accepted
 
+> **Status (2026-10-28):** `signed_at_ms` still equals `timestamp_ms`, but both now come from the gateway's durable message signing clock, which never repeats a value (`internal/heartbeat/publisher.go`, AGENTS.md GW-24), and freshness and replay follow gateway-api/v2 Envelope Freshness and Replay.
+
 The gateway publishes `ori/gateway/health` as the sole runtime-side
 `gateway_reachable` signal. Runtimes must not infer gateway reachability from
 public internet checks, REST probes, runtime node heartbeats, or export traffic.
@@ -119,6 +125,8 @@ and broker ACLs.
 ## 2026-06-11 — Runtime Node Heartbeat Consumption
 
 **Status:** Accepted
+
+> **Status (2026-10-28):** Silence, eviction and staleness are judged on the gateway's monotonic receipt of heartbeats, never on `last_seen_ms`, so a future-dated `last_seen_ms` no longer makes a node stale or evicted; a node silent after `critical` is retained (`internal/site/site.go`, AGENTS.md GW-18). A `last_seen_ms` beyond the future-skew bound is still rejected at ingest (`internal/site/heartbeat.go`).
 
 The gateway subscribes to concrete `ori/{device_id}/runtime/heartbeat` topics
 for devices listed in `gateway.device_ids` and updates its site registry from
@@ -178,6 +186,8 @@ Non-goals:
 ## 2026-06-14 — SMS Webhook Signing Bridge Owns Provider Ingress
 
 **Status:** Accepted
+
+> **Status (2026-10-28):** These rules hold. The bridge also bounds volume per sender and bridge-wide, answering 429 without forwarding, and answers 503 once the gateway decides to stop (`internal/webhookbridge`, AGENTS.md GW-16 and GW-15).
 
 The runtime requires raw-body HMAC verification for public SMS webhook ingress,
 but providers such as Africa's Talking do not emit Ori HMAC headers. The gateway
@@ -241,6 +251,8 @@ security for product features.
 
 Status: Accepted
 
+> **Status (2026-10-28):** Report delivery is no longer unimplemented: log, file and cloud deliverers exist (`internal/reporting/delivery.go`; the 2026-06-15 delivery entries).
+
 The gateway owns single-site weekly report generation. A scheduled weekly report
 uses an explicit `reporting.weekly_report` scope (`device_id`, `sensor_ids`,
 customer/site labels, local weekday/time/timezone), fetches bounded runtime
@@ -269,6 +281,8 @@ local runtime data while preserving runtime ownership of state and actuation.
 ## 2026-06-14 — Gateway Runner Supervision Is Centralized
 
 Status: Accepted
+
+> **Status (2026-10-28):** The supervisor stands, inside the ordered stop of AGENTS.md GW-15: one decision to stop refuses later callbacks, webhook requests and posture fetches, stops the signing clock and cancels the runners, and admitted work is joined before the state directory is released.
 
 The gateway process now supervises heartbeat, webhook bridge, weekly report, and
 future long-running app tasks through one `errgroup`-backed supervisor. Startup
@@ -326,6 +340,8 @@ boundary and avoid leaking security-sensitive implementation details.
 
 Status: Accepted
 
+> **Status (2026-10-28):** The projector and secrets rules hold. Status is now defined by AGENTS.md GW-18: severity is never folded, a node silent after `critical` is retained, export severity only raises a node, staleness uses the receipt clock, and the projection also carries `evidence_delivery` and `mqtt_ingress`.
+
 The gateway owns site-level health projection. No equivalent type exists in
 `ori-runtime`; the runtime exports per-device `HealthSnapshot` records, and the
 gateway's `internal/site` package is responsible for aggregating these into a
@@ -362,6 +378,8 @@ and makes the secrets boundary explicit and testable.
 ## 2026-06-15 — Weekly Report Delivery Architecture
 
 **Status:** Accepted
+
+> **Status (2026-10-28):** There is no `output_dir`: the file channel is `reporting.weekly_report.delivery.file.{enabled,path}` (`internal/config/config.go`, gateway-config/v2), and the cloud deliverer is implemented. The `Deliverer` design and file name are unchanged.
 
 Report delivery is separated from report generation via a narrow `Deliverer`
 interface so that new output channels can be added without touching generation
@@ -479,6 +497,8 @@ Deferred to ori-cloud integration:
 ## 2026-06-15 — Site Node Runtime Posture Projection
 
 **Status:** Accepted
+
+> **Status (2026-10-28):** Posture fetches are no longer fire-and-forget: they are still debounced per device, but none starts once the gateway decides to stop, and `runGateway` joins a running one (AGENTS.md GW-15).
 
 `GET /health` exposes per-node runtime security posture (broker hardening,
 encryption-at-rest, alert outbox) fetched asynchronously after each accepted

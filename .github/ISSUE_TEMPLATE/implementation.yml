@@ -88,7 +88,7 @@ body:
     id: invariants
     attributes:
       label: "Invariants — Do Not Violate"
-      description: "Copy the specific AGENTS.md invariants that apply to this issue."
+      description: "Copy the specific invariants that apply to this issue, from docs/INVARIANTS.md (summarised in AGENTS.md)."
       placeholder: |
         - **GW-1**: MQTT topic names must match `gateway-api/v1.md` exactly.
         - **GW-2**: Every response must echo `request_id`.
