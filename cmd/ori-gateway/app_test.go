@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net"
 	"net/http"
@@ -1129,7 +1132,7 @@ func TestEvictStaleRuntimeNodesRemovesNodesSilentOnReceipt(t *testing.T) {
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "future", Status: site.NodeStatusHealthy, LastSeenMS: 100_000})
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "fresh", Status: site.NodeStatusHealthy, LastSeenMS: 1})
 
-	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, slog.Default())
+	go evictStaleRuntimeNodes(t.Context(), registry, 3*time.Millisecond, slog.Default())
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := registry.Snapshot()
@@ -1167,7 +1170,7 @@ func TestEvictStaleRuntimeNodesRetainsSilentCriticalNode(t *testing.T) {
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 
-	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, logger)
+	go evictStaleRuntimeNodes(t.Context(), registry, 3*time.Millisecond, logger)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := registry.Snapshot()
@@ -1199,9 +1202,10 @@ func TestEvictStaleRuntimeNodesJudgesCriticalSilenceOnGatewayReceipt(t *testing.
 	registry.Upsert(site.NodeHeartbeat{DeviceID: "behind", Status: site.NodeStatusCritical, LastSeenMS: arrivalMS - 200_000})
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	const interval = 5 * time.Millisecond // TTL is three intervals: 15 ms.
+	const ttl = 15 * time.Millisecond
+	const interval = ttl / 3 // the eviction tick
 
-	go evictStaleRuntimeNodes(t.Context(), registry, interval, logger)
+	go evictStaleRuntimeNodes(t.Context(), registry, ttl, logger)
 	time.Sleep(20 * interval)
 	if strings.Contains(logs.String(), "silent after a critical heartbeat") {
 		t.Fatalf("a critical node still reporting was logged silent within the TTL of its arrival:\n%s", logs.String())
@@ -2144,6 +2148,140 @@ func TestGatewaySiteHealthServerStartsWhenEnabled(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("gateway did not stop")
+	}
+}
+
+// The node TTL is the contract's 90 seconds whatever the gateway's own
+// heartbeat_interval_s, which once gave 3 × that interval: 30 s at 10 and
+// 180 s at 60. A node exactly at the TTL is fresh, and stale past it.
+func TestSiteHealthJudgesNodesOnTheNinetySecondTTLWhateverTheHeartbeatInterval(t *testing.T) {
+	for _, intervalS := range []int{10, 60} {
+		t.Run(fmt.Sprint(intervalS), func(t *testing.T) {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := l.Addr().String()
+			l.Close()
+
+			cfg := validConfig()
+			cfg.Gateway.HeartbeatIntervalS = intervalS
+			cfg.SiteHealth = config.SiteHealthConfig{Enabled: true, ListenAddr: addr}
+			fb := newFakeBroker()
+			deps := baseDeps(t, cfg, fb, &fakeProvider{healthy: true}, newFakeHeartbeat())
+			registry, clock := newTestReceiptRegistry(deps.now().UnixMilli())
+			deps.newSiteRegistry = func() *site.Registry { return registry }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- runGateway(ctx, "gateway.yaml", deps) }()
+			select {
+			case <-fb.subscribed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("gateway did not subscribe")
+			}
+			var handler broker.MessageHandler
+			for deadline := time.Now().Add(time.Second); handler == nil && time.Now().Before(deadline); {
+				if handler = fb.handlerFor("ori/dev-01/runtime/heartbeat"); handler == nil {
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if handler == nil {
+				t.Fatalf("missing runtime heartbeat handler, got topics %v", fb.subscribeTopics)
+			}
+			payload, err := json.Marshal(contracts.RuntimeNodeHeartbeat{
+				DeviceID:       "dev-01",
+				Status:         site.NodeStatusHealthy,
+				LastSeenMS:     deps.now().UnixMilli(),
+				ActiveTriggers: []string{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler("ori/dev-01/runtime/heartbeat", payload)
+
+			stale := func() bool {
+				t.Helper()
+				var resp *http.Response
+				for deadline := time.Now().Add(2 * time.Second); ; {
+					if resp, err = http.Get("http://" + addr + "/health"); err == nil || time.Now().After(deadline) { //nolint:noctx
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if err != nil {
+					t.Fatalf("site health server did not answer: %v", err)
+				}
+				defer resp.Body.Close()
+				var health site.SiteHealth
+				if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+					t.Fatal(err)
+				}
+				if len(health.Nodes) != 1 || !health.Nodes[0].GatewayObserved {
+					t.Fatalf("want the one observed node, got %+v", health.Nodes)
+				}
+				return health.Nodes[0].Stale
+			}
+			clock.advance(site.NodeTTL)
+			if stale() {
+				t.Fatalf("a node exactly at the 90 s TTL is stale with heartbeat_interval_s %d", intervalS)
+			}
+			clock.advance(time.Millisecond)
+			if !stale() {
+				t.Fatalf("a node past the 90 s TTL is fresh with heartbeat_interval_s %d", intervalS)
+			}
+
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("runGateway returned error: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("gateway did not stop")
+			}
+		})
+	}
+}
+
+// Eviction ticks every 30 s, too slowly to drive through runGateway, so its
+// TTL is checked where runGateway passes it: site.NodeTTL, the same value as
+// the projector's, never one derived from heartbeat_interval_s.
+func TestEvictionAndTheProjectorShareTheNodeTTL(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "app.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isNodeTTL := func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		return ok && pkg.Name == "site" && sel.Sel.Name == "NodeTTL"
+	}
+	var evictions, projections int
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			if fn, ok := n.Fun.(*ast.Ident); ok && fn.Name == "evictStaleRuntimeNodes" {
+				evictions++
+				if len(n.Args) != 4 || !isNodeTTL(n.Args[2]) {
+					t.Errorf("evictStaleRuntimeNodes is not passed site.NodeTTL")
+				}
+			}
+		case *ast.KeyValueExpr:
+			if key, ok := n.Key.(*ast.Ident); ok && key.Name == "NodeTTL" {
+				projections++
+				if !isNodeTTL(n.Value) {
+					t.Errorf("the projector's NodeTTL is not site.NodeTTL")
+				}
+			}
+		}
+		return true
+	})
+	if evictions != 1 || projections != 1 {
+		t.Fatalf("found %d eviction calls and %d projector TTLs, want one of each", evictions, projections)
 	}
 }
 

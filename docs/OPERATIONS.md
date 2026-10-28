@@ -513,8 +513,15 @@ and the site status stays `critical`. The gateway log carries one `ERROR`,
 reports again`, with the `device_id`, `gateway_seen_ms` and `last_seen_ms`, the
 first time the eviction loop finds the node silent, whether or not
 `site_health` is enabled. Silent means the gateway has accepted no heartbeat
-from the node for three heartbeat intervals, measured from when it received the
-last one on a monotonic clock. The node's `last_seen_ms` plays no part, so a
+from the node for longer than the node TTL, 90 seconds, measured from when it
+received the last one on a monotonic clock. The node TTL is fixed at 90 seconds
+(gateway-api/v2 Site Health): three times the longest node heartbeat interval
+runtime-config/v2 admits, 30 seconds. It does not follow the gateway's own
+`heartbeat_interval_s`, and there is no setting for it. A node whose gap
+between accepted heartbeats exceeds 90 seconds goes stale and, unless
+retained as `critical`, is evicted. runtime-config/v2 caps the runtime's
+heartbeat interval at 30 seconds, so migrate a runtime configured above that
+to 30 seconds or less. The node's `last_seen_ms` plays no part, so a
 node whose clock is ahead or behind is not reported silent while it is still
 reporting. A step in the gateway's own wall clock, such as an NTP sync after
 boot on a device with no real-time clock, neither makes a reporting node look
@@ -528,12 +535,12 @@ next heartbeat does not end that: only a later health export that reads
 otherwise does.
 
 A node that goes silent after a `healthy` or `degraded` heartbeat, with no
-`critical` export, is dropped from the registry after three heartbeat
-intervals and shows as unobserved and `degraded`, as before.
+`critical` export, is dropped from the registry once silent for longer than
+the node TTL and shows as unobserved and `degraded`, as before.
 
 Every node's eviction and `gateway_observed` follow the same rule: receipt age
 on the gateway's monotonic clock. Its `stale` flag in `GET /health` is set when
-the node's report has not moved for three heartbeat intervals on that clock:
+the node's report has not moved for longer than the node TTL on that clock:
 no heartbeat arrived, or none whose `last_seen_ms` passed the previous
 heartbeat's. A live runtime's `last_seen_ms` advances on every heartbeat, so a
 node whose runtime is stuck behind a live publisher, or whose clock has

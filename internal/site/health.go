@@ -4,7 +4,6 @@
 package site
 
 import (
-	"math"
 	"time"
 
 	"github.com/ori-platform/ori-gateway/internal/contracts"
@@ -197,14 +196,21 @@ type GatewayEvidenceDeliveryHeld struct {
 	Acknowledged   bool   `json:"acknowledged"`
 }
 
+// NodeTTL is the gateway's Site Health TTL (gateway-api/v2 Site Health), used
+// for both staleness and eviction: three times the 30-second longest node
+// heartbeat interval runtime-config/v2 admits, whatever the gateway's own
+// heartbeat_interval_s. The gateway offers no setting for it, so no TTL
+// outside the contract's 90 seconds to 24 hours can be configured.
+const NodeTTL = 90 * time.Second
+
 // ProjectOptions configures the site health projection parameters.
 type ProjectOptions struct {
 	// ExpectedDeviceIDs lists the device IDs the gateway expects to observe heartbeats from.
 	ExpectedDeviceIDs []string
-	// NodeTTLMS is the staleness threshold: a node the gateway has accepted no
-	// heartbeat from within this window, on its monotonic receipt clock, is
-	// stale.
-	NodeTTLMS int64
+	// NodeTTL is the staleness threshold: a node whose report has not moved
+	// for longer than this, on the gateway's monotonic receipt clock, is
+	// stale. The gateway passes NodeTTL.
+	NodeTTL time.Duration
 }
 
 // Viewer is the narrow interface for consumers of site health projections.
@@ -229,11 +235,7 @@ func NewProjector(registry *Registry, opts ProjectOptions) *Projector {
 func (p *Projector) Project(now time.Time, gateway GatewayView) SiteHealth {
 	nowMS := now.UnixMilli()
 	snapshot, exportSeverity, receiptNow := p.registry.snapshotWithExportSeverity()
-	// A TTL too long to hold as a Duration never ends.
-	ttl := time.Duration(math.MaxInt64)
-	if p.opts.NodeTTLMS < math.MaxInt64/int64(time.Millisecond) {
-		ttl = time.Duration(p.opts.NodeTTLMS) * time.Millisecond
-	}
+	ttl := p.opts.NodeTTL
 	observed := make(map[string]NodeHeartbeat, len(snapshot))
 	for _, n := range snapshot {
 		observed[n.DeviceID] = n

@@ -708,7 +708,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	// Supervised like every long-running task, so it stops with the others
 	// and never outlives runGateway (GW-15).
 	runners.start("site node eviction", func(ctx context.Context) error {
-		evictStaleRuntimeNodes(ctx, siteRegistry, time.Duration(cfg.Gateway.HeartbeatIntervalS)*time.Second, deps.logger)
+		evictStaleRuntimeNodes(ctx, siteRegistry, site.NodeTTL, deps.logger)
 		<-ctx.Done()
 		return ctx.Err()
 	})
@@ -919,7 +919,7 @@ func runGateway(ctx context.Context, configPath string, deps appDependencies) (r
 	if cfg.SiteHealth.Enabled {
 		siteProjector := site.NewProjector(siteRegistry, site.ProjectOptions{
 			ExpectedDeviceIDs: cfg.Gateway.DeviceIDs,
-			NodeTTLMS:         (3 * time.Duration(cfg.Gateway.HeartbeatIntervalS) * time.Second).Milliseconds(),
+			NodeTTL:           site.NodeTTL,
 		})
 		gatewayViewFn := func() site.GatewayView {
 			status := site.SiteStatusHealthy
@@ -1066,21 +1066,18 @@ func (r *supervisedRunners) wait() error {
 func evictStaleRuntimeNodes(
 	ctx context.Context,
 	registry *site.Registry,
-	interval time.Duration,
+	ttl time.Duration,
 	logger *slog.Logger,
 ) {
 	if registry == nil {
 		return
 	}
-	if interval <= 0 {
-		interval = time.Duration(config.DefaultHeartbeatIntervalS) * time.Second
-	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	// Receipt age is measured on the registry's own monotonic clock.
-	ttl := 3 * interval
-	ticker := time.NewTicker(interval)
+	// Receipt age is measured on the registry's own monotonic clock. A node is
+	// evicted at most a third of the TTL after it falls silent past it.
+	ticker := time.NewTicker(ttl / 3)
 	defer ticker.Stop()
 	for {
 		select {

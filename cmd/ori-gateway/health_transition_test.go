@@ -242,7 +242,7 @@ func TestHealthTransitionReachesSiteHealthAndTheWeeklyReport(t *testing.T) {
 				fetchAndUpsertPosture(context.Background(), rc, registry, tc.RequestedDeviceID, logger)
 				projection := site.NewProjector(registry, site.ProjectOptions{
 					ExpectedDeviceIDs: []string{tc.RequestedDeviceID},
-					NodeTTLMS:         60_000,
+					NodeTTL:           time.Minute,
 				}).Project(now, site.GatewayView{Status: site.SiteStatusHealthy})
 				if len(projection.Nodes) != 1 || projection.Nodes[0].Posture == nil {
 					t.Fatalf("no posture projected: %#v", projection.Nodes)
@@ -348,7 +348,7 @@ func TestACriticalExportSurvivesHeartbeatsAndAFailedFetch(t *testing.T) {
 	}
 	expect := func(step, want string) {
 		t.Helper()
-		h := site.NewProjector(registry, site.ProjectOptions{ExpectedDeviceIDs: []string{"dev-01"}, NodeTTLMS: 60_000}).
+		h := site.NewProjector(registry, site.ProjectOptions{ExpectedDeviceIDs: []string{"dev-01"}, NodeTTL: time.Minute}).
 			Project(now, site.GatewayView{Status: site.SiteStatusHealthy})
 		if h.Nodes[0].Status != want || h.Status != want {
 			t.Fatalf("%s: node %q site %q, want %q", step, h.Nodes[0].Status, h.Status, want)
@@ -406,7 +406,7 @@ func TestEvictStaleRuntimeNodesReportsASilentCriticalExport(t *testing.T) {
 	clock.advance(time.Second)
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	go evictStaleRuntimeNodes(t.Context(), registry, time.Millisecond, logger)
+	go evictStaleRuntimeNodes(t.Context(), registry, 3*time.Millisecond, logger)
 
 	lines := []string{
 		`level=ERROR msg="runtime node silent after a critical health export; kept critical until its export reads otherwise" device_id=export gateway_seen_ms=2000 last_seen_ms=1000`,
@@ -523,7 +523,7 @@ func TestARunningGatewayKeepsACriticalExportThroughAFailedFetch(t *testing.T) {
 	}
 	expect := func(step, want string) {
 		t.Helper()
-		h := site.NewProjector(registry, site.ProjectOptions{ExpectedDeviceIDs: []string{"dev-01"}, NodeTTLMS: 60_000}).
+		h := site.NewProjector(registry, site.ProjectOptions{ExpectedDeviceIDs: []string{"dev-01"}, NodeTTL: time.Minute}).
 			Project(now, site.GatewayView{Status: site.SiteStatusHealthy})
 		if h.Nodes[0].Status != want || h.Status != want {
 			t.Fatalf("%s: node %q site %q, want %q", step, h.Nodes[0].Status, h.Status, want)
